@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.2"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-09-13"
+#define VERSION "v8.4"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-09-16"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install Arduino Legacy IDE v1.8.xx from https://www.arduino.cc/en/software (scroll down!)
@@ -32,6 +32,18 @@
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
+ * Version 8.4
+ *  -- OLED: Fix slightly messed-up formatting from v8.3.
+ * Version 8.3
+ *  -- DEW: Retain "aggression" values using NVRAM.
+ *  -- DEW: Be much more assertive with PWM percentages.
+ *  -- DEW: Use degrees rather than half-degrees for "aggression" values.
+ *  -- "get all" now shows variables sorted in order by name.
+ *  -- New option to support hardware from the original WIFI+BT+GPS project.
+ *  -- Support building for All-In-One hardware with HBG3 mainline code: everything working except USB-Host and Ethernet.
+ *  -- Add NVRAM setting "musb.rfenable": set to 1 to leave WiFi+BT "on" when musb_selected: needed for port 3000 "debug".
+ *  -- Add "status" command to show similar information to what OLED shows.
+ *  -- Experiment with 8N1 instead of 8N2 for auxbus, with new NVRAM setting "auxbus.stopbits".
  * Version 8.2
  *  -- OTA:   Fix bug when scanning for Content-Length header line.
  *  -- OTA:   Compare file timestamp against saved (nvram) timestamp to decide if already up-to-date or not.
@@ -137,25 +149,19 @@
 #define BLOCK_CFM_CONNECTIONS     true  // Set to false to allow CFM to attempt to interogate/update firmware (VERY RISKY!!). DO NOT DO THIS!!
 #define NCHUCK_ENABLED            true  // Enables use of a Nunchuck game controller on I2C for slew/focus.
 #define OLED_ENABLED              true  // When true, OLED support is included. Requires library: https://github.com/greiman/SSD1306Ascii/
+#define OTA_ENABLED               true  // When true, support is included for Over-The-Air (OTA) Firmware Updates
 #define EMULATE_GPS               true  // When true and GPS is attached, pretend to be a Celestron SkySync GPS receiver.
 #define EMULATE_SSAA              true  // When true, include code for StarSense AutoAlign  simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor.
+#define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
 
 #define NVRAM_VALS_MAX_LEN 31
 static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
 static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
 
-#if EMULATE_DEW
-  #define ADC_VREF_ENABLE         true  // When true, thermistor readings will use the factory-calibrated VREF value.
-  #ifdef __has_include
-    #if __has_include("ADC_LUT.h")
-      #warning "Including ADC_LUT.h"
-      #include "ADC_LUT.h"
-    #endif
-  #endif
-#endif /* EMULATE_DEW */
+// PIN definitions for this project:
 
 // PIN definitions for this project:
 
@@ -169,13 +175,59 @@ static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
 #define ESP32_WIFI_MODE_PIN       13    // was 5;  Ground for "Access Point" mode; float high for "Direct Connect"
 #define MUSB_SELECT_PIN           15    // Ground to use USB port as Mount-USB
 
+#define READ_WIFI_MODE_PIN()      (digitalRead(ESP32_WIFI_MODE_PIN))
+#define READ_MUSB_SELECT_PIN()    (digitalRead(MUSB_SELECT_PIN))
+
 #define OLED_MODE_PIN             4     // For push-button switch to cycle between OLED data screens and OFF.
 #define LED_PIN                   2     // ESP32 DevKitV1 built-in (blue) LED
 #define USB_RX_PIN                3     // Internal pad; no associated pin
 #define USB_TX_PIN                1     // Internal pad; no associated pin
 
-#define LED_ON                    HIGH  // Some boards want LOW here; 30-pin DevKit-v1 wants HIGH.
-#define LED_OFF                   (((LED_ON) == HIGH) ? LOW : HIGH)  // Do NOT edit tihs line
+#define LED_ON                   HIGH  // Some boards want LOW here; 30-pin DevKit-v1 wants HIGH.
+#define LED_OFF                  (((LED_ON) == HIGH) ? LOW : HIGH)  // Do NOT edit tihs line
+
+#define AUXRELAY_RX_PIN           34    // from AUX relay bus RX pin
+#define AUXRELAY_TX_PIN           14    // to   AUX relay bus TX pin
+#define AUXRELAY_BUSYIN_PIN       26    // from AUX relay bus BUSY pin (could be same pin as BUSYOUT on older hardware)
+#define AUXRELAY_BUSYOUT_PIN      27    // to   AUX relay bus BUSY pin (could be same pin as BUSYIN  on older hardware)
+
+#if ORIGINAL_WIFI_PROJECT   // PIN assignments for the _original_ HomeBrew WiFI+BT+GPS project:
+#undef  AUXRELAY_RX_PIN
+#define AUXRELAY_RX_PIN -1
+#undef  ESP32_WIFI_MODE_PIN
+#define ESP32_WIFI_MODE_PIN 5
+#undef  GPS_TX_PIN
+#define GPS_TX_PIN 22
+#undef  GPS_RX_PIN
+#define GPS_RX_PIN 23
+#undef  WIFIRELAY_ENABLED
+#define WIFIRELAY_ENABLED false
+#undef  EMULATE_DEW
+#define EMULATE_DEW false
+#undef  EMULATE_FOCUS
+#define EMULATE_FOCUS false
+#undef  OTA_ENABLED
+#define OTA_ENABLED false
+#define HBG3_NAME  "HBG1"
+#endif
+
+//FIXME Temporary arrangement:  first include of this file defines PINs
+#ifdef __has_include
+  #if __has_include("aio.h")
+    #warning "Including aio.h"
+    #include "aio.h"
+  #endif
+#endif
+
+#if EMULATE_DEW
+  #define ADC_VREF_ENABLE       true    // When true, thermistor readings will use the factory-calibrated VREF value.
+  #ifdef __has_include
+    #if __has_include("ADC_LUT.h")
+      #warning "Including ADC_LUT.h"
+      #include "ADC_LUT.h"
+    #endif
+  #endif
+#endif /* EMULATE_DEW */
 
 #include <limits.h>
 #include <string.h>
@@ -200,13 +252,8 @@ HardwareSerial          hwserial0(0);   // debug or MUSB.
 HardwareSerial          hwserial1(1);   // MUSB, auxrelay, GPS, or debug (in that order).
 HardwareSerial          auxbus_uart(2); // auxbus
 #define auxrelay_uart   hwserial1
-HardwareSerial         *SerialDebug;    // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
+HardwareSerial         *SerialDebug = NULL; // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
 HardwareSerial         *musb_uart;      // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
-
-#define AUXRELAY_RX_PIN           34    // from AUX relay bus RX pin
-#define AUXRELAY_TX_PIN           14    // to   AUX relay bus TX pin
-#define AUXRELAY_BUSYIN_PIN       26    // from AUX relay bus BUSY pin (could be same pin as BUSYOUT on older hardware)
-#define AUXRELAY_BUSYOUT_PIN      27    // to   AUX relay bus BUSY pin (could be same pin as BUSYIN  on older hardware)
 
 typedef unsigned long ulong;
 typedef unsigned int  uint;
@@ -221,6 +268,7 @@ static bool aux_ascii_passthru  = false;
 static bool auxbus_raw_tracing  = false;
 static byte auxbus_raw_count    = 0;
 static long auxbus_raw_timeout  = 0;
+static byte auxbus_stopbits     = 2;      // Default was always 8N2, but 8N1 should work fine and is 10% faster.
 static bool nchuck_debug        = false;  // For extra verbose output to help diagnose Nunchuck issues: enable with 'n' on Serial port.
 static bool gps_detected        = false;  // Don't respond as DEV_GPS unless a GPS is detected
 static bool gps_disabled        = false;  // GPS can be prevented from responding via NVRAM setting
@@ -248,7 +296,9 @@ static bool emulate_ssag        = false;
 #define EMULATING_SSAG false
 #endif
 
+#ifndef HBG3_NAME
 #define HBG3_NAME                 "HBG3"
+#endif
 #define DEFAULT_SSID              "HomeBrew-"
 #define ADAPTER_VERSION           DEFAULT_SSID "AMW007-9.0.0.0, " VERSION_DATE "T12:00:00Z, " HBG3_NAME "-"
 // Celestron reports: "ZENTRI-AMW007-1.2.0.10, 2017-07-28T07:43:27Z, ZentriOS-WL-1.2.0.10, Board:N/A");
@@ -267,6 +317,8 @@ static long       bt_is_active   = 0;
 static byte       wifi_mac_addr[6];  // Filled in by setup(), used to create unique SSIDs
 static char       current_ssid[32];
 static char       current_ipaddr[32];
+
+static enum {bt_mode_off, bt_mode_aux, bt_mode_usb} bt_mode = bt_mode_off;  // needed by AIO bt stuff
 
 static inline void SERIAL_WRITE     (const char *s) { if    (SerialDebug)  SerialDebug->write(s);        }
 static inline int  SERIAL_AVAILABLE (void)          { return SerialDebug ? SerialDebug->available() : 0; }
@@ -1064,11 +1116,11 @@ static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
   return detected;
 }
 
-static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *name, HardwareSerial *uart, byte rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
+static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *name, HardwareSerial *uart, int rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
 {
   char tname[12];
   memset(bus, 0, sizeof(*bus));
-  if (do_loopback_test && !bus_detect(busyout_pin, rx_pin, tx_pin))
+  if (rx_pin == -1 || (do_loopback_test && !bus_detect(busyout_pin, rx_pin, tx_pin)))
     return false;
   bus->rxbuf = (struct rxbuf_s *)malloc(sizeof(struct rxbuf_s));
   mkname(tname, name, "_rx");
@@ -1078,7 +1130,7 @@ static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *name
   mkname(tname, name, "_tx");
   txq_init(bus->txq, tname, uart, rx_pin, tx_pin, busyin_pin, busyout_pin);
   uart->setRxBufferSize((2 * AUXBUS_PKT_MAX) + AUXBUS_SSAA_PKT_MAX);     // Large enough for SSAA packets, plus some
-  uart->begin(19200, SERIAL_8N2, rx_pin, tx_pin);
+  uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, rx_pin, tx_pin);
   return true;
 }
 
@@ -1203,6 +1255,7 @@ static void auxbus_send_msg (byte *data, uint16_t len)
 #define MUSB_TIMEOUT  3500   // 3.5 seconds of no activity drops the connection
 static struct rxbuf_s musb_rxbuf;
 static bool           musb_selected     = false;
+static bool           musb_rfkill       = true;  // nvram
 static long           musb_connected    = 0;
 static uint32_t       musb_rxcount      = 0;
 static uint32_t       musb_txcount      = 0;
@@ -1215,7 +1268,7 @@ static bool           musb_switch_is_on = false;
 static void monitor_musb_switch (void)
 {
   bool old = musb_switch_is_on;
-  musb_switch_is_on = (digitalRead(MUSB_SELECT_PIN) == LOW);
+  musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
   if (old != musb_switch_is_on) {
     musb_switch_timer = (musb_switch_is_on == musb_selected) ? 0 : get_timeout(1500);
     SERIAL_PRINTF("MUSB switch changed to %s\r\n", musb_switch_is_on ? "LOW" : "HIGH");
@@ -1324,31 +1377,7 @@ static inline byte emulate_begin (const char *devname, byte *data, byte *reply)
   return reply[1] + 2; // overall length, not including the checksum byte
 }
 
-static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
-{
-  bool from_ssaa   = (data[0] == 0x3c);
-  bool regular_pkt = (data[0] == 0x3b);
-  if (regular_pkt) {
-    len++;             // make room for checksum byte
-    data[1] = len - 3; // excludes 0x3b, itself, and checksum
-    update_checksum(data);
-  }
-  if (!rxbuf) {
-    tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
-  } else {
-    rxbuf->requestor = DEV_FF;
-    if (rxbuf->bus)
-      tx_enq(NULL, rxbuf->bus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
-    else if (rxbuf == &w2000_rxbuf)
-      w2000_tx(from_ssaa, data, len);
-    else if (rxbuf == &bt_rxbuf)
-      bt_tx(from_ssaa, data, len);
-    else if (rxbuf == &musb_rxbuf)
-      musb_tx(from_ssaa, data, len);
-    else
-      SERIAL_PRINTF("%s: unknown rxbuf\r\n", __func__);
-  }
-}
+static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len);
 
 static byte long_to_4bytes (byte *dest, ulong v)
 {
@@ -1902,7 +1931,7 @@ SoftwareSerial swserial0;
 static bool    gps_using_swserial;
 #define SWSERIAL_bufCapacity   96  // library default is 64; WARNING: uses a LOT of memory!
 
-static void GPS_UART_WRITE     (byte b) {        gps_using_swserial ? swserial0.write(b)    : hwserial1.write(b);    }
+static void GPS_UART_WRITE     (byte b) { if (GPS_TX_PIN != -1) {gps_using_swserial ? swserial0.write(b) : hwserial1.write(b);} }
 static byte GPS_UART_READ        (void) { return gps_using_swserial ? swserial0.read()      : hwserial1.read();      }
 static int  GPS_UART_AVAILABLE   (void) { return gps_using_swserial ? swserial0.available() : hwserial1.available(); }
 static void GPS_UART_FLUSH       (void) {        gps_using_swserial ? swserial0.flush()     : hwserial1.flush(false);}
@@ -3739,14 +3768,14 @@ static void nchuck_loop ()
 // Support up to four Dew Control "channels", by defining pairs of non-zero pin numbers here:
 #define DEW_NUMCHANNELS    2
 static bool   dew_detected                      = false;
-static double dew_input_current_limit           = 3.000;     // amperage
-static byte   thermistor_pins [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39.
-static byte   dew_automode    [DEW_NUMCHANNELS] = { 1,  1};  // Must be from GPIOs 32..39.
-static byte   dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  //
-static byte   dew_pwm_percent [DEW_NUMCHANNELS] = { 0,  0};  // percent 0..100
-static byte   dew_aggression  [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 half-degrees
-static double dew_temperature [DEW_NUMCHANNELS] = { 0,  0};  // degrees
-static double dew_max_amperage[DEW_NUMCHANNELS] = { 0,  0};  // kept in NVRAM
+static double dew_input_current_limit           = 3.000;      // amperage
+static byte   thermistor_pins  [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39.
+static byte   dew_automode     [DEW_NUMCHANNELS] = { 1,  1};  // Must be from GPIOs 32..39.
+static byte   dew_pwm_pins     [DEW_NUMCHANNELS] = {14, 26};  //
+static byte   dew_pwm_percent  [DEW_NUMCHANNELS] = { 0,  0};  // percent 0..100
+static byte   dew_aggression   [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 degrees (NVRAM)
+static double dew_temperature  [DEW_NUMCHANNELS] = { 0,  0};  // degrees
+static double dew_max_amperage [DEW_NUMCHANNELS] = { 0,  0};  // kept in NVRAM
 
 static char   dew_oled_rows[4][22] = {{0,},};
 
@@ -3782,6 +3811,15 @@ static byte double_to_2bytes (byte out[2], double val)
    out[1] = v;
    out[0] = v >> 8;
    return 2;
+}
+
+static void dew_set_aggression (byte channel, byte aggr)
+{
+  dew_aggression[channel] = aggr;
+  dew_automode  [channel] = 1;
+  char name[] = "dew0.aggression";
+  name[3] += channel;
+  nvram_save_val(name, aggr);
 }
 
 static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
@@ -3902,7 +3940,7 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
         reply[len++] = dew_pwm_percent[channel] * 2.55 + 0.5;  // percent as fraction of 255
         double amps  = dew_pwm_percent[channel] * dew_max_amperage[channel] / 100;
         len += double_to_2bytes(reply + len, amps);
-        reply[len++] = dew_aggression[channel]; // aggression 1..10 half-degrees over dewpoint
+        reply[len++] = dew_aggression[channel]; // aggression 1..10 degrees over dewpoint
         len += double_to_4bytes(reply + len, dew_temperature[channel]);
       }
       if (dew_debug)
@@ -3919,11 +3957,9 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
     }
     case OP(DEW_SET_AUTO_AGGR,5): {
       byte channel = data[5];
-      byte aggr    = data[6];  // aggression 1..10: half-degrees over dewpoint
-      if (channel < DEW_NUMCHANNELS) {
-        dew_aggression[channel] = aggr;
-        dew_automode  [channel] = 1;
-      }
+      byte aggr    = data[6];  // aggression 1..10: degrees over dewpoint
+      if (channel < DEW_NUMCHANNELS)
+        dew_set_aggression(channel, aggr);
       if (dew_debug)
         SERIAL_PRINTF("DEW SET_AUTO_AGGR[%u] %u\r\n", channel, aggr);
       break;
@@ -4219,9 +4255,18 @@ static void dew_tenths (const char *prefix, double T, const char *suffix, bool p
 static void dew_oled_set_aggr (byte channel)
 {
   if (OLED_ENABLED) {
-    char *row = dew_oled_rows[2 + channel];
-    row[13] = (dew_aggression[channel] / 2) + '0';
-    row[15] = (dew_aggression[channel] & 1) ? '5' : '0';
+    char *out = dew_oled_rows[2 + channel] + 12;
+    byte aggr = dew_aggression[channel];
+    if (aggr > 9) {
+      *out++ = '+';
+      *out++ = '1';
+      *out++ = '0' + (aggr - 10);
+    } else {
+      *out++ = ' '; 
+      *out++ = '+'; 
+      *out++ = '0' + aggr;
+    }
+    *out++ = 'C';
   }
 }
 
@@ -4237,13 +4282,11 @@ static void dew_manage_next_channel (void)
   } else {
     pwm = 0;
     if (!sht3x_calibration_running) {
-      target = sht3x_dewpoint + (dew_aggression[channel] * 0.5);
+      target = sht3x_dewpoint + dew_aggression[channel];
       delta  = target - dewring;
       if (delta > 0) {
         if (delta <= 2.0)
-          pwm = delta * 15 + 5;
-        else if (delta <= 5.0)
-          pwm = delta * 20 + 5;
+          pwm = delta * 45 + 5;
         else
           pwm = 100;
       }
@@ -4269,7 +4312,7 @@ static void dew_manage_next_channel (void)
     degrees = t / 10;
     tenths  = abs(tenths - (degrees * 10));
     if (dew_automode[channel]) {
-      sprintf(dew_oled_rows[2 + channel], "Th%u: %3d.%uC +X.X %3u%%", channel, degrees, tenths, pwm);
+      sprintf(dew_oled_rows[2 + channel], "Th%u: %3d.%uC +XXC %3u%%", channel, degrees, tenths, pwm);
       dew_oled_set_aggr(channel);
      } else {
       sprintf(dew_oled_rows[2 + channel], "Th%u: %3d.%uC Man: %3u%%", channel, degrees, tenths, pwm);
@@ -4349,7 +4392,7 @@ static void dew_setup ()
   }
 }
 
-static double nvram_restore_dew_amperage (byte channel)
+static double dew_nvram_restore_amperage (byte channel)
 {
   float amps = 1.8;  // default value
   char name[16];
@@ -4539,14 +4582,13 @@ static void oled_connectstatus_updatefn (void)
 {
   char tmp[OLED_ROW_CHARS + 1];
   tmp[OLED_ROW_CHARS] = 0;
-  bool connected = bt_is_active || musb_connected || w2000.connected() || w3000.connected();
-
+  const char *connection = get_connection_type();
   if (musb_switch_timer)
     snprintf(tmp, OLED_ROW_CHARS, "%-5s Reset Pending..", hbg3_version);
-  else if (!connected && musb_selected)
+  else if (connection[0] == 'N' && musb_selected)
     snprintf(tmp, OLED_ROW_CHARS, "%-5s MUSB Selected",   hbg3_version);
   else
-    snprintf(tmp, OLED_ROW_CHARS, "%-5s %sConnected",     hbg3_version, connected ? "" : "Not ");
+    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s Connected",    hbg3_version, connection);
   oled_set_row(0, tmp);
   if (bt_is_active) {
     oled_set_row(1, "Mode: Bluetooth");
@@ -4556,12 +4598,12 @@ static void oled_connectstatus_updatefn (void)
   } else if (musb_connected) {
     snprintf(tmp, OLED_ROW_CHARS, "Mode: USB %lu", (musb_uart->baudRate() / 10) * 10); // show 115201 as 115200.
     oled_set_row(1, tmp);
-    snprintf(tmp, OLED_ROW_CHARS, "rx: %u", musb_rxcount);
+    snprintf(tmp, OLED_ROW_CHARS, "Wireless is %s", musb_rfkill ? "off" : "on");
     oled_set_row(2, tmp);
-    snprintf(tmp, OLED_ROW_CHARS, "tx: %u", musb_txcount);
+    snprintf(tmp, OLED_ROW_CHARS, "%u %u", musb_rxcount, musb_txcount);
     oled_set_row(3, tmp);
   } else if (esp32_wifi_off) {
-    oled_set_row(1, musb_selected ? "Wireless is off" : "WiFi is off");
+    oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : "WiFi is off");
     oled_clear(2);
   } else {
     const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
@@ -4580,6 +4622,7 @@ static bool oled_turned_off = false;
 static long oled_offtime = 0;
 #define OLED_NMODES (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + 3)  // Network, OTA, and blank/off are the 3 other modes
 
+#if OTA_ENABLED
 static void oled_ota_updatefn (void)
 {
   char tmp[OLED_ROW_CHARS+1];
@@ -4593,6 +4636,7 @@ static void oled_ota_updatefn (void)
     oled_set_row(3, "  Needs Access Point");
   }
 }
+#endif /* OTA_ENABLED */
 
 static void oled_off_updatefn (void)
 {
@@ -4629,7 +4673,9 @@ static void oled_init_modes (void)
   #if EMULATE_GPS
     oled_updatefn[mode++] = oled_gps_updatefn;
   #endif
-  oled_updatefn[mode++] = oled_ota_updatefn;
+  #if OTA_ENABLED
+    oled_updatefn[mode++] = oled_ota_updatefn;
+  #endif
   oled_updatefn[mode++] = oled_off_updatefn;
 }
 
@@ -4642,7 +4688,8 @@ static void oled_setup ()
   if (!oled_detected) {
     SERIAL_PRINTLN("OLED not detected");
   } else {
-    pinMode(OLED_MODE_PIN, INPUT_PULLUP);
+    if (OLED_MODE_PIN != -1)
+      pinMode(OLED_MODE_PIN, INPUT_PULLUP);
     SERIAL_PRINTLN("OLED detected");
     oled.begin(&OLED_TYPE, OLED_I2C_ADDRESS);
     oled.clear();
@@ -4661,12 +4708,13 @@ static void oled_loop (void)
   static byte oled_mode = 0;
   static long modepin_debounce = 0;
   static int modepin = HIGH;
-  int this_modepin = digitalRead(OLED_MODE_PIN);
+  int this_modepin = (OLED_MODE_PIN != -1) ? digitalRead(OLED_MODE_PIN) : HIGH;
   if (modepin != this_modepin) {
     modepin = this_modepin;
     modepin_debounce = get_timeout(100);
   } else if (modepin_debounce && time_after(millis(), modepin_debounce)) {
     if (modepin == LOW) {
+#if OTA_ENABLED
       if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn) {
         if (!modepin_longpress) {
           modepin_longpress = get_timeout(3000);
@@ -4675,6 +4723,7 @@ static void oled_loop (void)
           ota_fetch_update();
         }
       }
+#endif /* OTA_ENABLED */
 #if EMULATE_DEW
       if (dew_detected && dew_automode[0] && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
         if (!modepin_longpress) {
@@ -4684,10 +4733,12 @@ static void oled_loop (void)
           modepin_longpress = get_timeout(1000);
           if (++dew_aggression[0] > 10)
             dew_aggression[0] = 1;
+          dew_set_aggression(0, dew_aggression[0]);
           oled_row_num = 2;
           next_update = millis();
           dew_oled_set_aggr(0);
-          SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
+          if (dew_debug)
+            SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
         }
       }
 #endif /* EMULATE_DEW */
@@ -5044,7 +5095,7 @@ static void set_bt_connected (bool connected)
     bt_connected = connected;
     SERIAL_PRINTF("bt_connected=%d\r\n", connected);
     if (!bt_connected)
-      bt_restart();
+      bt_aux_restart();
   }
 }
 
@@ -5065,6 +5116,32 @@ static void w2000_tx (bool from_ssaa, byte *data, uint16_t count)
     //w2000.flush();  // breaks wifi operation with CPWI
     if (TVERBOSE2(from_ssaa, data))
       print_packet("w2000_tx", NULL, data, count);
+  }
+}
+
+static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
+{
+  bool from_ssaa   = (data[0] == 0x3c);
+  bool regular_pkt = (data[0] == 0x3b);
+  if (regular_pkt) {
+    len++;             // make room for checksum byte
+    data[1] = len - 3; // excludes 0x3b, itself, and checksum
+    update_checksum(data);
+  }
+  if (!rxbuf) {
+    tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
+  } else {
+    rxbuf->requestor = DEV_FF;
+    if (rxbuf->bus)
+      tx_enq(NULL, rxbuf->bus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
+    else if (rxbuf == &w2000_rxbuf)
+      w2000_tx(from_ssaa, data, len);
+    else if (rxbuf == &bt_rxbuf)
+      bt_tx(from_ssaa, data, len);
+    else if (rxbuf == &musb_rxbuf)
+      musb_tx(from_ssaa, data, len);
+    else
+      SERIAL_PRINTF("%s: unknown rxbuf\r\n", __func__);
   }
 }
 
@@ -5564,6 +5641,13 @@ static void bus_loop (struct bus_s *bus)
   txq_free_pkt(txq, p);
 }
 
+//FIXME Temporary arrangement:  second include of same file defines functions etc..
+#ifdef __has_include
+  #if __has_include("aio.h")
+    #include "aio.h"
+  #endif
+#endif
+
 struct nvram_variable_s {
   char *name;
   char value[64];
@@ -5571,6 +5655,7 @@ struct nvram_variable_s {
 
 #define NVRAM_COUNT 40
 
+// No need to keep these in order; they now get sorted by name when displayed with "get all".
 static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"softap.passkey",
   (char *)"softap.ssid",
@@ -5595,8 +5680,8 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"dew1.amps",
   (char *)"disable.gps",
   (char *)"cordwrap.override",
-  (char *)"reserved15",
-  (char *)"reserved14",
+  (char *)"dew0.aggression",
+  (char *)"dew1.aggression",
   (char *)"reserved13",
   (char *)"suppress.lowbattery",
   (char *)"reserved11",
@@ -5606,8 +5691,8 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"reserved7",
   (char *)"reserved6",
   (char *)"reserved5",
-  (char *)"reserved4",
-  (char *)"reserved3",
+  (char *)"auxbus.stopbits",
+  (char *)"musb.rfenable",
   (char *)"ota.timestamp",
   (char *)"ota.update.server",
   (char *)"ota.update.path",
@@ -5639,10 +5724,10 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // dew1.amps
   ""                // disable.gps
   ""                // cordwrap.override
-  ""                // reserved15
-  ""                // suppress.lowbattery
+  ""                // dew0.aggression
+  ""                // dew1.aggression
   ""                // reserved13
-  ""                // reserved12
+  ""                // suppress.lowbattery
   ""                // reserved11
   ""                // reserved10
   ""                // reserved9
@@ -5650,8 +5735,8 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // reserved7
   ""                // reserved6
   ""                // reserved5
-  ""                // reserved4
-  ""                // reserved3
+  ""                // auxbus.stopbits
+  ""                // musb.rfenable
   ""                // ota.timestamp
   ""                // ota.update.server
   ""                // ota.update.path
@@ -5774,7 +5859,11 @@ static void nvram_restore ()
     nvram_load_defaults();
     nvram_save();
   }
+  musb_rfkill = !atoi(nvram_get_val("musb.rfenable"));
   suppress_lowbattery = !!atoi(nvram_get_val("suppress.lowbattery"));
+  byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
+  if (tmp == 1 || tmp == 2)
+    auxbus_stopbits = tmp;
 #if EMULATE_FOCUS
   focus_backlash_pos =   atoi(nvram_get_val("focus.backlash.pos"));
   focus_backlash_neg =   atoi(nvram_get_val("focus.backlash.neg"));
@@ -5803,12 +5892,17 @@ static void nvram_restore ()
       cordwrap_override = 0;  // no cordwrap override
   }
 #if EMULATE_DEW
-  dew_max_amperage[0] = nvram_restore_dew_amperage(0);
-  dew_max_amperage[1] = nvram_restore_dew_amperage(1);
+  dew_max_amperage[0] = dew_nvram_restore_amperage(0);
+  dew_max_amperage[1] = dew_nvram_restore_amperage(1);
+  tmp = atoi(nvram_get_val("dew0.aggression"));
+  if (tmp) dew_aggression[0] = tmp;
+  tmp = atoi(nvram_get_val("dew1.aggression"));
+  if (tmp) dew_aggression[1] = tmp;
 #endif
+#if OTA_ENABLED
   nvram_get_nonblank_val("ota.update.server", ota_update_server);
   nvram_get_nonblank_val("ota.update.path",   ota_update_path);
-  dew_max_amperage[1] = nvram_restore_dew_amperage(1);
+#endif
   mount_reversed_alt = !!atoi(nvram_get_val("mount.reversed.alt"));
   // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
   // Insert our MAC address and ADAPTER_VERSION string into the advertisement broadcast string:
@@ -5822,6 +5916,7 @@ static void nvram_save (void)
 {
   if (!nvram_initialized)
     return;
+  nvram_delayed_save = 0;
   strcpy(nvram_signature.sig, VARS_SIGNATURE);
   nvram_signature.vsize = sizeof(nvram_vals);
   if (FRAM_USE_FOR_NVRAM && fram_detected) {
@@ -5942,7 +6037,8 @@ static bool wifi_begin_client_mode()
 static bool is_wifi_client_mode_requested()
 {
   static byte old_want_client = 0xa5;
-  byte want_client = digitalRead(ESP32_WIFI_MODE_PIN) == LOW;
+  byte want_client = false;
+  want_client = (READ_WIFI_MODE_PIN() == LOW);
   if (want_client != old_want_client) {
     wifi_client_mode_override = false;
     old_want_client = want_client;
@@ -6035,18 +6131,18 @@ static void manage_evo_wifi (bool want_off)
 static void manage_wifi_onoff ()
 {
   // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
-  manage_esp32_wifi(bt_is_active || musb_selected);
+  manage_esp32_wifi(bt_is_active || (musb_selected && musb_rfkill));
   manage_evo_wifi  (bt_is_active || musb_connected || (!esp32_wifi_off && w2000.connected()));
 }
 
 // **** Begin OTA Firmware Update **********************************************************************************************************
 
+#if OLED_ENABLED
 #include <ArduinoOTA.h>
 #include <Update.h>
 
 #define otaclient w2000   // Re-use w2000 for this (saves memory)
 
-#if OLED_ENABLED
 static void oled_refresh_all (void)
 {
     oled_write_row(0);
@@ -6071,6 +6167,7 @@ static void oled_show_progress (byte percent, size_t progress, size_t total)
 }
 #endif /* OLED_ENABLED */
 
+#if OTA_ENABLED
 static void ota_show_progress (size_t progress, size_t total)
 {
   static byte old_percent;
@@ -6196,6 +6293,7 @@ static void ota_fetch_update (void)
   }
   ota_exit(msg);
 }
+#endif /* OTA_ENABLED */
 
 // **** End   OTA Firmware Update **********************************************************************************************************
 
@@ -6448,6 +6546,79 @@ static void set_p3000_debug (bool on_off)
   }
 }
 
+static const char *get_connection_type (void)
+{
+  const char *connection;
+       if (bt_is_active)      connection = "BT";
+  else if (musb_connected)    connection = "USB";
+  else if (w2000.connected()) connection = "W2";
+  else if (w3000.connected()) connection = "W3";
+  else                        connection = "Not";
+  return connection;
+}
+
+static void nvram_get_all (void (*writep)(const char *))
+{
+  // Show all variables/values, sorted by name:
+  bool wrote[NVRAM_COUNT] = {false,};
+  for (int k = 0; nvram_vars[k]; ++k) {
+    int best = -1;
+    for (int i = 0; nvram_vars[i]; ++i) {
+      if (!wrote[i]) {
+        if (0 == strncmp(nvram_vars[i], "reserved", 8))
+          wrote[i] = true;
+        else if (best == -1 || strcmp(nvram_vars[best], nvram_vars[i]) > 0)
+          best = i;
+      }
+    }
+    if (best == -1)
+      return;
+    wrote[best] = true;
+    writep(nvram_vars[best]);
+    if (*(nvram_vals[best])) {
+      writep(": ");
+      writep(nvram_vals[best]);
+      writep("\r\n");
+    } else {
+      writep(":\r\n");
+    }
+  }
+}
+
+static void status_command (void (*writep)(const char *))
+{
+  char tmp[128];
+  const char *connection = get_connection_type();
+  sprintf(tmp, "%s %s, ", HBG3_NAME, hbg3_version);
+  if (musb_switch_timer) {
+    strcat(tmp, "Reset Pending");
+  } else if (connection[0] == 'N' && musb_selected) {
+    strcat(tmp, "MUSB Selected");
+  } else {
+    strcat(tmp, connection);
+    strcat(tmp, "-Connected");
+  }
+  strcat(tmp, "; ");
+  writep(tmp);
+  if (bt_is_active) {
+    sprintf(tmp, "Mode: Bluetooth, SSID: %s; ", bt_id);
+    writep(tmp);
+  }
+  if (musb_connected) {
+    sprintf(tmp, "Mode: USB %lu; ", (musb_uart->baudRate() / 10) * 10); // show 115201 as 115200.
+    writep(tmp);
+  }
+  if (esp32_wifi_off) {
+    writep((musb_selected && musb_rfkill) ? "Wireless is off\r\n" : "WiFi is off\r\n");
+  } else {
+    const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
+    if (WIFIRELAY_ENABLED && wifi_relay_mode)
+      mode = "Relay";
+    sprintf(tmp, "WiFi=%s, SSID=%s, IP=%s\r\n", mode, current_ssid, current_ipaddr);
+    writep(tmp);
+  }
+}
+
 static char help_p3000_commands[] =
   "\r\n" HBG3_NAME " " VERSION " by Mark Lord: https://rtr.ca/hbg3/\r\n"
   "Command list:\r\n\r\n"
@@ -6456,8 +6627,11 @@ static char help_p3000_commands[] =
   "reset             -- reset/restart the ESP32\r\n"
   "version           -- print version info\r\n"
   "load defaults     -- reset NVRAM to factory defaults\r\n"
+#if OLED_ENABLED
   "ota_update        -- fetch/install remote firmware update\r\n"
+#endif
   "save              -- save any NVRAM changes from the 'set' command\r\n"
+  "status            -- show some basic system information, including IP address\r\n"
   "get all           -- list all NVRAM variables and values\r\n"
   "get var           -- show value of a specific variable\r\n"
   "set var val       -- change value of 'var' to 'val'\r\n"
@@ -6493,22 +6667,20 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
   } else if (0 == strcmp(cmd, "load defaults")) {
     nvram_load_defaults();
     writep("Loaded defaults");
+#if OTA_ENABLED
   } else if (0 == strcmp(cmd, "ota_update")) {
     ota_fetch_update();
+#endif /* OTA_ENABLED */
   } else if (0 == strcmp(cmd, "save")) {
     nvram_save();
     writep("Success");
     wifi_client_mode_override = false;
+  } else if (0 == strcmp(cmd, "status")) {  // Show similar information to what OLED shows.
+    status_command(writep);
+    return true;
   } else if (0 == strcmp(cmd, "get all")) {
-    for (int i = 0; nvram_vars[i]; ++i) {
-      if (0 != strncmp(nvram_vars[i], "reserved", 8)) {
-        writep(nvram_vars[i]);
-        writep(": ");
-        writep(nvram_vals[i]);
-        if (nvram_vars[i + 1])
-          writep("\r\n");
-      }
-    }
+    nvram_get_all(writep);
+    return true;
   } else if ((cmd[0] == 'g' || cmd[0] == 's') && cmd[1] == 'e' && cmd[2] == 't' && cmd[3] == ' '  && cmd[4]) {
     char *c = cmd + 4;
     if (cmd[0] == 'g') {
@@ -6705,23 +6877,26 @@ static void auxtest_loop ()
   }
 }
 
-static void bt_restart (void)
+static void bt_aux_restart (void)
 {
   static bool initialized = false;
-  if (initialized)
+  if (initialized) {
+    bt_mode = bt_mode_off;
     bt.end();
-  else
+  } else {
     initialized = true;
-  if (musb_selected)
+  }
+  if (musb_selected && musb_rfkill)
     return;
   sprintf(bt_id, "%s%02X%02X%02X", DEFAULT_SSID, wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
+  bt_mode = bt_mode_aux;
   bt.begin(bt_id);
   init_rxbuf(&bt_rxbuf, "bt_rx");
 }
 
-static inline void bt_loop (void)
+static inline void bt_aux_rx (void)
 {
-  if (!musb_selected && bt_available()) {
+  if (!(musb_selected && musb_rfkill) && bt_available()) {
     set_bt_connected(true);  // enables bt_tx()
     while (bt_available())
       (void)packet_decoder(&bt_rxbuf, bt_read());
@@ -6732,14 +6907,13 @@ static inline void bt_loop (void)
 
 void non_wifi_loop (void)
 {
-  if (nvram_delayed_save && time_after(millis(), nvram_delayed_save)) {
-    nvram_delayed_save = 0;
+  if (nvram_delayed_save && time_after(millis(), nvram_delayed_save))
     nvram_save();
-  }
   if (SerialDebug)
     serial_loop();
   auxtest_loop();
-  bt_loop();
+  if (bt_mode == bt_mode_aux)
+    bt_aux_rx();
   bus_loop(&auxbus);
   if (auxrelay_detected)
     bus_loop(&auxrelay);
@@ -6760,6 +6934,9 @@ void non_wifi_loop (void)
 #if NCHUCK_ENABLED
   nchuck_loop();
 #endif
+#ifdef AIO_H
+  aio_loop();
+#endif
   monitor_musb_switch();
 }
 
@@ -6778,12 +6955,18 @@ void setup (void)
   auxrelay_detected = bus_init(&auxrelay, true,  "relay",  &auxrelay_uart, AUXRELAY_RX_PIN, AUXRELAY_TX_PIN, AUXRELAY_BUSYIN_PIN, AUXRELAY_BUSYOUT_PIN);
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
+#ifdef AIO_H
+  aio_setup_early();
+#endif
 
   // Now sort out the other uart assignments:
-  pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
-  pinMode(MUSB_SELECT_PIN, INPUT_PULLUP);
-  delay(5);
-  musb_selected = musb_switch_is_on = (digitalRead(MUSB_SELECT_PIN) == LOW);
+  if (ESP32_WIFI_MODE_PIN != -1)
+    pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
+  if (MUSB_SELECT_PIN != -1) {
+    pinMode(MUSB_SELECT_PIN, INPUT_PULLUP);
+    delay(5);
+  }
+  musb_selected = musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
   if (!musb_selected) {
     SerialDebug = &hwserial0;
     SerialDebug->begin(115200, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN); // The USB pins are the main debug/command port:
@@ -6792,7 +6975,7 @@ void setup (void)
     if (EMULATE_GPS || auxrelay_detected) {
       SerialDebug = NULL;
       musb_uart   = &hwserial0;
-    } else { 
+    } else {
       SerialDebug = &hwserial0;
       SerialDebug->begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
       musb_uart   = &hwserial1;
@@ -6816,10 +6999,12 @@ void setup (void)
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u\r\n",
          hbg3_version, auxrelay_detected, EMULATE_GPS, BLOCK_CFM_CONNECTIONS,
          NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, mount_reversed_alt);
-
+#ifdef AIO_H
+  aio_setup();
+#endif
   init_rxbuf(&w2000_rxbuf, "w2000_rx");
   memset(spaces, ' ', sizeof(spaces) - 1);
-  bt_restart();
+  bt_aux_restart();
 
 #if EMULATE_GPS
   gps_using_swserial = musb_selected || auxrelay_detected;
