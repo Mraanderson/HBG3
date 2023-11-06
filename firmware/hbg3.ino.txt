@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.6"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-09-18"
+#define VERSION "v8.7"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-09-19"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -34,6 +34,8 @@
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
+ * Version 8.7
+ *  -- NCHK: Send Nunchuck focuser (and other) packets out on relay bus as well as auxbus.
  * Version 8.6
  *  -- OLED: Use NVRAM setting "oled.type" instead of a build-time setting.
  *  -- OLED: Use longer I2C bursts for QRcode image data.
@@ -1167,6 +1169,8 @@ static void auxbus_send_msg (byte *data, uint16_t len)
     update_checksum(data);
   }
   tx_enq(NULL, &auxbus, forward_yes, regular_pkt, data, len);
+  if (auxrelay_detected)
+    tx_enq(NULL, &auxrelay, forward_no, regular_pkt, data, len);
 }
 
 #define AUXBUS_SEND_MSG(...) do { byte _msg[] = {0x3b, 0x00, __VA_ARGS__, 0x00}; auxbus_send_msg(_msg, sizeof(_msg)); } while (0)
