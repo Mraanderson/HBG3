@@ -9,10 +9,12 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.5"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-09-17"
+#define VERSION "v8.6"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-09-18"
 /*
  * Arduino IDE configuration for this project:
+ *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
+ *  -- Or do it the hard way:
  *  -- Install Arduino Legacy IDE v1.8.xx from https://www.arduino.cc/en/software (scroll down!)
  *  -- Install ESP32 support into Arduino IDE: https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html
  *  -- First, select Board="ESP32 Dev Module".
@@ -32,6 +34,11 @@
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
+ * Version 8.6
+ *  -- OLED: Use NVRAM setting "oled.type" instead of a build-time setting.
+ *  -- OLED: Use longer I2C bursts for QRcode image data.
+ *  -- OLED: Show QRcode only on Adafruit128x64 displays.
+ *  -- OTA:  Do SPIFFS partition size check MUCH earlier, so a bad result can be shown on OLED.
  * Version 8.5
  *  -- OTA:  Implement a better version check; ota.timestamp conflicted with manual Arduino uploads.
  *  -- OLED: Add QRcode splash screen.
@@ -59,94 +66,6 @@
  * Version 8.0
  *  -- P3000: Toggle serial-debug redirection onto WiFi port 3000 with "debug" command there.
  *  -- MUSB:  Make changing the MUSB switch position trigger a reset of the HBG3 after a short delay.
- * Version 7.19
- *  -- MUSB: Fix it -- wasn't always working with latest CPWI.
- *  -- MUSB: Permit MUSB even when RELAY mode is also active.
- *  -- MUSB: Get rid of "RF-Kill" mode: Wireless always stays off when MUSB switch is active at power-on/reset.
- *  -- MUSB: Get rid of MUSB_ENABLED flag: always enabled in the code now.
- *  -- MUSB: Get rid of FALLBACK serial logic: no SerialDebug if MUSB is "on" and either EMULATE_GPS=true or auxrelay_detected=true
- * Version 7.18
- *  -- RELAY: Don't do auxrelay_ssforward when controlled from CPWI/SkyPortal/SkySafari.
- * Version 7.17
- *  -- RELAY: Don't forward emulated-dev requests to auxrelay: fixes emulated-dev double response bug.
- *  -- RELAY: Auto-detect and dynamically manage the need for auxrelay_ssforward instead of a manual NVRAM setting.
- * Version 7.16
- *  -- GPS:  Improve/speed-up autobaud code.
- *  -- DEW:  Fix build for EMULATE_DEW=false
- * Version 7.15
- *  -- GPS:  Always wait at least 10-minutes before powering-down GPS.
- *  -- GPS:  Improve autobaud detection: wasn't reliable before.
- *  -- SSAG: Emulate more SSAG commands.
- *  -- SSAG: Decode SSAG commands.
- *  -- Fix issues with "txq->is_alive" causing packets to be discarded.
- * Version 7.14
- *  -- Fix off-by-one error in packet_decoder(), which was giving "bad len 0xd" messages.
- * Version 7.13
- *  -- Show emulated device (eg. "gps_rx") instead of "emdev_rx" when tracing.
- *  -- RELAY:  txq->busy_timeout was too short (1.25 seconds); increased it to 15.00 seconds.
- *             Reason is StarSense-HC sometimes holds BUSY while doing plate solve.. takes it a while..
- *  -- RELAY:  Replace build-time variable SSFORWARD_ENABLED with NVRAM variable relay.ssforward (1=on, 0=off).
- *  -- RELAY:  Fix SSFORWARD_ENABLED; was broken by recent memory-saving tweaks.
- *  -- NCHUCK: Slower slewing by default; use 'Z' button for original "faster" slewing.
- *  -- NCHUCK: Slight tweaks to make speed zone '4' a bit wider on the Nunchucks.
- *  -- SSAA:   Emulator tweaks.
- * Version 7.12
- *  -- Workarounds for CPWI sending bad MC_GOTO_DONE commands.
- *  -- Improve focus_debug output.
- * Version 7.11
- *  -- Reduce bt_is_active timeout from 15 to 10 seconds.
- *  -- Show 0x3c packet data when using "trace ssaa".
- *  -- Use "HBG3" instead of "HomeBrew" in most places.
- *  -- If auxrelay_detected, then Use 'r' instead of 'v' prefix in VERSION everywhere.
- *  -- Disable Dew Control if auxrelay is detected (pin conflicts).
- *  -- Tidy up auxtest output, and better align print_packet() output.
- *  -- Tweak/speed-up auxrelay detection logic.
- *  -- Rename "auxrelay_[rt]x" to "relay_[rt]x" for print_packet() output.
- * Version 7.10
- *  -- Allow settling time before loopback existence test for auxrelay bus
- *  -- Give Relay devices a different bus address than regular HBG3: makes testing easier.
- *  -- Split DEV_ESP32 into DEV_HBG3 and DEV_RELAY.
- *  -- Show degrees for MC_GET_POS and CORDWRAP commands.
- * Version 7.9
- *  -- New NVRAM setting for "cordwrap.override" to override hand-controller, CPWI, etc.  0/1 forces OFF/ON, blank does nothing.
- *  -- Workaround for CPWI sending bad MC_POLL_CORDWRAP commands.
- *  -- Change MC CORDWRAP opcode names to match the AUX Protocol document.
- *  -- Implement push-and-hold for OLED_MODE button to cycle DewControl "aggression" values for channel-0.
- *  -- GPS: New NVRAM setting for "disable.gps": leaves built-in GPS running, but not responding on AUX bus.
- *  -- GPS: emulate the GPS_GET_RCVR_STATUS command.
- * Version 7.8
- *  -- Tidy up MUSB/RF-Kill status on OLED.
- *  -- Get rid of setTxBufferSize() calls: default buffering is adequate.
- *  -- Enforce full blocking of packets from DEV_CFM.
- *  -- Reduce AUXBUS_PKT_MAX to 16 from 32, matching reality and using considerably less RAM.
- * Version 7.7
- *  -- FIX BUG: earlier v7.x versions didn't format checksum correctly in responses from emulated devices.
- *  -- Don't allocate large buffer for SSAA emulator until needed, and free it again after.
- *  -- Further reduce AUXBUS_SSAA_PKT_MAX to 848: matters only for the SSAA emulator, which never exceeds 832.
- *  -- Show more informaion from "free" command.
- * Version 7.6
- *  -- Fix WiFi Direct Connect: system was out of RAM: reduced uart buffers and other stuff.
- *  -- Added "free" command to show heap free memory.
- * Version 7.5
- *  -- Fix #include of ADC_LUT.h
- * Version 7.4
- *  -- Fix bug with flipping MUSB switch after power-on.
- * Version 7.3
- *  -- Lots of code tidying.
- *  -- Fixes for "mount.reversed.alt" mode.
- *  -- Get rid of AUXRELAY_ENABLED flag: auto-detect auxrelay Rx/Tx loopback during setup().
- *  -- FOCUS: Build for both stepper motor DRIVER types, and auto-detect them during setup().
- *  -- Fix bug in "trace" command: "trace" with no dev should turn tracing off!
- *  -- Fix bug in Nexstar GPS compatibility code.
- * Version 7.2
- *  -- Restore mysterious I2C handshake for Nunchuck: needed by some it seems.
- * Version 7.1
- *  -- Fix value parsing bug in "set" command; trim this change log.
- * Version 7.0
- *  -- Implement "mount.reversed.alt" mode, for folks who want to mount their OTA backwards on an ALT/AZM mount.
- *  -- FOCUS: Maintain current stepper position in FRAM (if present), so motor position is remembered across resets and power cycles.
- *  -- DEW:  Use NVRAM for dew_max_amperage[] values: default is 1.8amps, but user can customize it with "set" commands.
- *  -- NCHK: Show samples in nchuck_measure_middle() if nchuck_debug==1
  */
 #define WIFIRELAY_ENABLED         true  // When false, code for wifi_relay_mode is omitted.
 #define BLOCK_CFM_CONNECTIONS     true  // Set to false to allow CFM to attempt to interogate/update firmware (VERY RISKY!!). DO NOT DO THIS!!
@@ -164,8 +83,6 @@
 static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
 static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
 static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
-
-// PIN definitions for this project:
 
 // PIN definitions for this project:
 
@@ -4418,10 +4335,35 @@ static double dew_nvram_restore_amperage (byte channel)
 #if OLED_ENABLED
 #include <SSD1306AsciiWire.h>
 
-// Uncomment ONE of these three depending upon the exact model of OLED. Experiment if you don't know which.
-//#define OLED_TYPE       Adafruit128x32  // Hard to find these in WHITE or RED
-#define OLED_TYPE         Adafruit128x64  // These are the most commonly available ones now
-//#define OLED_TYPE       SH1106_128x64   // Larger dimensions than the Adafruit128x64 style
+// Set oled type in NVRAM.  Eg.  set oled.type &SH1106_128x64
+//
+static const DevType *oled_type = NULL;
+
+static struct oled_type_s {
+  const char    *name;
+  const DevType *oled;
+} oled_types[] = {
+  {"Adafruit128x64", &Adafruit128x64},
+  {"Adafruit128x32", &Adafruit128x32},
+  {"SH1106_128x64",  &SH1106_128x64},
+  {NULL, NULL}
+};
+  
+static void oled_get_type (void)
+{
+  const char *oled_name = nvram_get_val("oled.type");
+  byte oled_index = 0;  // Default
+  if (oled_name && oled_name[0]) {
+    for (byte i = 0; oled_types[i].name; ++i) {
+      if (0 == strcasecmp(oled_name, oled_types[i].name)) {
+        oled_index = i;
+        break;
+      }
+    }
+  }
+  oled_type = oled_types[oled_index].oled;
+  SERIAL_PRINTF("oled.type = %s\r\n", oled_types[oled_index].name);
+}
 
 #define OLED_I2C_ADDRESS  0x3c
 static  SSD1306AsciiWire  oled;
@@ -4434,6 +4376,7 @@ static char oled_data[4][OLED_ROW_CHARS + 1] = {{0,},};   // Four rows of OLED d
 static bool oled_data_updated[4] = {false,false,false,false};
 static bool oled_turned_off      = false;
 static long oled_offtime         = 0;
+static long oled_splash_timer    = 0;
 static bool oled_updatefn_initial_call = true;
 
 static const uint8_t HomeBrew5x14_font[] = {  // two groups of 5-bytes-across for each character. Each byte is vertical pixels.
@@ -4487,14 +4430,13 @@ static const uint8_t HomeBrew5x14_font[] = {  // two groups of 5-bytes-across fo
  0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x03, 0x3c, 0xc0, 0x00, 0x00, 0x30, 0x0f, 0x00, 0x00,
  0xc0, 0xc0, 0xcc, 0xf0, 0xc0, 0x00, 0x00, 0x0c, 0x03, 0x00, 0xc0, 0xf0, 0xcc, 0xc0, 0xc0, 0x00, 0x03, 0x0c, 0x00, 0x00,
  0x00, 0x3c, 0xc3, 0xc3, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, };
-#define OLED_FONT        ((&OLED_TYPE == &Adafruit128x32) ? (System5x7) : (HomeBrew5x14_font))
 
 static bool oled_write_row (int row)
 {
   if (!oled_data_updated[row])
     return false;
   oled_data_updated[row] = false;
-  oled.setRow(row * ((&OLED_TYPE == &Adafruit128x32) ? 1 : 2));
+  oled.setRow(row * ((oled_type->lcdHeight == 32) ? 1 : 2));
   oled.setCol(0);
   oled.print(oled_data[row]);
   return true;
@@ -4629,12 +4571,17 @@ static void oled_connectstatus_updatefn (void)
 }
 
 #if OTA_ENABLED
+static bool ota_partition_size_okay = false;
+
 static void oled_ota_updatefn (void)
 {
   if (oled_updatefn_initial_call) {
     oled_set_row(0, "OTA Firmware Update");
     oled_set_row(1, "===================");
-    if (wifi_client_mode) {
+    if (!ota_partition_size_okay) {
+      oled_set_row(2, "Wrong Partition Size");
+      oled_clear(3);
+    } else if (wifi_client_mode) {
       oled_set_row(2, "To trigger update,");
       oled_set_row(3, "  Push/hold button");
     } else {
@@ -4688,7 +4635,7 @@ static void oled_cmd(uint8_t command)
   Wire.endTransmission();
 }
 
-static void oled_send_image (byte *buffer)
+static void oled_send_image (byte *image, unsigned int image_size)
 {
   oled_cmd(0x20);  // Set MemoryMode to next byte:
   oled_cmd(0x00);  //  use Horizontal addressing mode for image.
@@ -4698,12 +4645,12 @@ static void oled_send_image (byte *buffer)
   oled_cmd(0x22);  // Set Page (row) Address Low/High:
   oled_cmd(0x00);  //  Low:    0
   oled_cmd(0x07);  //  High:   7
-  for (byte burst = 0; burst < 64; burst++) {
+  const byte burst_size = 32;
+  for (byte burst = 0; burst < (image_size / burst_size); burst++) {
     Wire.beginTransmission(OLED_I2C_ADDRESS);
     Wire.write(0x40);      // Select "Data" mode
-    for (unsigned int i = 0; i < 16; ++i) {
-      Wire.write(buffer[i + (burst * 16)]);
-    }
+    for (unsigned int i = 0; i < burst_size; ++i)
+      Wire.write(*image++);
     Wire.endTransmission();
   }
   oled_cmd(0x20);  // Set MemoryMode to next byte:
@@ -4712,8 +4659,19 @@ static void oled_send_image (byte *buffer)
 
 static void oled_QRcode_updatefn (void)
 {
-  if (oled_updatefn_initial_call)
-    oled_send_image(QRcode_image);
+  if (oled_updatefn_initial_call) {
+    if (oled_type == &Adafruit128x64) {
+      oled_send_image(QRcode_image, sizeof(QRcode_image));
+    } else {
+      oled_clear(0);
+      oled_set_row(1, HBG3_NAME " by Mark Lord");
+      oled_set_row(2, "https://rtr.ca/hbg3/");
+      if (oled_splash_timer) {
+        oled_write_row(1);
+        oled_write_row(2);
+      }
+    }
+  }
 }
 
 static void oled_off_updatefn (void)
@@ -4756,12 +4714,11 @@ static void oled_init_modes (void)
   oled_updatefn[mode++] = oled_off_updatefn;
 }
 
-static long oled_splash_timer = 0;
-
 static void oled_setup ()
 {
   oled_clear(0);
   oled_init_modes();
+  oled_get_type();
   Wire.beginTransmission(OLED_I2C_ADDRESS);
   oled_detected = (Wire.endTransmission() == 0);
   if (!oled_detected) {
@@ -4770,13 +4727,13 @@ static void oled_setup ()
     if (OLED_MODE_PIN != -1)
       pinMode(OLED_MODE_PIN, INPUT_PULLUP);
     SERIAL_PRINTLN("OLED detected");
-    oled.begin(&OLED_TYPE, OLED_I2C_ADDRESS);
+    oled.begin(oled_type, OLED_I2C_ADDRESS);
     oled.clear();
-    oled.setFont(OLED_FONT);
+    oled.setFont((oled_type->lcdHeight == 32) ? System5x7 : HomeBrew5x14_font);
 
     // Show splash screen briefly at start-up:
+    oled_splash_timer = get_timeout(1300); 
     oled_QRcode_updatefn();
-    oled_splash_timer = get_timeout(1250); 
     oled_updatefn_initial_call = true;
   }
 }
@@ -4792,6 +4749,7 @@ static void oled_loop (void)
     if (time_before(millis(), oled_splash_timer))
       return;
     oled_splash_timer = 0;
+    oled.clear();
   }
   static long next_update = 0;
   static byte oled_mode = 0;
@@ -4804,7 +4762,7 @@ static void oled_loop (void)
   } else if (modepin_debounce && time_after(millis(), modepin_debounce)) {
     if (modepin == LOW) {
 #if OTA_ENABLED
-      if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn) {
+      if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn && ota_partition_size_okay) {
         if (!modepin_longpress) {
           modepin_longpress = get_timeout(3000);
         } else if (time_after(millis(), modepin_longpress)) {
@@ -4859,11 +4817,11 @@ static void oled_loop (void)
   if (next_update && time_before(millis(), next_update))
     return;
 
-  // Update the in-RAM copy of the display: oled_data[]
 #if EMULATE_DEW
   if (!dew_detected && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn)
     oled_mode = (oled_mode + 1) % OLED_NMODES;
 #endif
+  // Update the in-RAM copy of the display: oled_data[]:
   oled_updatefn[oled_mode]();
   oled_updatefn_initial_call = false;
 
@@ -5780,7 +5738,7 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"reserved9",
   (char *)"reserved8",
   (char *)"reserved7",
-  (char *)"reserved6",
+  (char *)"oled.type",
   (char *)"ota.version.path",
   (char *)"auxbus.stopbits",
   (char *)"musb.rfenable",
@@ -5824,7 +5782,7 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // reserved9
   ""                // reserved8
   ""                // reserved7
-  ""                // reserved6
+  ""                // oled.type
   ""                // ota.version.path
   ""                // auxbus.stopbits
   ""                // musb.rfenable
@@ -5943,6 +5901,7 @@ static void nvram_restore ()
     if (!ret) {
       SERIAL_PRINTLN("SPIFFS.begin failed");
     } else {
+      ota_partition_size_okay = (SPIFFS.totalBytes() < 300000);
       SERIAL_PRINTF("SPIFFS size: %lu\r\n", SPIFFS.totalBytes());  // 113201
       File vf = SPIFFS.open(NVRAM_PATH, FILE_READ);
       if (!vf) {
@@ -6382,6 +6341,7 @@ static void ota_fetch_file (long timeout, const char *server, const char *path)
 static void ota_fetch_update (void)
 {
   long timeout = get_timeout(10 * 1000);
+
   ota_show_progress(0, 0);  // Initialize the display
   ota_fetch_file(timeout, ota_update_server, ota_version_path);
   // Note: server seems to respond with a bytecount line as well as the actual data..
@@ -6401,8 +6361,6 @@ static void ota_fetch_update (void)
       break;
     }
   }
-  if (SPIFFS.totalBytes() > 300000)
-    ota_exit("Wrong Partition Size");
 
   // Now do the actual firmware download/update:
   timeout = get_timeout(15 * 1000);
@@ -6792,7 +6750,10 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
     writep("Loaded defaults");
 #if OTA_ENABLED
   } else if (0 == strcmp(cmd, "ota_update")) {
-    ota_fetch_update();
+    if (ota_partition_size_okay)
+      ota_fetch_update();
+    else
+      writep("Wrong Parition Size for OTA");
 #endif /* OTA_ENABLED */
   } else if (0 == strcmp(cmd, "save")) {
     nvram_save();
