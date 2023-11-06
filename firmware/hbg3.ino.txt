@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.9"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-10-09"
+#define VERSION "v8.10"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-10-11"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,10 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again.  WTF?
  *
+ * Version 8.10
+ *  -- Push and hold button for 10-seconds while on QRcode screen, and device resets to "factory defaults".
+ *  -- Add '*' indicator on DirectConnect display to indicate AccessPoint mode selected but not configured.
+ *  -- Move call to aio_setup() to AFTER oled_setup(), so that the AIO's OLED lights up MUCH sooner at power-on.
  * Version 8.9
  *  -- Note that OTA Updates will NOT work on ethernet because of limitations of the underlying library.
  *  -- Get ethernet working on AIO, including with p3000_debug.
@@ -4620,7 +4624,7 @@ static void oled_connectstatus_updatefn (void)
     const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
     if (WIFIRELAY_ENABLED && wifi_relay_mode)
       mode = "Relay";
-    snprintf(tmp, OLED_ROW_CHARS, "WiFi: %s", mode);
+    snprintf(tmp, OLED_ROW_CHARS, "WiFi: %s%s", mode, wifi_client_mode_override ? "*" : "");
     oled_set_row(1, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", current_ssid);
     oled_set_row(2, tmp);
@@ -4823,6 +4827,16 @@ static void oled_loop (void)
     modepin_debounce = get_timeout(100);
   } else if (modepin_debounce && time_after(millis(), modepin_debounce)) {
     if (modepin == LOW) {
+      if (oled_updatefn[oled_mode] == oled_QRcode_updatefn) {
+        if (!modepin_longpress) {
+          modepin_longpress = get_timeout(10 * 1000);
+        } else if (time_after(millis(), modepin_longpress)) {
+          nvram_load_defaults();
+          nvram_save();
+          delay(500);
+          ESP.restart();
+        }
+      }
 #if OTA_ENABLED
       if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn && ota_partition_size_okay) {
         if (!modepin_longpress) {
@@ -5971,7 +5985,7 @@ static void nvram_restore ()
       SERIAL_PRINTLN("SPIFFS.begin failed");
     } else {
       ota_partition_size_okay = (SPIFFS.totalBytes() < 300000);
-      SERIAL_PRINTF("SPIFFS size: %lu\r\n", SPIFFS.totalBytes());  // 113201
+      //SERIAL_PRINTF("SPIFFS size: %lu\r\n", SPIFFS.totalBytes());  // 113201
       File vf = SPIFFS.open(NVRAM_PATH, FILE_READ);
       if (!vf) {
         SERIAL_PRINTLN("open(" NVRAM_PATH "[R]) failed");
@@ -6794,7 +6808,7 @@ static void status_command (void (*writep)(const char *))
     const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
     if (WIFIRELAY_ENABLED && wifi_relay_mode)
       mode = "Relay";
-    sprintf(tmp, "WiFi=%s, SSID=%s, IP=%s\r\n", mode, current_ssid, current_ipaddr);
+    sprintf(tmp, "WiFi=%s%s, SSID=%s, IP=%s\r\n", mode, wifi_client_mode_override ? "*" : "", current_ssid, current_ipaddr);
     writep(tmp);
   }
 }
@@ -7197,9 +7211,6 @@ void setup (void)
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u\r\n",
          hbg3_version, auxrelay_detected, EMULATE_GPS, BLOCK_CFM_CONNECTIONS,
          NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, mount_reversed_alt);
-#ifdef AIO_H
-  aio_setup();
-#endif
   init_rxbuf(&w2000_rxbuf, "w2000_rx");
   memset(spaces, ' ', sizeof(spaces) - 1);
   bt_aux_restart();
@@ -7225,6 +7236,9 @@ void setup (void)
 #endif
 #if EMULATE_DEW
   dew_setup();
+#endif
+#ifdef AIO_H
+  aio_setup();
 #endif
   if (is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
