@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.7"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-09-19"
+#define VERSION "v8.8"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-10-05"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -34,6 +34,11 @@
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
+ * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again.  WTF?
+ *
+ * Version 8.8
+ *  -- NCHK: Improve Nunchuck/focuser fix from v8.7, by NOT sending DEV_AZM/DEV_ALT packets out on relay bus.
+ *  -- Add PIN definitions for coolick PCBs.
  * Version 8.7
  *  -- NCHK: Send Nunchuck focuser (and other) packets out on relay bus as well as auxbus.
  * Version 8.6
@@ -120,11 +125,14 @@ static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
 #undef  ESP32_WIFI_MODE_PIN
 #define ESP32_WIFI_MODE_PIN 5
 #undef  GPS_TX_PIN
-#define GPS_TX_PIN 22
 #undef  GPS_RX_PIN
-#define GPS_RX_PIN 23
-#undef  WIFIRELAY_ENABLED
-#define WIFIRELAY_ENABLED false
+#if 1  // Original WiFi+BT+GPS project:
+  #define GPS_TX_PIN 22
+  #define GPS_RX_PIN 23
+#else  // Coolick PCBs:
+  #define GPS_TX_PIN 23
+  #define GPS_RX_PIN 19
+#endif
 #undef  EMULATE_DEW
 #define EMULATE_DEW false
 #undef  EMULATE_FOCUS
@@ -247,7 +255,7 @@ static inline void SERIAL_WRITE     (const char *s) { if    (SerialDebug)  Seria
 static inline int  SERIAL_AVAILABLE (void)          { return SerialDebug ? SerialDebug->available() : 0; }
 static inline char SERIAL_READ      (void)          { return SerialDebug ? SerialDebug->read()      : 0; }
 static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  SerialDebug->flush(txonly);   }
-    
+
 // Debug messages use these macros, normally sending to debug uart, but possibly instead to the TCP/IP Port-3000 connection:
 #define W3000_ENDLINE()             do {     w3000.write("\r\n"); w3000.flush(); } while (0)
 #define SERIAL_ENDLINE()            do { if (p3000_debug) {W3000_ENDLINE();                } else if (SerialDebug) {SerialDebug->println();           SERIAL_FLUSH(true);}} while (0)
@@ -608,7 +616,7 @@ static const struct auxdev_op_s aux_ssaa_ops[] = {
 #define SSAG_GET_CALIBRATE_STATUS      0x04  // 5-bytes in:  00..=inProgress; otherwise 01/ff xx.. :  CenterCalibrationStatus(SOLVED, x=65134, y=64192) 01-FE-6E-FA-C0
 #define SSAG_06                        0x06  // 10-bytes out, 8-bytes in
 #define SSAG_07                        0x07  // 1-byte in (00,01)
-#define SSAG_SET_GUIDING               0x20  // 1-byte out, ack;  00=disabled; 69: west=True altaz=True 
+#define SSAG_SET_GUIDING               0x20  // 1-byte out, ack;  00=disabled; 69: west=True altaz=True
 #define SSAG_GET_GUIDING_DATA          0x23  // 10-bytes in:  Error(0, 0) Correction(0, 0) MoveRa = False MoveDec = False StopAll = TrueGuideStars = 0Quality = 0 00-00-00-00-91-00-00-00-00-00
 #define SSAG_SET_MOUNT_INFO            0x30  // 8-bytes out, ack: mountModel = 4, isAltAz = True, azmFirmwareVersion = [40, 99] 04-01-28-63-00-00
 #define SSAG_SET_GEOLOCATION           0x31  // 8-bytes out, ack: location = [66, 34, 203, 75, 194, 149, 204, 45] 42-22-CB-4B-C2-95-CC-2D
@@ -1033,7 +1041,7 @@ static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
         break;
       }
     }
-  } 
+  }
   pinMode(busyout_pin, INPUT);
   pinMode(tx_pin,      INPUT);
   return detected;
@@ -1128,7 +1136,7 @@ static void tx_enq (struct rxbuf_s *from_rxbuf, struct bus_s *bus, byte forward,
   if (p->len != 0) {
     SERIAL_PRINTF("%s overflow\r\n", txq->name);  // auxbus_tx overflow
     txq_discard_all(txq);
-    bus->rxbuf->discard_len = 0; 
+    bus->rxbuf->discard_len = 0;
     return;
   }
   p->regular_pkt = regular_pkt;
@@ -1148,7 +1156,7 @@ static void tx_enq (struct rxbuf_s *from_rxbuf, struct bus_s *bus, byte forward,
       if (!pdata) {
         SERIAL_PRINTF("%s: large pkt: malloc(%u) failed\r\n", txq->name, alloc_len);
         return;
-      } 
+      }
       memcpy(pdata, data, len);
     }
     *(byte **)(p->data) = pdata;  // Pass pointer to the real data as first 4-bytes of p->data[]:
@@ -1169,8 +1177,11 @@ static void auxbus_send_msg (byte *data, uint16_t len)
     update_checksum(data);
   }
   tx_enq(NULL, &auxbus, forward_yes, regular_pkt, data, len);
-  if (auxrelay_detected)
-    tx_enq(NULL, &auxrelay, forward_no, regular_pkt, data, len);
+  if (auxrelay_detected) {
+    byte dst = data[3];
+    if (dst != DEV_ALT && dst != DEV_AZM && dst != DEV_ESP32 && dst != DEV_DUMMY)
+      tx_enq(NULL, &auxrelay, forward_no, regular_pkt, data, len);  // Needed for Nunchuck controlling Focus Motor, and SSAA tests
+  }
 }
 
 #define AUXBUS_SEND_MSG(...) do { byte _msg[] = {0x3b, 0x00, __VA_ARGS__, 0x00}; auxbus_send_msg(_msg, sizeof(_msg)); } while (0)
@@ -2213,7 +2224,7 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
       reply[len++] = 0x00;
       break;
     }
-    case OP(SSAG_SET_GUIDING,4): {           // 1-byte out:  00=disabled; 69: west=True altaz=True 
+    case OP(SSAG_SET_GUIDING,4): {           // 1-byte out:  00=disabled; 69: west=True altaz=True
       break;
     }
     case OP(SSAG_GET_GUIDING_DATA,13): {     // 10-bytes in:  Error(0, 0) Correction(0, 0) MoveRa = False MoveDec = False StopAll = TrueGuideStars = 0Quality = 0 00-00-00-00-91-00-00-00-00-00
@@ -4187,8 +4198,8 @@ static void dew_oled_set_aggr (byte channel)
       *out++ = '1';
       *out++ = '0' + (aggr - 10);
     } else {
-      *out++ = ' '; 
-      *out++ = '+'; 
+      *out++ = ' ';
+      *out++ = '+';
       *out++ = '0' + aggr;
     }
     *out++ = 'C';
@@ -4352,7 +4363,7 @@ static struct oled_type_s {
   {"SH1106_128x64",  &SH1106_128x64},
   {NULL, NULL}
 };
-  
+
 static void oled_get_type (void)
 {
   const char *oled_name = nvram_get_val("oled.type");
@@ -4736,7 +4747,7 @@ static void oled_setup ()
     oled.setFont((oled_type->lcdHeight == 32) ? System5x7 : HomeBrew5x14_font);
 
     // Show splash screen briefly at start-up:
-    oled_splash_timer = get_timeout(1300); 
+    oled_splash_timer = get_timeout(1300);
     oled_QRcode_updatefn();
     oled_updatefn_initial_call = true;
   }
@@ -4793,7 +4804,7 @@ static void oled_loop (void)
         }
       }
 #endif /* EMULATE_DEW */
-    } else { // (modepin == HIGH) 
+    } else { // (modepin == HIGH)
       modepin_debounce = 0;
       modepin_longpress = 0;
       if (modepin_nochange) {
@@ -4898,7 +4909,7 @@ static byte tx_enq_from_rxbuf (struct rxbuf_s *rxbuf, byte ret)
   bool regular_pkt = (ret == pkt_complete);
   byte dst = regular_pkt ? rxbuf->data[3] : 0xff;
   bool emulated = dev_is_emulated(dst);
-    
+
   if (emulated || rxbuf != auxbus.rxbuf)
     tx_enq(rxbuf, &auxbus,   (rxbuf != auxrelay.rxbuf) ? forward_yes : forward_no, regular_pkt, rxbuf->data, rxbuf->len);
   if (!emulated && rxbuf != auxrelay.rxbuf)
@@ -5928,7 +5939,7 @@ static void nvram_restore ()
     nvram_load_defaults();
     nvram_save();
   }
-  nvram_clear_reserved_slots(); 
+  nvram_clear_reserved_slots();
   musb_rfkill = !atoi(nvram_get_val("musb.rfenable"));
   suppress_lowbattery = !!atoi(nvram_get_val("suppress.lowbattery"));
   byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
@@ -6313,12 +6324,32 @@ static void ota_wait_for_data (long timeout)
   }
 }
 
+#define OTA_SIMPLE_FETCH_VERSION false
+
+static void ota_fetch_version (char *version, int maxlen, long timeout, const char *server, const char *path)
+{
+  if (OTA_SIMPLE_FETCH_VERSION) {
+    otaclient.stop();
+    SERIAL_PRINTF("Connecting to http://%s%s%s\r\n", server, (path[0] == '/') ? "" : "/", path);
+    ota_clength = 0;
+    if (!otaclient.connect(server, 80, timeout))
+      ota_exit("Connection failed");
+    otaclient.printf( "GET %s\r\n\r\n", path);
+    ota_wait_for_data(timeout);
+    String line = otaclient.readStringUntil('\n');
+    line.trim();
+    SERIAL_PRINTF("server: %s\r\n", line.c_str());
+    const char *v = line.c_str();
+    strncpy(version, v, maxlen);
+  }
+}
+
 static void ota_fetch_file (long timeout, const char *server, const char *path)
 {
   otaclient.stop();
   SERIAL_PRINTF("Connecting to http://%s%s%s\r\n", server, (path[0] == '/') ? "" : "/", path);
   ota_clength = 0;
-  if (!otaclient.connect(server, 80))
+  if (!otaclient.connect(server, 80, timeout))
     ota_exit("Connection failed");
   otaclient.printf( "GET %s HTTP/1.1\r\n"
                     "Host: %s\r\n"
@@ -6341,30 +6372,35 @@ static void ota_fetch_file (long timeout, const char *server, const char *path)
       ota_clength = atoi(s + strlen(Content_Length));
   }
 }
-  
+
 static void ota_fetch_update (void)
 {
   long timeout = get_timeout(10 * 1000);
+  char version[16] = {0,};
 
   ota_show_progress(0, 0);  // Initialize the display
-  ota_fetch_file(timeout, ota_update_server, ota_version_path);
-  // Note: server seems to respond with a bytecount line as well as the actual data..
-
-  while (1) {
-    ota_wait_for_data(timeout);
-    String line = otaclient.readStringUntil('\n');
-    const char *data = line.c_str();
-    SERIAL_PRINTF("server: %s\r\n", data);
-    if (data[0] == 'v') {
-      SERIAL_PRINTF("OTA: running=" VERSION ", available=%s\r\n", data);
-      if (0 == strcmp(data, VERSION))
-        ota_exit("Already Up-to-date");
-      char tmp[OLED_ROW_CHARS + 1];
-      sprintf(tmp, "Updating to %s", data);
-      oled_set_row(0, tmp);
-      break;
+  if (OTA_SIMPLE_FETCH_VERSION) {
+    ota_fetch_version(version, sizeof(version) - 1, timeout, ota_update_server, ota_version_path);
+  } else {
+    ota_fetch_file(timeout, ota_update_server, ota_version_path);
+    // Note: server seems to respond with a bytecount line as well as the actual data..
+    while (1) {
+      ota_wait_for_data(timeout);
+      String line = otaclient.readStringUntil('\n');
+      const char *data = line.c_str();
+      SERIAL_PRINTF("server: %s\r\n", data);
+      if (data[0] == 'v') {
+        strncpy(version, data, sizeof(version) - 1);
+        break;
+      }
     }
   }
+  SERIAL_PRINTF("OTA: running=" VERSION ", available=%s\r\n", version);
+  if (0 == strcmp(version, VERSION))
+    ota_exit("Already Up-to-date");
+  char tmp[OLED_ROW_CHARS + 1];
+  sprintf(tmp, "Updating to %s", version);
+  oled_set_row(0, tmp);
 
   // Now do the actual firmware download/update:
   timeout = get_timeout(15 * 1000);
