@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.11"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-10-14"
+#define VERSION "v8.12"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-10-19"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -28,14 +28,18 @@
  * Tools-->Board-->Boards_Manager: ensure the esp32 support is 2.1.x or higher.
  *
  * For Mount-USB and Arduino IDE:
- * >>> MS-Windows Driver installation is required for the onboard CP210x USB-Serial chip:
+ * >>> MS-Windows Driver installation is required for the onboard CP210x USB-25rial chip:
  *     Go here:  https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers?tab=downloads
  *     Download/save the CP210x Universal Windows Driver .zip file.
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
- * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again.  WTF?
+ * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  *
+ * Version 8.12
+ *  -- Turn OLED on before aio_setup(), for much earlier feedback after power-on.
+ *  -- Show BT AUX/USB mode on OLED.
+ *  -- Fix bugs and clean-up Bluetooth state management.
  * Version 8.11
  *  -- Include VERSION_DATE as part of OTA Update version check.
  *  -- Verify that single-letter commands are actually single-letters!
@@ -97,6 +101,7 @@
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor.
+
 #define ETHERNET_ENABLED          false // Do not edit this line.  See "aio.h" instead.
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
 #define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
@@ -195,6 +200,10 @@ static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUX
 #include <Wire.h>
 #include "BluetoothSerial.h"
 
+BluetoothSerial        bt;
+static char            bt_id[32];
+static long            bt_connected = 0;
+
 /*
  * There is no serial "debug" port if (musb_selected && relay_detected).
  * Too complex to attempt debug over SoftwareSerial for now.
@@ -273,8 +282,6 @@ static long auxtest_timer       = 0;
 
 static WiFiClient w2000;             // The wifi application port 2000, for controlling the mount
 static WiFiClient w3000;             // The wifi management  port 3000, for configuring the adapter
-static char       bt_id[32];
-static long       bt_is_active  = 0;
 static byte       wifi_mac_addr[6];  // Filled in by setup(), used to create unique SSIDs
 static char       current_ssid[32];
 static char       current_ipaddr[32];
@@ -283,7 +290,8 @@ static char       current_ipaddr[32];
 static const IPAddress server_static_ip(SERVER_IPADDRESS);
 static const IPAddress server_static_netmask(255,255,255,0);
 
-static enum {bt_mode_off, bt_mode_aux, bt_mode_usb} bt_mode = bt_mode_off;  // needed by AIO bt stuff
+static bool bt_enabled = false;
+static enum {bt_mode_aux, bt_mode_usb} bt_mode = bt_mode_aux;
 
 static inline void SERIAL_WRITE     (const char *s) { if    (SerialDebug)  SerialDebug->write(s);        }
 static inline int  SERIAL_AVAILABLE (void)          { return SerialDebug ? SerialDebug->available() : 0; }
@@ -313,7 +321,7 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
   if (SerialDebug) {SerialDebug->print(x);}                                              \
 } while (0)
 
-#define Serial Serial_UNDEFINED  // Prevent using "Serial" by accident
+#define Serial      Serial_UNDEFINED  // Prevent using "Serial" by accident
 
 static void set_wifi_info (const char *ssid, IPAddress ip)
 {
@@ -4664,7 +4672,8 @@ static void oled_connectstatus_updatefn (void)
     snprintf(tmp, OLED_ROW_CHARS, "%-5s %s Connected",    hbg3_version, connection);
   oled_set_row(0, tmp);
   if (connection[0] == 'B') {
-    oled_set_row(1, "Mode: Bluetooth");
+    snprintf(tmp, OLED_ROW_CHARS, "Mode: %s", (bt_mode == bt_mode_aux) ? "AUX protocol" : "USB handset");
+    oled_set_row(1, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", bt_id);
     oled_set_row(2, tmp);
     oled_clear(3);
@@ -4840,17 +4849,15 @@ static void oled_init_modes (void)
 
 static void oled_setup ()
 {
+  // Note: called too early to make use of any SerialDebug output.
   oled_clear(0);
   oled_init_modes();
   oled_get_type();
   Wire.beginTransmission(OLED_I2C_ADDRESS);
   oled_detected = (Wire.endTransmission() == 0);
-  if (!oled_detected) {
-    SERIAL_PRINTLN("OLED not detected");
-  } else {
+  if (oled_detected) {
     if (OLED_MODE_PIN != -1)
       pinMode(OLED_MODE_PIN, INPUT_PULLUP);
-    SERIAL_PRINTLN("OLED detected");
     oled.begin(oled_type, OLED_I2C_ADDRESS);
     oled.clear();
     oled.setFont((oled_type->lcdHeight == 32) ? System5x7 : HomeBrew5x14_font);
@@ -5095,9 +5102,6 @@ static inline bool block_cfm_connections (struct rxbuf_s *rxbuf, byte src, byte 
   if (!auxbus_passive_mode && (src == DEV_CFM || (src == DEV_SW && dst == DEV_UART))) {
     auxbus_raw_break();
     SERIAL_PRINTLN("Caught Celestron Firmware Manager (CFM); killing the connection!");
-    w2000.stop();
-    set_bt_connected(__func__, false);
-    musb_disconnect();
     (void)packet_reset(rxbuf, pkt_fail);
     while (true) delay(1000);  // Freeze all further operation to prevent CFM from doing anything
     return true;  // Never reached
@@ -5260,26 +5264,37 @@ static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
   return tx_enq_from_rxbuf(rxbuf, pkt_complete);
 }
 
-BluetoothSerial        bt;
-static bool            bt_connected = false;
-static inline bool     bt_available (void) {return bt.available();}
-
-static inline byte bt_read (void)
+static void bt_setup (void)
 {
-  bt_is_active = get_timeout(10 * 1000);
-  return bt.read();
+  init_rxbuf(&bt_rxbuf, "bt_rx");
+  if (musb_selected && musb_rfkill) {
+    bt_enabled = false;
+  } else {
+    bt_enabled = true;
+    sprintf(bt_id, "%s%02X%02X%02X", DEFAULT_SSID, wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
+    bt.begin(bt_id);
+  }
 }
 
-static void set_bt_connected (const char *who, bool connected)
+static inline void bt_restart (void)
 {
-  if (connected != bt_connected) {
-    if (!bt_connected)
-      init_rxbuf(&bt_rxbuf, "bt_rx");
-    bt_connected = connected;
-    SERIAL_PRINTF("%s: bt_connected=%d\r\n", who, connected);
-    if (!bt_connected && bt_mode != bt_mode_usb)
-      bt_aux_restart();
+  if (bt_enabled) {
+    bt_enabled = false;
+    bt.end();
   }
+  bt_setup();
+}
+
+static inline bool bt_check_connection (void)
+{
+  bool connected = bt_enabled ? bt.connected(0) : false;
+  if (connected != bt_connected) {
+    SERIAL_PRINTF("BT: %s mode %u\r\n", connected ? "CONNECTED" : "DISCONNECTED", bt_mode);
+    bt_connected = connected;
+    if (!connected)
+      bt_restart();
+  }
+  return connected;
 }
 
 static inline void bt_tx (bool from_ssaa, byte *data, uint16_t count)
@@ -5294,8 +5309,16 @@ static inline void bt_tx (bool from_ssaa, byte *data, uint16_t count)
 
 static inline void bt_tx_aux (bool from_ssaa, byte *data, uint16_t count)
 {
-  if (bt_mode != bt_mode_usb)
+  if (bt_mode == bt_mode_aux)
     bt_tx(from_ssaa, data, count);
+}
+
+static inline void bt_aux_rx (void)
+{
+  if (bt_connected) {
+    while (bt.available())
+      (void)packet_decoder(&bt_rxbuf, bt.read());
+  }
 }
 
 static void w2000_tx (bool from_ssaa, byte *data, uint16_t count)
@@ -6078,11 +6101,13 @@ static void nvram_restore ()
 #endif
 #if EMULATE_SSAA
   emulate_ssaa    = !!atoi(nvram_get_val("emulate.ssaa"));
-  SERIAL_PRINTF("emulate.ssaa=%u\r\n", emulate_ssaa);
+  if (emulate_ssaa)
+    SERIAL_PRINTF("emulate.ssaa=%u\r\n", emulate_ssaa);
 #endif
 #if EMULATE_SSAG
   emulate_ssag    = !!atoi(nvram_get_val("emulate.ssag"));
-  SERIAL_PRINTF("emulate.ssag=%u\r\n", emulate_ssag);
+  if (emulate_ssag)
+    SERIAL_PRINTF("emulate.ssag=%u\r\n", emulate_ssag);
 #endif
 #if EMULATE_GPS
   gps_disabled    = !!atoi(nvram_get_val("disable.gps"));
@@ -6187,6 +6212,8 @@ static inline bool autodetect_wifi_relay_mode (const char *ssid)
   return false;
 #endif
 }
+
+static void non_wifi_loop (void);
 
 static bool wifi_begin_client_mode()
 {
@@ -6307,8 +6334,6 @@ static void manage_esp32_wifi (bool want_off)
 {
   static long esp32_wifi_off_timer = 0;
   if (!want_off) {
-    if (bt_mode != bt_mode_usb)
-      set_bt_connected(__func__, false);
     esp32_wifi_off_timer = 0;
     set_esp32_wifi_onoff();
   } else if (!esp32_wifi_off_timer) {
@@ -6336,8 +6361,8 @@ static void manage_evo_wifi (bool want_off)
 static void manage_wifi_onoff ()
 {
   // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
-  manage_esp32_wifi(bt_is_active || (musb_selected && musb_rfkill));
-  manage_evo_wifi  (bt_is_active || musb_connected || (!esp32_wifi_off && w2000.connected()));
+  manage_esp32_wifi(bt_connected || (musb_selected && musb_rfkill));
+  manage_evo_wifi  (bt_connected || musb_connected || (!esp32_wifi_off && w2000.connected()));
 }
 
 // **** Begin OTA Firmware Update **************************************************************************************
@@ -6800,7 +6825,7 @@ static void set_p3000_debug (bool on_off, bool debug_ethernet)
 static const char *get_connection_type (void)
 {
   const char *connection;
-       if (bt_is_active)      connection = "BT";
+       if (bt_connected)      connection = "BT";
   else if (musb_connected)    connection = "USB";
   else if (w2000.connected()) connection = "W2";
 #if ETHERNET_ENABLED
@@ -6858,7 +6883,7 @@ static void status_command (void (*writep)(const char *))
   strcat(tmp, "; ");
   writep(tmp);
   if (connection[0] == 'B') {
-    sprintf(tmp, "Mode: Bluetooth, SSID: %s; ", bt_id);
+    sprintf(tmp, "Mode: Bluetooth %s, SSID: %s; ", (bt_mode == bt_mode_aux) ? "AUX" : "USB", bt_id);
     writep(tmp);
   }
   if (connection[0] == 'U') {
@@ -7110,7 +7135,6 @@ static void w2000_loop()
   if (!wifi_port_is_connected(w2000, &connected, poll_for_new_w2000_connection, "w2000")) {
     w2000_timeout = 0;
   } else {
-    set_bt_connected(__func__, false);
     while (w2000.available()) {
       (void)packet_decoder(&w2000_rxbuf, w2000.read());
       w2000_timeout = 0;
@@ -7148,38 +7172,6 @@ static void auxtest_loop ()
   }
 }
 
-static void bt_aux_restart (void)
-{
-  static bool initialized = false;
-  if (initialized) {
-    bt_mode = bt_mode_off;
-    SERIAL_PRINTF("%s: bt_mode=bt_mode_off\r\n", __func__);
-    bt.end();
-  } else {
-    initialized = true;
-  }
-  if (musb_selected && musb_rfkill)
-    return;
-  sprintf(bt_id, "%s%02X%02X%02X", DEFAULT_SSID, wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
-  bt_mode = bt_mode_aux;
-  SERIAL_PRINTF("%s: bt_mode=bt_mode_aux\r\n", __func__);
-  bt.begin(bt_id);
-  init_rxbuf(&bt_rxbuf, "bt_rx");
-}
-
-static inline void bt_aux_rx (void)
-{
-  if (!(musb_selected && musb_rfkill) && bt_available()) {
-    set_bt_connected(__func__, true);  // enables bt_tx()
-    while (bt_available())
-      (void)packet_decoder(&bt_rxbuf, bt_read());
-  }
-  if (bt_is_active && time_after(millis(), bt_is_active)) {
-    bt_is_active = 0;
-    SERIAL_PRINTF("%s: bt timed-out\r\n", __func__);
-  }
-}
-
 // Temporary arrangement(?):  second include of same file defines functions etc..
 #ifdef __has_include
   #if __has_include("aio.h")
@@ -7187,15 +7179,17 @@ static inline void bt_aux_rx (void)
   #endif
 #endif
 
-void non_wifi_loop (void)
+static void non_wifi_loop (void)
 {
   if (nvram_delayed_save && time_after(millis(), nvram_delayed_save))
     nvram_save();
   if (SerialDebug)
     serial_loop();
   auxtest_loop();
-  if (bt_mode != bt_mode_usb)
-    bt_aux_rx();
+  if (bt_check_connection()) {
+    if (bt_mode == bt_mode_aux)
+      bt_aux_rx();
+  }
   bus_loop(&auxbus);
   if (auxrelay_detected)
     bus_loop(&auxrelay);
@@ -7237,10 +7231,15 @@ void setup (void)
   auxrelay_detected = bus_init(&auxrelay, true,  "relay",  &auxrelay_uart, AUXRELAY_RX_PIN, AUXRELAY_TX_PIN, AUXRELAY_BUSYIN_PIN, AUXRELAY_BUSYOUT_PIN);
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
-#ifdef AIO_H
-  aio_setup_early();
-#endif
 
+  Wire.begin();                   // Prepare the I2C bus for use
+  Wire.setClock(100000ul);        // 400000ul causes WiFi/BT issues.
+#if OLED_ENABLED
+  oled_setup();
+#endif
+#ifdef AIO_H
+  aio_setup_early();  // needed here for the MUSB switch which uses a USB chip GPIO
+#endif
   // Now sort out the other uart assignments:
   if (ESP32_WIFI_MODE_PIN != -1)
     pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
@@ -7249,10 +7248,12 @@ void setup (void)
     delay(5);
   }
   musb_selected = musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
+
   if (!musb_selected) {
+    musb_uart   = NULL;
     SerialDebug = &hwserial0;
     SerialDebug->begin(115200, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN); // The USB pins are the main debug/command port:
-    musb_uart   = NULL;
+    SerialDebug->flush(false);
   } else {
     if (EMULATE_GPS || auxrelay_detected) {
       SerialDebug = NULL;
@@ -7260,6 +7261,7 @@ void setup (void)
     } else {
       SerialDebug = &hwserial0;
       SerialDebug->begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+      SerialDebug->flush(false);
       musb_uart   = &hwserial1;
     }
     init_rxbuf(&musb_rxbuf, "musb_rx");
@@ -7268,10 +7270,7 @@ void setup (void)
     musb_uart->flush(false);
   }
 
-  Wire.begin();                   // Prepare the I2C bus for use
-  Wire.setClock(100000ul);        // 400000ul causes WiFi/BT issues.
   fram_setup();
-
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LED_ON);   // Turn on the blue LED while initializing NVRAM
   WiFi.macAddress(wifi_mac_addr);  // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
@@ -7283,8 +7282,6 @@ void setup (void)
          NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, mount_reversed_alt);
   init_rxbuf(&w2000_rxbuf, "w2000_rx");
   memset(spaces, ' ', sizeof(spaces) - 1);
-  bt_aux_restart();
-
 #if EMULATE_GPS
   gps_using_swserial = musb_selected || auxrelay_detected;
   SERIAL_PRINTF("GPS uart is %s\r\n", GPS_UART_NAME());
@@ -7297,12 +7294,10 @@ void setup (void)
   gps_turn_on(true, true);
   GPS_UART_FLUSH();
 #endif /* EMULATE_GPS */
+  SERIAL_PRINTF("OLED %sdetected\r\n", oled_detected ? "" : "not ");
 
 #if NCHUCK_ENABLED
   nchuck_detect();  // Do this part earlier than the rest so user can touch thumbstick sooner
-#endif
-#if OLED_ENABLED
-  oled_setup();
 #endif
 #if EMULATE_DEW
   dew_setup();
@@ -7310,6 +7305,7 @@ void setup (void)
 #ifdef AIO_H
   aio_setup();
 #endif
+  bt_setup();
   if (is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
     wifi_begin_server_mode();
