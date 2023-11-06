@@ -9,14 +9,14 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.0"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-09-12"
+#define VERSION "v8.2"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-09-13"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install Arduino Legacy IDE v1.8.xx from https://www.arduino.cc/en/software (scroll down!)
  *  -- Install ESP32 support into Arduino IDE: https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html
  *  -- First, select Board="ESP32 Dev Module".
- *  -- Now choose Partition Scheme="Huge APP (3MB..)".
+ *  -- Now choose Partition Scheme="Minimal SPIFFS.."
  *  -- and also CPU Frequency = 160Mhz (WiFi/BT).
  *  -- Use Tools-->Manage-Libraries to install EspSoftwareSerial library.
  *  -- For EMULATE_FOCUS=true, use Tools-->Manage-Libraries to install AccelStepper library.
@@ -32,6 +32,15 @@
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
+ * Version 8.2
+ *  -- OTA:   Fix bug when scanning for Content-Length header line.
+ *  -- OTA:   Compare file timestamp against saved (nvram) timestamp to decide if already up-to-date or not.
+ *  -- NVRAM: New NVRAM setting for suppress.lowbattery: Use '1' to block Evolution Low-Battery warnings.
+ *  -- NVRAM: New NVRAM settings for OTA update server and path.
+ *  -- NVRAM: Change mount.reversed.alt to a simple 0/1 setting instead of "Yes".
+ * Version 8.1
+ *  -- P3000: Use w3000.printf() instead of unnecessary w3000_printf().
+ *  -- OTA:   Introduce new Over-The-Air (OTA) firmware updates.
  * Version 8.0
  *  -- P3000: Toggle serial-debug redirection onto WiFi port 3000 with "debug" command there.
  *  -- MUSB:  Make changing the MUSB switch position trigger a reset of the HBG3 after a short delay.
@@ -134,6 +143,10 @@
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor.
 
+#define NVRAM_VALS_MAX_LEN 31
+static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
+static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
+
 #if EMULATE_DEW
   #define ADC_VREF_ENABLE         true  // When true, thermistor readings will use the factory-calibrated VREF value.
   #ifdef __has_include
@@ -215,6 +228,7 @@ static bool oled_detected       = false;
 static byte cordwrap_override   = 0;
 static bool auxrelay_ssforward  = false;  // When true, AUXRELAY will forward StarSense Camera packets across the relay.
 static bool p3000_debug         = false;  // When true, serial debug commands/output will be redirected to the port 3000 connection.
+static bool suppress_lowbattery = false;  // For low-battery warnings spewed from the Evolution mount.
 
 static const char *nvram_get_val(const char *name);
 static void nvram_save_val (const char *name, int val);
@@ -259,28 +273,11 @@ static inline int  SERIAL_AVAILABLE (void)          { return SerialDebug ? Seria
 static inline char SERIAL_READ      (void)          { return SerialDebug ? SerialDebug->read()      : 0; }
 static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  SerialDebug->flush(txonly);   }
     
-static void w3000_printf (const char *fmt, ...)
-{
-  va_list ap;
-  va_start(ap, fmt);
-  const int tmpsize = 127;
-  char *tmp = (char *)malloc(tmpsize + 1);
-  if (!tmp) {
-    va_end(ap);
-  } else {
-    vsnprintf(tmp, tmpsize, fmt, ap);
-    tmp[tmpsize] = 0;
-    w3000.write(tmp);
-    w3000.flush();
-    free(tmp);
-  }
-}
-
 // Debug messages use these macros, normally sending to debug uart, but possibly instead to the TCP/IP Port-3000 connection:
 #define W3000_ENDLINE()             do {     w3000.write("\r\n"); w3000.flush(); } while (0)
 #define SERIAL_ENDLINE()            do { if (p3000_debug) {W3000_ENDLINE();                } else if (SerialDebug) {SerialDebug->println();           SERIAL_FLUSH(true);}} while (0)
 #define SERIAL_PRINTLN(x)           do { if (p3000_debug) {w3000.write(x); W3000_ENDLINE();} else if (SerialDebug) {SerialDebug->println(x);          SERIAL_FLUSH(true);}} while (0)
-#define SERIAL_PRINTF(...)          do { if (p3000_debug) {w3000_printf(__VA_ARGS__);      } else if (SerialDebug) {SerialDebug->printf(__VA_ARGS__); SERIAL_FLUSH(true);}} while (0)
+#define SERIAL_PRINTF(...)          do { if (p3000_debug) {w3000.printf(__VA_ARGS__);      } else if (SerialDebug) {SerialDebug->printf(__VA_ARGS__); SERIAL_FLUSH(true);}} while (0)
 #define SERIAL_PRINT(x)             do { if (p3000_debug) {w3000.write(x);                 } else if (SerialDebug) {SerialDebug->print(x);                               }} while (0)
 
 #define Serial                      Serial_UNDEFINED  // Prevent using "Serial" by accident
@@ -1902,7 +1899,6 @@ static long     gps_last_baud_change = 0;
 
 #include <SoftwareSerial.h>
 SoftwareSerial swserial0;
-SoftwareSerial swserial1;
 static bool    gps_using_swserial;
 #define SWSERIAL_bufCapacity   96  // library default is 64; WARNING: uses a LOT of memory!
 
@@ -4527,7 +4523,7 @@ static void oled_gps_updatefn (void)
 #endif
 
 #if EMULATE_DEW
-static void oled_dewcontrol_updatefn()
+static void oled_dewcontrol_updatefn (void)
 {
   if (!dew_detected) {
     oled_set_row(0, "DewControl: no SHT3x");
@@ -4539,7 +4535,7 @@ static void oled_dewcontrol_updatefn()
 }
 #endif /* EMULATE_DEW */
 
-static void oled_connectstatus_updatefn()
+static void oled_connectstatus_updatefn (void)
 {
   char tmp[OLED_ROW_CHARS + 1];
   tmp[OLED_ROW_CHARS] = 0;
@@ -4582,9 +4578,23 @@ static void oled_connectstatus_updatefn()
 
 static bool oled_turned_off = false;
 static long oled_offtime = 0;
-#define OLED_NMODES (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + 2)  // Network and blank/off are the other two modes
+#define OLED_NMODES (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + 3)  // Network, OTA, and blank/off are the 3 other modes
 
-static void oled_off_updatefn(void)
+static void oled_ota_updatefn (void)
+{
+  char tmp[OLED_ROW_CHARS+1];
+  oled_set_row(0, "OTA Firmware Update");
+  oled_set_row(1, "===================");
+  if (wifi_client_mode) {
+    oled_set_row(2, "To trigger update,");
+    oled_set_row(3, "  Push/hold button");
+  } else {
+    oled_set_row(2, "Wrong WiFi mode:");
+    oled_set_row(3, "  Needs Access Point");
+  }
+}
+
+static void oled_off_updatefn (void)
 {
   if (!oled_turned_off) {
     char tmp[OLED_ROW_CHARS+1];
@@ -4597,7 +4607,7 @@ static void oled_off_updatefn(void)
     tmp[OLED_ROW_CHARS] = 0;
     oled_set_row(3, tmp);
     if (!oled_offtime) {
-      oled_offtime = get_timeout(2000);
+      oled_offtime = get_timeout(2500);
     } else if (time_after(millis(), oled_offtime)) {
       oled_offtime = 0;
       oled_turned_off = true;
@@ -4619,6 +4629,7 @@ static void oled_init_modes (void)
   #if EMULATE_GPS
     oled_updatefn[mode++] = oled_gps_updatefn;
   #endif
+  oled_updatefn[mode++] = oled_ota_updatefn;
   oled_updatefn[mode++] = oled_off_updatefn;
 }
 
@@ -4656,6 +4667,14 @@ static void oled_loop (void)
     modepin_debounce = get_timeout(100);
   } else if (modepin_debounce && time_after(millis(), modepin_debounce)) {
     if (modepin == LOW) {
+      if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn) {
+        if (!modepin_longpress) {
+          modepin_longpress = get_timeout(3000);
+        } else if (time_after(millis(), modepin_longpress)) {
+          modepin_longpress = 0;
+          ota_fetch_update();
+        }
+      }
 #if EMULATE_DEW
       if (dew_detected && dew_automode[0] && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
         if (!modepin_longpress) {
@@ -4812,6 +4831,21 @@ static inline void bus_autodetect_ssforward (struct bus_s *bus, byte src, byte d
   }
 }
 
+static inline bool suppress_lowbattery_warnings (struct rxbuf_s *rxbuf)
+{
+  // Regular bursts of battery warnings from the Evolution mount:
+  if (suppress_lowbattery && rxbuf->data[1] == 0x04 && rxbuf->data[5] == 0) {
+    // Send a response, to make it stop complaining for a period:
+    byte msg[] = {0x3b, 0x03, rxbuf->data[3], DEV_AZM, MC_SEND_WARNING, 0x00};
+    update_checksum(msg);
+    tx_enq(NULL, rxbuf->bus, forward_no, REGULAR_PKT, msg, sizeof(msg));
+    rxbuf->len = 0;  // eat it
+    packet_reset(rxbuf, pkt_fail);
+    return true;
+  }
+  return false;
+}
+
 static inline bool block_cfm_connections (struct rxbuf_s *rxbuf, byte src, byte dst)
 {
 #if !BLOCK_CFM_CONNECTIONS
@@ -4962,25 +4996,27 @@ static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
   struct bus_s *bus = rxbuf->bus;
   if (bus && rxbuf->len == bus->txq->last_tx_len) {
     if (0 == memcmp(rxbuf->data, bus->txq->last_tx, rxbuf->len)) {
-      rxbuf->len = 0;
+      rxbuf->len = 0;  // eat it
       return packet_reset(rxbuf, pkt_fail);
     }
   }
 
   // Handle a fully completed packet:
+  if (TVERBOSE(rxbuf->data))
+      print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
+
   byte src = rxbuf->data[2];
   byte dst = rxbuf->data[3];
   rxbuf->requestor = src;  // Used to prevent forwarding this packet back to originator
   bus_autodetect_ssforward(bus, src, dst);
+  byte op = rxbuf->data[4];
 
-  // CFM likes to shift baud rates on the fly:
-  if (rxbuf->data[4] == UART_SET_BAUD)
-    handle_uart_set_baud(rxbuf);
-
-  if (TVERBOSE(rxbuf->data))
-      print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
   if (block_cfm_connections(rxbuf, src, dst))
-    return pkt_fail;  // never reached
+    return pkt_fail;
+  if (src == DEV_AZM && op == MC_SEND_WARNING && suppress_lowbattery_warnings(rxbuf))
+    return pkt_fail;
+  if (op == UART_SET_BAUD)  // CFM likes to shift baud rates on the fly:
+    handle_uart_set_baud(rxbuf);
   if (src == DEV_FOCUS)
     fm_detected = true;
 #if NCHUCK_ENABLED
@@ -5562,7 +5598,7 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"reserved15",
   (char *)"reserved14",
   (char *)"reserved13",
-  (char *)"reserved12",
+  (char *)"suppress.lowbattery",
   (char *)"reserved11",
   (char *)"reserved10",
   (char *)"reserved9",
@@ -5572,13 +5608,11 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"reserved5",
   (char *)"reserved4",
   (char *)"reserved3",
-  (char *)"reserved2",
-  (char *)"reserved1",
-  (char *)"reserved0",
+  (char *)"ota.timestamp",
+  (char *)"ota.update.server",
+  (char *)"ota.update.path",
   (char *)NULL
 };
-
-#define NVRAM_VALS_MAX_LEN 31
 
 static       char nvram_vals         [NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1];
 static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
@@ -5606,7 +5640,7 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // disable.gps
   ""                // cordwrap.override
   ""                // reserved15
-  ""                // reserved14
+  ""                // suppress.lowbattery
   ""                // reserved13
   ""                // reserved12
   ""                // reserved11
@@ -5618,9 +5652,9 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // reserved5
   ""                // reserved4
   ""                // reserved3
-  ""                // reserved2
-  ""                // reserved1
-  ""                // reserved0
+  ""                // ota.timestamp
+  ""                // ota.update.server
+  ""                // ota.update.path
   ""                // NULL
 };
 
@@ -5637,10 +5671,17 @@ static int nvram_find_val (const char *name)
   return -1;
 }
 
-static const char *nvram_get_val(const char *name)
+static const char *nvram_get_val (const char *name)
 {
   int x = nvram_find_val(name);
   return (x == -1) ? "" : nvram_vals[x];
+}
+
+static void nvram_get_nonblank_val (const char *name, char *dst)
+{
+  const char *tmp = nvram_get_val(name);
+  if (*tmp)
+    strcpy(dst, tmp);
 }
 
 static long nvram_delayed_save = 0;
@@ -5704,10 +5745,10 @@ static void nvram_restore ()
       nvram_initialized = true;
     }
   } else {
-    bool ret = SPIFFS.begin(false);
+    bool ret = SPIFFS.begin(false, "/spiffs", 2);  // Max 2 open files at a time
     if (!ret) {
       SERIAL_PRINTLN("Formatting SPIFFS -- please wait on BLUE LED");
-      bool ret = SPIFFS.begin(true);
+      ret = SPIFFS.begin(true, "/spiffs", 2);  // Max 2 open files at a time
     }
     if (!ret) {
       SERIAL_PRINTLN("SPIFFS.begin failed");
@@ -5733,6 +5774,7 @@ static void nvram_restore ()
     nvram_load_defaults();
     nvram_save();
   }
+  suppress_lowbattery = !!atoi(nvram_get_val("suppress.lowbattery"));
 #if EMULATE_FOCUS
   focus_backlash_pos =   atoi(nvram_get_val("focus.backlash.pos"));
   focus_backlash_neg =   atoi(nvram_get_val("focus.backlash.neg"));
@@ -5764,7 +5806,10 @@ static void nvram_restore ()
   dew_max_amperage[0] = nvram_restore_dew_amperage(0);
   dew_max_amperage[1] = nvram_restore_dew_amperage(1);
 #endif
-  mount_reversed_alt = (0 == strcmp(nvram_get_val("mount.reversed.alt"), "Yes"));
+  nvram_get_nonblank_val("ota.update.server", ota_update_server);
+  nvram_get_nonblank_val("ota.update.path",   ota_update_path);
+  dew_max_amperage[1] = nvram_restore_dew_amperage(1);
+  mount_reversed_alt = !!atoi(nvram_get_val("mount.reversed.alt"));
   // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
   // Insert our MAC address and ADAPTER_VERSION string into the advertisement broadcast string:
   sprintf(advertisement, "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\n\"version\":\"" ADAPTER_VERSION "%s\"\n}",
@@ -5773,7 +5818,7 @@ static void nvram_restore ()
     SERIAL_PRINTF("UDP advertisement=%s\r\n", advertisement);
 }
 
-static void nvram_save ()
+static void nvram_save (void)
 {
   if (!nvram_initialized)
     return;
@@ -5993,6 +6038,166 @@ static void manage_wifi_onoff ()
   manage_esp32_wifi(bt_is_active || musb_selected);
   manage_evo_wifi  (bt_is_active || musb_connected || (!esp32_wifi_off && w2000.connected()));
 }
+
+// **** Begin OTA Firmware Update **********************************************************************************************************
+
+#include <ArduinoOTA.h>
+#include <Update.h>
+
+#define otaclient w2000   // Re-use w2000 for this (saves memory)
+
+#if OLED_ENABLED
+static void oled_refresh_all (void)
+{
+    oled_write_row(0);
+    oled_write_row(1);
+    oled_write_row(2);
+    oled_write_row(3);
+}
+
+static void oled_show_progress (byte percent, size_t progress, size_t total)
+{
+  char tmp[OLED_ROW_CHARS + 1];
+  if (total == 0) {
+    oled_set_row(0, "OTA Firmware Update");
+    oled_set_row(1, "===================");
+  }
+  sprintf(tmp, "Progress: %3u%%", percent);
+  oled_set_row(2, tmp);
+  snprintf(tmp, OLED_ROW_CHARS, "%7lu/%lu", progress, total);
+  tmp[OLED_ROW_CHARS] = 0;
+  oled_set_row(3, tmp);
+  oled_refresh_all();
+}
+#endif /* OLED_ENABLED */
+
+static void ota_show_progress (size_t progress, size_t total)
+{
+  static byte old_percent;
+  byte percent;
+  percent = total ? (progress * 100 / total) : ~(old_percent = ~0);
+  if (percent != old_percent) {
+    old_percent = percent;
+    SERIAL_PRINTF("OTA update: %3u%%\r\n", percent);
+  }
+  #if OLED_ENABLED
+    if (oled_detected)
+      oled_show_progress(percent, progress, total);
+  #endif
+  monitor_musb_switch();
+}
+
+// Update firmware from existing stream: this type is triggered by pressing buttons.
+static bool firmware_update_from_stream (uint32_t clength)
+{
+  if (!Update.begin(clength)) {
+    SERIAL_PRINTLN("Not enough space to begin OTA");
+  } else {
+    SERIAL_PRINTF("Begin OTA update, length is %d\r\n", clength);
+    Update.onProgress([](size_t progress, size_t total)
+    {
+      ota_show_progress(progress, total);
+    });
+    ulong wrote = Update.writeStream(otaclient);
+    SERIAL_ENDLINE();
+    if (wrote != clength) {  // Update.writeStream() does the download/update
+      SERIAL_PRINTF("Write failed! %lu/%lu %s\r\n", wrote, clength, Update.errorString());
+      Update.abort();
+      return false;
+    }
+    SERIAL_PRINTF("Wrote %d bytes successfully\r\n", clength);
+    if (Update.end()) {
+      SERIAL_PRINTLN("OTA done");
+      if (Update.isFinished()) {
+        SERIAL_PRINTLN("Update successfully completed");
+        return true;  // Success
+      } else {
+        SERIAL_PRINTLN("Update not finished!");
+      }
+    } else {
+      SERIAL_PRINTF("Error Occurred. Error %s\r\n", Update.errorString());
+    }
+  }
+  return false;
+}
+
+static void ota_exit (const char *msg)
+{
+#if OLED_ENABLED
+  if (oled_detected) {
+    oled_set_row(3, msg);
+    oled_write_row(3);
+  }
+#endif
+  SERIAL_PRINTLN(msg);
+  delay(5000);
+  ESP.restart();
+}
+
+static void ota_fetch_update (void)
+{
+  long        timeout = get_timeout(10 * 1000);
+  ulong       clength = 0;
+  char        file_timestamp[NVRAM_VALS_MAX_LEN + 1] = {0,};
+
+  ota_show_progress(0, 0);  // Initialize the display
+  otaclient.stop();
+  SERIAL_PRINTF("Connecting to %s for %s\r\n", ota_update_server, ota_update_path);
+  if (!otaclient.connect(ota_update_server, 80))
+    ota_exit("Connection failed");
+  otaclient.printf( "GET /%s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Cache-Control: no-cache\r\n"
+                    "Connection: close\r\n\r\n",
+                     ota_update_path,
+                     ota_update_server );
+  while (otaclient.available() == 0) {
+    if (time_after(millis(), timeout))
+      ota_exit("Host timed-out");
+  }
+
+  while (otaclient.available()) {
+    String line = otaclient.readStringUntil('\n');
+    line.trim();
+    SERIAL_PRINTF ("%s\r\n", line.c_str());
+    if (!line.length())  // End of headers?
+      break;             // Yes, get the OTA started
+    // Check if the HTTP Response is 200.  Any other response is an error.
+    if (line.startsWith("HTTP/1.1") && line.indexOf(" 200 ") < 0)
+      ota_exit("Bad server status");
+    // If the line contains content-length information: set clength (content length counter).
+    static const char Last_Modified [] = "Last-Modified:";
+    static const char Content_Length[] = "Content-Length:";
+    const char *s = line.c_str();
+    if (s) {   // Eg. "Last-Modified: Tue, 23 Apr 2019 09:10:00 GMT"
+      if (strlen(s) > (strlen(Last_Modified) + 6) && 0 == strncmp(s, Last_Modified, strlen(Last_Modified))) {
+        strncpy(file_timestamp, s + (strlen(Last_Modified) + 6), sizeof(file_timestamp) - 1);
+      } else if (0 == strncmp(s, Content_Length, strlen(Content_Length))) {
+        ulong len = atoi(s + strlen(Content_Length));
+        if (len > clength)
+          clength = len;
+      }
+    }
+  }
+
+  // End of headers reached
+  char*old_timestamp = (char *)nvram_get_val("ota.timestamp");
+  const char *msg;
+  if ((old_timestamp[0] || file_timestamp[0]) && 0 == strcmp(old_timestamp, file_timestamp)) {
+    msg = "Already Up-To-Date";
+  } else if (clength <= 0) {
+    msg = "No data from server";
+  } else if (!firmware_update_from_stream(clength)) {
+    msg = "OTA Update failed";
+  } else {
+    msg = "OTA Update success";
+    strcpy(old_timestamp, file_timestamp);
+    nvram_save();
+  }
+  ota_exit(msg);
+}
+
+// **** End   OTA Firmware Update **********************************************************************************************************
 
 static const char help_serial_commands[] =
   ";                 -- Comment, ignore/print this line\r\n"
@@ -6251,6 +6456,7 @@ static char help_p3000_commands[] =
   "reset             -- reset/restart the ESP32\r\n"
   "version           -- print version info\r\n"
   "load defaults     -- reset NVRAM to factory defaults\r\n"
+  "ota_update        -- fetch/install remote firmware update\r\n"
   "save              -- save any NVRAM changes from the 'set' command\r\n"
   "get all           -- list all NVRAM variables and values\r\n"
   "get var           -- show value of a specific variable\r\n"
@@ -6287,6 +6493,8 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
   } else if (0 == strcmp(cmd, "load defaults")) {
     nvram_load_defaults();
     writep("Loaded defaults");
+  } else if (0 == strcmp(cmd, "ota_update")) {
+    ota_fetch_update();
   } else if (0 == strcmp(cmd, "save")) {
     nvram_save();
     writep("Success");
