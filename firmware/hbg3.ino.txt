@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.8"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-10-05"
+#define VERSION "v8.9"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-10-09"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,11 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again.  WTF?
  *
+ * Version 8.9
+ *  -- Note that OTA Updates will NOT work on ethernet because of limitations of the underlying library.
+ *  -- Get ethernet working on AIO, including with p3000_debug.
+ *  -- Get bt_mode_usb working on AIO: Celestron USB Hand-Controller gets exported over Bluetooth.
+ *  -- Tidying.
  * Version 8.8
  *  -- NCHK: Improve Nunchuck/focuser fix from v8.7, by NOT sending DEV_AZM/DEV_ALT packets out on relay bus.
  *  -- Add PIN definitions for coolick PCBs.
@@ -84,7 +89,9 @@
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor.
+#define ETHERNET_ENABLED          false // Do not edit this line.  See "aio.h" instead.
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
+#define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
 
 #define NVRAM_VALS_MAX_LEN 31
 static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
@@ -119,27 +126,33 @@ static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
 #define AUXRELAY_BUSYIN_PIN       26    // from AUX relay bus BUSY pin (could be same pin as BUSYOUT on older hardware)
 #define AUXRELAY_BUSYOUT_PIN      27    // to   AUX relay bus BUSY pin (could be same pin as BUSYIN  on older hardware)
 
-#if ORIGINAL_WIFI_PROJECT   // PIN assignments for the _original_ HomeBrew WiFI+BT+GPS project:
-#undef  AUXRELAY_RX_PIN
-#define AUXRELAY_RX_PIN -1
-#undef  ESP32_WIFI_MODE_PIN
-#define ESP32_WIFI_MODE_PIN 5
-#undef  GPS_TX_PIN
-#undef  GPS_RX_PIN
-#if 1  // Original WiFi+BT+GPS project:
-  #define GPS_TX_PIN 22
-  #define GPS_RX_PIN 23
-#else  // Coolick PCBs:
-  #define GPS_TX_PIN 23
-  #define GPS_RX_PIN 19
+#if (ORIGINAL_WIFI_PROJECT || COOLICK_PCB_PROJECT)  // PIN assignments for earlier versions of the WiFi+BT+GPS project
+  #undef  AUXRELAY_RX_PIN
+  #define AUXRELAY_RX_PIN         -1
+  #undef  ESP32_WIFI_MODE_PIN
+  #define ESP32_WIFI_MODE_PIN      5
+  #undef  GPS_TX_PIN
+  #undef  GPS_RX_PIN
+  #if COOLICK_PCB_PROJECT
+    #define GPS_TX_PIN            23
+    #define GPS_RX_PIN            19
+  #else // ORIGINAL_WIFI_PROJECT
+    #define GPS_TX_PIN            22
+    #define GPS_RX_PIN            23
+  #endif
+  #undef  EMULATE_DEW
+  #define EMULATE_DEW             false
+  #undef  EMULATE_FOCUS
+  #define EMULATE_FOCUS           false
+  #undef  OTA_ENABLED
+  #define OTA_ENABLED             false
+  #define HBG3_NAME  "HBG1"
 #endif
-#undef  EMULATE_DEW
-#define EMULATE_DEW false
-#undef  EMULATE_FOCUS
-#define EMULATE_FOCUS false
-#undef  OTA_ENABLED
-#define OTA_ENABLED false
-#define HBG3_NAME  "HBG1"
+
+#if EMULATE_DEW
+#define DEW_NUMCHANNELS           2
+static byte thermistor_pins [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39.  Conflicts with AUXRELAY pins.
+static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUXRELAY pins.
 #endif
 
 // Temporary arrangement(?):  first include of this file defines PINs
@@ -206,11 +219,20 @@ static bool gps_disabled        = false;  // GPS can be prevented from respondin
 static bool oled_detected       = false;
 static byte cordwrap_override   = 0;
 static bool auxrelay_ssforward  = false;  // When true, AUXRELAY will forward StarSense Camera packets across the relay.
-static bool p3000_debug         = false;  // When true, serial debug commands/output will be redirected to the port 3000 connection.
 static bool suppress_lowbattery = false;  // For low-battery warnings spewed from the Evolution mount.
+static bool p3000_debug         = false;  // When true, serial debug commands/output will be redirected to the port 3000 connection.
 
-static const char *nvram_get_val(const char *name);
-static void nvram_save_val (const char *name, int val);
+#if ETHERNET_ENABLED
+  static char p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
+  #define E3000_ENDLINE() do { e3000.write("\r\n"); e3000.flush(); } while (0)
+#else
+  #define p3000_debug_ethernet false
+  #define E3000_ENDLINE W3000_ENDLINE
+  #define e3000 w3000
+#endif /* ETHERNET_ENABLED */
+
+static const char *nvram_get_val  (const char *name);
+static void        nvram_save_val (const char *name, int val);
 
 #if EMULATE_SSAA
 static bool emulate_ssaa        = false;
@@ -234,20 +256,24 @@ static bool emulate_ssag        = false;
 #define ADAPTER_VERSION           DEFAULT_SSID "AMW007-9.0.0.0, " VERSION_DATE "T12:00:00Z, " HBG3_NAME "-"
 // Celestron reports: "ZENTRI-AMW007-1.2.0.10, 2017-07-28T07:43:27Z, ZentriOS-WL-1.2.0.10, Board:N/A");
 
-#define AUXBUS_TXQ_SIZE           32  // Large (32) seems to be needed for reliable Bluetooth
-#define AUXBUS_PKT_MAX            16  // Max length of a regular 0x3b style auxbus packet  FIXE?: was 32
+#define AUXBUS_TXQ_SIZE           32  // Large (32) seems to be needed for reliable Bluetooth.
+#define AUXBUS_PKT_MAX            16  // Max length of a regular 0x3b style auxbus packet.
 #define AUXBUS_SSAA_PKT_MAX       848 // Theoretically up to 2470 bytes.  In practice, nothing is ever larger than about 832 bytes.
 
-static long auxtest_led_timer =   0;
-static long auxtest_timer     =   0;
+static long auxtest_led_timer   = 0;
+static long auxtest_timer       = 0;
 
 static WiFiClient w2000;             // The wifi application port 2000, for controlling the mount
 static WiFiClient w3000;             // The wifi management  port 3000, for configuring the adapter
 static char       bt_id[32];
-static long       bt_is_active   = 0;
+static long       bt_is_active  = 0;
 static byte       wifi_mac_addr[6];  // Filled in by setup(), used to create unique SSIDs
 static char       current_ssid[32];
 static char       current_ipaddr[32];
+
+#define SERVER_IPADDRESS  1,2,3,4    // For both WiFi and Ethernet
+static const IPAddress server_static_ip(SERVER_IPADDRESS);
+static const IPAddress server_static_netmask(255,255,255,0);
 
 static enum {bt_mode_off, bt_mode_aux, bt_mode_usb} bt_mode = bt_mode_off;  // needed by AIO bt stuff
 
@@ -258,12 +284,28 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
 
 // Debug messages use these macros, normally sending to debug uart, but possibly instead to the TCP/IP Port-3000 connection:
 #define W3000_ENDLINE()             do {     w3000.write("\r\n"); w3000.flush(); } while (0)
-#define SERIAL_ENDLINE()            do { if (p3000_debug) {W3000_ENDLINE();                } else if (SerialDebug) {SerialDebug->println();           SERIAL_FLUSH(true);}} while (0)
-#define SERIAL_PRINTLN(x)           do { if (p3000_debug) {w3000.write(x); W3000_ENDLINE();} else if (SerialDebug) {SerialDebug->println(x);          SERIAL_FLUSH(true);}} while (0)
-#define SERIAL_PRINTF(...)          do { if (p3000_debug) {w3000.printf(__VA_ARGS__);      } else if (SerialDebug) {SerialDebug->printf(__VA_ARGS__); SERIAL_FLUSH(true);}} while (0)
-#define SERIAL_PRINT(x)             do { if (p3000_debug) {w3000.write(x);                 } else if (SerialDebug) {SerialDebug->print(x);                               }} while (0)
 
-#define Serial                      Serial_UNDEFINED  // Prevent using "Serial" by accident
+#define SERIAL_ENDLINE() do {                                                              \
+  if (p3000_debug) {if (p3000_debug_ethernet) E3000_ENDLINE(); else W3000_ENDLINE();} else \
+  if (SerialDebug) {SerialDebug->println(); SERIAL_FLUSH(true);}                           \
+} while (0)
+
+#define SERIAL_PRINTLN(x) do {                                                                             \
+  if (p3000_debug) {if (p3000_debug_ethernet) w3000.write(x); else e3000.write(x); SERIAL_ENDLINE();} else \
+  if (SerialDebug) {SerialDebug->println(x); SERIAL_FLUSH(true);}                                          \
+} while (0)
+
+#define SERIAL_PRINTF(...) do {                                                                                \
+  if (p3000_debug) {if (p3000_debug_ethernet) e3000.printf(__VA_ARGS__); else w3000.printf(__VA_ARGS__);} else \
+  if (SerialDebug) {SerialDebug->printf(__VA_ARGS__); SERIAL_FLUSH(true);}                                     \
+} while (0)
+
+#define SERIAL_PRINT(x) do {                                                             \
+  if (p3000_debug) {if (p3000_debug_ethernet) w3000.write(x); else e3000.write(x);} else \
+  if (SerialDebug) {SerialDebug->print(x);}                                              \
+} while (0)
+
+#define Serial Serial_UNDEFINED  // Prevent using "Serial" by accident
 
 static void set_wifi_info (const char *ssid, IPAddress ip)
 {
@@ -915,6 +957,11 @@ static struct rxbuf_s {
   char         name[12];
   struct bus_s *bus;
 } w2000_rxbuf, bt_rxbuf;
+
+#if ETHERNET_ENABLED
+static struct rxbuf_s e2000_rxbuf;
+static void e2000_tx (byte *data, uint16_t len);
+#endif
 
 static void init_rxbuf (struct rxbuf_s *rxbuf, const char *name)
 {
@@ -3702,12 +3749,9 @@ static void nchuck_loop ()
 #if EMULATE_DEW
 
 // Support up to four Dew Control "channels", by defining pairs of non-zero pin numbers here:
-#define DEW_NUMCHANNELS    2
 static bool   dew_detected                      = false;
 static double dew_input_current_limit           = 3.000;      // amperage
-static byte   thermistor_pins  [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39.
 static byte   dew_automode     [DEW_NUMCHANNELS] = { 1,  1};  // Must be from GPIOs 32..39.
-static byte   dew_pwm_pins     [DEW_NUMCHANNELS] = {14, 26};  //
 static byte   dew_pwm_percent  [DEW_NUMCHANNELS] = { 0,  0};  // percent 0..100
 static byte   dew_aggression   [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 degrees (NVRAM)
 static double dew_temperature  [DEW_NUMCHANNELS] = { 0,  0};  // degrees
@@ -4384,7 +4428,7 @@ static void oled_get_type (void)
 static  SSD1306AsciiWire  oled;
 
 #define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
-#define OLED_NMODES       (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
+#define OLED_NMODES       (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + ((byte)ETHERNET_ENABLED) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
 
 static void (*oled_updatefn[OLED_NMODES])(void);
 static char oled_data[4][OLED_ROW_CHARS + 1] = {{0,},};   // Four rows of OLED data
@@ -4557,12 +4601,12 @@ static void oled_connectstatus_updatefn (void)
   else
     snprintf(tmp, OLED_ROW_CHARS, "%-5s %s Connected",    hbg3_version, connection);
   oled_set_row(0, tmp);
-  if (bt_is_active) {
+  if (connection[0] == 'B') {
     oled_set_row(1, "Mode: Bluetooth");
     snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", bt_id);
     oled_set_row(2, tmp);
     oled_clear(3);
-  } else if (musb_connected) {
+  } else if (connection[0] == 'U') {
     snprintf(tmp, OLED_ROW_CHARS, "Mode: USB %lu", (musb_uart->baudRate() / 10) * 10); // show 115201 as 115200.
     oled_set_row(1, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "Wireless is %s", musb_rfkill ? "off" : "on");
@@ -4596,7 +4640,7 @@ static void oled_ota_updatefn (void)
     if (!ota_partition_size_okay) {
       oled_set_row(2, "Wrong Partition Size");
       oled_clear(3);
-    } else if (wifi_client_mode) {
+    } else if (wifi_client_mode) {  // Unfortunately, the OTA library doesn't work over Ethernet.
       oled_set_row(2, "To trigger update,");
       oled_set_row(3, "  Push/hold button");
     } else {
@@ -4691,24 +4735,24 @@ static void oled_QRcode_updatefn (void)
 
 static void oled_off_updatefn (void)
 {
-  if (!oled_turned_off) {
-    if (oled_updatefn_initial_call) {
-      char tmp[OLED_ROW_CHARS+1];
-      oled_set_row(0, "Display Off.");
-      sprintf(tmp, HBG3_NAME "%s %s", auxrelay_detected ? "-Relay" : "", hbg3_version);
-      tmp[OLED_ROW_CHARS] = 0;
-      oled_set_row(1, tmp);
-      oled_set_row(2, VERSION_DATE);
-      snprintf(tmp, OLED_ROW_CHARS, "MinFree: %lu", heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
-      tmp[OLED_ROW_CHARS] = 0;
-      oled_set_row(3, tmp);
-      oled_offtime = get_timeout(2500);
-    } else if (time_after(millis(), oled_offtime)) {
-      oled_offtime = 0;
-      oled_turned_off = true;
-      oled_clear(0);
-      oled.ssd1306WriteCmd(SSD1306_DISPLAYOFF);
-    }
+  if (oled_turned_off)
+    return;
+  if (oled_updatefn_initial_call) {
+    char tmp[OLED_ROW_CHARS+1];
+    oled_set_row(0, "Display Off.");
+    sprintf(tmp, HBG3_NAME "%s %s", auxrelay_detected ? "-Relay" : "", hbg3_version);
+    tmp[OLED_ROW_CHARS] = 0;
+    oled_set_row(1, tmp);
+    oled_set_row(2, VERSION_DATE);
+    snprintf(tmp, OLED_ROW_CHARS, "MinFree: %lu", heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+    tmp[OLED_ROW_CHARS] = 0;
+    oled_set_row(3, tmp);
+    oled_offtime = get_timeout(2500);
+  } else if (time_after(millis(), oled_offtime)) {
+    oled_offtime = 0;
+    oled_turned_off = true;
+    oled_clear(0);
+    oled.ssd1306WriteCmd(SSD1306_DISPLAYOFF);
   }
 }
 
@@ -4719,6 +4763,9 @@ static void oled_init_modes (void)
     oled_updatefn[mode++] = oled_dewcontrol_updatefn;
   #endif
     oled_updatefn[mode++] = oled_connectstatus_updatefn;
+  #if ETHERNET_ENABLED
+    oled_updatefn[mode++] = oled_ethernet_updatefn;
+  #endif
   #if EMULATE_GPS
     oled_updatefn[mode++] = oled_gps_updatefn;
   #endif
@@ -4977,7 +5024,7 @@ static inline bool block_cfm_connections (struct rxbuf_s *rxbuf, byte src, byte 
     auxbus_raw_break();
     SERIAL_PRINTLN("Caught Celestron Firmware Manager (CFM); killing the connection!");
     w2000.stop();
-    set_bt_connected(false);
+    set_bt_connected(__func__, false);
     musb_disconnect();
     (void)packet_reset(rxbuf, pkt_fail);
     while (true) delay(1000);  // Freeze all further operation to prevent CFM from doing anything
@@ -5151,14 +5198,14 @@ static inline byte bt_read (void)
   return bt.read();
 }
 
-static void set_bt_connected (bool connected)
+static void set_bt_connected (const char *who, bool connected)
 {
   if (connected != bt_connected) {
     if (!bt_connected)
       init_rxbuf(&bt_rxbuf, "bt_rx");
     bt_connected = connected;
-    SERIAL_PRINTF("bt_connected=%d\r\n", connected);
-    if (!bt_connected)
+    SERIAL_PRINTF("%s: bt_connected=%d\r\n", who, connected);
+    if (!bt_connected && bt_mode != bt_mode_usb)
       bt_aux_restart();
   }
 }
@@ -5171,6 +5218,12 @@ static inline void bt_tx (bool from_ssaa, byte *data, uint16_t count)
     if (TVERBOSE2(from_ssaa, data))
       print_packet(__func__, NULL, data, count);
   }
+}
+
+static inline void bt_tx_aux (bool from_ssaa, byte *data, uint16_t count)
+{
+  if (bt_mode != bt_mode_usb)
+    bt_tx(from_ssaa, data, count);
 }
 
 static void w2000_tx (bool from_ssaa, byte *data, uint16_t count)
@@ -5201,7 +5254,7 @@ static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
     else if (rxbuf == &w2000_rxbuf)
       w2000_tx(from_ssaa, data, len);
     else if (rxbuf == &bt_rxbuf)
-      bt_tx(from_ssaa, data, len);
+      bt_tx_aux(from_ssaa, data, len);
     else if (rxbuf == &musb_rxbuf)
       musb_tx(from_ssaa, data, len);
     else
@@ -5450,9 +5503,17 @@ static void forward_from_bus_to_outside (struct rxbuf_s *rxbuf, byte status, byt
 
   // Echo packet to bt, unless it came from bt:
   if (!regular_pkt || src != bt_rxbuf.requestor)
-    bt_tx(from_ssaa, data, len);
+    bt_tx_aux(from_ssaa, data, len);
   if (regular_pkt && dst == bt_rxbuf.requestor)
     bt_rxbuf.requestor = DEV_FF;
+
+#if ETHERNET_ENABLED
+  // Echo packet to e2000 (ethernet), unless it came from e2000:
+  if (!regular_pkt || src != e2000_rxbuf.requestor)
+    e2000_tx(data, len);
+  if (regular_pkt && dst == e2000_rxbuf.requestor)
+    e2000_rxbuf.requestor = 0;
+#endif /* ETHERNET_ENABLED */
 
   if (musb_selected) {
     // Echo packet to Mount-USB, unless it came from there:
@@ -5704,13 +5765,6 @@ static void bus_loop (struct bus_s *bus)
   bus_forward(bus, p->forward, pdata, p->len);     // Forward packet out to other destinations
   txq_free_pkt(txq, p);
 }
-
-// Temporary arrangement(?):  second include of same file defines functions etc..
-#ifdef __has_include
-  #if __has_include("aio.h")
-    #include "aio.h"
-  #endif
-#endif
 
 struct nvram_variable_s {
   char *name;
@@ -6029,10 +6083,6 @@ static bool IP_fromString(IPAddress ip, const char *s)
   return false;
 }
 
-#define SERVER_IPADDRESS  1,2,3,4
-static const IPAddress server_static_ip(SERVER_IPADDRESS);
-static const IPAddress server_static_netmask(255,255,255,0);
-
 static void wifi_begin_server_mode()
 {
   SERIAL_PRINTLN("wifi_begin_server_mode:");
@@ -6185,7 +6235,8 @@ static void manage_esp32_wifi (bool want_off)
 {
   static long esp32_wifi_off_timer = 0;
   if (!want_off) {
-    set_bt_connected(false);
+    if (bt_mode != bt_mode_usb)
+      set_bt_connected(__func__, false);
     esp32_wifi_off_timer = 0;
     set_esp32_wifi_onoff();
   } else if (!esp32_wifi_off_timer) {
@@ -6652,18 +6703,20 @@ static void serial_loop (void)
   }
 }
 
-static void w3000_write (const char *s)
-{
-  w3000.write(s);
-}
+static void w3000_write (const char *s) { w3000.write(s); }
+static void w3000_flush (void)          { w3000.flush();  }
 
-static void set_p3000_debug (bool on_off)
+static void set_p3000_debug (bool on_off, bool debug_ethernet)
 {
-  if (p3000_debug != on_off) {
+  if (p3000_debug != on_off || p3000_debug_ethernet != debug_ethernet) {
     const char *s = on_off ? "on" : "off";
-    SERIAL_PRINTF("p3000_debug=%s\r\n", s);  // Once for the current debug destination
+    const char *d = debug_ethernet ? "Ethernet" : "WiFi";
+    SERIAL_PRINTF("p3000_debug=%s (%s)\r\n", s, d);  // Once for the current debug destination
     p3000_debug = on_off;
-    SERIAL_PRINTF("p3000_debug=%s\r\n", s);  // Again for the new debug destination
+#if ETHERNET_ENABLED
+    p3000_debug_ethernet = debug_ethernet;
+#endif
+    SERIAL_PRINTF("p3000_debug=%s (%s)\r\n", s, d);  // Again for the new debug destination
   }
 }
 
@@ -6673,7 +6726,13 @@ static const char *get_connection_type (void)
        if (bt_is_active)      connection = "BT";
   else if (musb_connected)    connection = "USB";
   else if (w2000.connected()) connection = "W2";
+#if ETHERNET_ENABLED
+  else if (e2000.connected()) connection = "E2";
+#endif
   else if (w3000.connected()) connection = "W3";
+#if ETHERNET_ENABLED
+  else if (w3000.connected()) connection = "E3";
+#endif
   else                        connection = "Not";
   return connection;
 }
@@ -6721,11 +6780,11 @@ static void status_command (void (*writep)(const char *))
   }
   strcat(tmp, "; ");
   writep(tmp);
-  if (bt_is_active) {
+  if (connection[0] == 'B') {
     sprintf(tmp, "Mode: Bluetooth, SSID: %s; ", bt_id);
     writep(tmp);
   }
-  if (musb_connected) {
+  if (connection[0] == 'U') {
     sprintf(tmp, "Mode: USB %lu; ", (musb_uart->baudRate() / 10) * 10); // show 115201 as 115200.
     writep(tmp);
   }
@@ -6761,7 +6820,7 @@ static char help_p3000_commands[] =
   ;
 
 /*
- * handle_p3000_commands() is used for both p3000 and serial port commands
+ * handle_p3000_commands() is used for both p3000 and serial port commands, and by e3000 on the AIO.
  */
 static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
 {
@@ -6778,12 +6837,9 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
     writep(ADAPTER_VERSION);
     writep(hbg3_version);
   } else if (0 == strcmp(cmd, "debug")) {
-    set_p3000_debug(!p3000_debug);
+    set_p3000_debug(!p3000_debug, (writep != w3000_write));
   } else if (0 == strcmp(cmd, "reset")) {
-    if (p3000_debug || writep != SERIAL_WRITE) {
-      w3000.stop();
-      delay(100);
-    }
+    delay(100);
     ESP.restart();
   } else if (0 == strcmp(cmd, "load defaults")) {
     nvram_load_defaults();
@@ -6856,10 +6912,14 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
   return true;
 }
 
-static bool p3000_decoder (char b)
+static bool p3000_decoder (char b,  void (*writep)(const char *), void (*flushp)(void))
 {
   static char cmd[64];
   static byte cx = 0;
+  if (writep == NULL || flushp == NULL) {
+    cx = 0;
+    return true;
+  }
   if (cx == 0)
     memset(cmd, 0, sizeof(cmd));
   if ((cx < sizeof(cmd) - 1) && b != '\r' && b != '\n')
@@ -6869,10 +6929,10 @@ static bool p3000_decoder (char b)
   cx = 0;
   if (0 == strcmp(cmd, "exit"))
     return true;  // close connection
-  if (!handle_p3000_commands(cmd, w3000_write) && !(p3000_debug && handle_serial_commands(cmd)))
-    w3000_write("Unknown command\r\n");
-  w3000_write("> ");
-  w3000.flush();
+  if (!handle_p3000_commands(cmd, writep) && !(p3000_debug && handle_serial_commands(cmd)))
+    writep("Unknown command\r\n");
+  writep("> ");
+  flushp();
   return false;
 }
 
@@ -6899,8 +6959,10 @@ static bool wifi_port_is_connected (WiFiClient client, bool *connected, void (*p
 static void poll_for_new_w3000_connection()
 {
   w3000 = W3000.available();
-  if (w3000)
+  if (w3000) {
+    (void)p3000_decoder(0, NULL, NULL); // reset the decoder
     w3000.write("> ");
+  }
 }
 
 static void w3000_loop()
@@ -6908,11 +6970,12 @@ static void w3000_loop()
   static bool connected = false;
 
   if (!wifi_port_is_connected(w3000, &connected, poll_for_new_w3000_connection, "w3000")) {
-    set_p3000_debug(false);
+    if (!p3000_debug_ethernet)
+      set_p3000_debug(false, false);
   } else {
     while (w3000.available()) {
       char b = w3000.read();
-      if (p3000_decoder(b))  {
+      if (p3000_decoder(b, w3000_write, w3000_flush))  {
         w3000.stop();
       }
     }
@@ -6964,7 +7027,7 @@ static void w2000_loop()
   if (!wifi_port_is_connected(w2000, &connected, poll_for_new_w2000_connection, "w2000")) {
     w2000_timeout = 0;
   } else {
-    set_bt_connected(false);
+    set_bt_connected(__func__, false);
     while (w2000.available()) {
       (void)packet_decoder(&w2000_rxbuf, w2000.read());
       w2000_timeout = 0;
@@ -7006,6 +7069,7 @@ static void bt_aux_restart (void)
   static bool initialized = false;
   if (initialized) {
     bt_mode = bt_mode_off;
+    SERIAL_PRINTF("%s: bt_mode=bt_mode_off\r\n", __func__);
     bt.end();
   } else {
     initialized = true;
@@ -7014,6 +7078,7 @@ static void bt_aux_restart (void)
     return;
   sprintf(bt_id, "%s%02X%02X%02X", DEFAULT_SSID, wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
   bt_mode = bt_mode_aux;
+  SERIAL_PRINTF("%s: bt_mode=bt_mode_aux\r\n", __func__);
   bt.begin(bt_id);
   init_rxbuf(&bt_rxbuf, "bt_rx");
 }
@@ -7021,13 +7086,22 @@ static void bt_aux_restart (void)
 static inline void bt_aux_rx (void)
 {
   if (!(musb_selected && musb_rfkill) && bt_available()) {
-    set_bt_connected(true);  // enables bt_tx()
+    set_bt_connected(__func__, true);  // enables bt_tx()
     while (bt_available())
       (void)packet_decoder(&bt_rxbuf, bt_read());
   }
-  if (bt_is_active && time_after(millis(), bt_is_active))
+  if (bt_is_active && time_after(millis(), bt_is_active)) {
     bt_is_active = 0;
+    SERIAL_PRINTF("%s: bt timed-out\r\n", __func__);
+  }
 }
+
+// Temporary arrangement(?):  second include of same file defines functions etc..
+#ifdef __has_include
+  #if __has_include("aio.h")
+    #include "aio.h"
+  #endif
+#endif
 
 void non_wifi_loop (void)
 {
@@ -7036,7 +7110,7 @@ void non_wifi_loop (void)
   if (SerialDebug)
     serial_loop();
   auxtest_loop();
-  if (bt_mode == bt_mode_aux)
+  if (bt_mode != bt_mode_usb)
     bt_aux_rx();
   bus_loop(&auxbus);
   if (auxrelay_detected)
