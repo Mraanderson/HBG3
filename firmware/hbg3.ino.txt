@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.4"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-09-16"
+#define VERSION "v8.5"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-09-17"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install Arduino Legacy IDE v1.8.xx from https://www.arduino.cc/en/software (scroll down!)
@@ -32,6 +32,9 @@
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
+ * Version 8.5
+ *  -- OTA:  Implement a better version check; ota.timestamp conflicted with manual Arduino uploads.
+ *  -- OLED: Add QRcode splash screen.
  * Version 8.4
  *  -- OLED: Fix slightly messed-up formatting from v8.3.
  * Version 8.3
@@ -160,6 +163,7 @@
 #define NVRAM_VALS_MAX_LEN 31
 static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
 static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
+static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
 
 // PIN definitions for this project:
 
@@ -211,7 +215,7 @@ static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
 #define HBG3_NAME  "HBG1"
 #endif
 
-//FIXME Temporary arrangement:  first include of this file defines PINs
+// Temporary arrangement(?):  first include of this file defines PINs
 #ifdef __has_include
   #if __has_include("aio.h")
     #warning "Including aio.h"
@@ -4422,11 +4426,17 @@ static double dew_nvram_restore_amperage (byte channel)
 #define OLED_I2C_ADDRESS  0x3c
 static  SSD1306AsciiWire  oled;
 
-#define OLED_ROW_CHARS    22
+#define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
+#define OLED_NMODES       (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
+
+static void (*oled_updatefn[OLED_NMODES])(void);
 static char oled_data[4][OLED_ROW_CHARS + 1] = {{0,},};   // Four rows of OLED data
 static bool oled_data_updated[4] = {false,false,false,false};
+static bool oled_turned_off      = false;
+static long oled_offtime         = 0;
+static bool oled_updatefn_initial_call = true;
 
-static const uint8_t HomeBrew5x14_font[] = {
+static const uint8_t HomeBrew5x14_font[] = {  // two groups of 5-bytes-across for each character. Each byte is vertical pixels.
  0x0,  0x0,     5,   14, 0x20, 0x61,
  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00,
  0x00, 0x3f, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xff, 0x30, 0xff, 0x30, 0x03, 0x3f, 0x03, 0x3f, 0x03,
@@ -4618,39 +4628,107 @@ static void oled_connectstatus_updatefn (void)
   }
 }
 
-static bool oled_turned_off = false;
-static long oled_offtime = 0;
-#define OLED_NMODES (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + 3)  // Network, OTA, and blank/off are the 3 other modes
-
 #if OTA_ENABLED
 static void oled_ota_updatefn (void)
 {
-  char tmp[OLED_ROW_CHARS+1];
-  oled_set_row(0, "OTA Firmware Update");
-  oled_set_row(1, "===================");
-  if (wifi_client_mode) {
-    oled_set_row(2, "To trigger update,");
-    oled_set_row(3, "  Push/hold button");
-  } else {
-    oled_set_row(2, "Wrong WiFi mode:");
-    oled_set_row(3, "  Needs Access Point");
+  if (oled_updatefn_initial_call) {
+    oled_set_row(0, "OTA Firmware Update");
+    oled_set_row(1, "===================");
+    if (wifi_client_mode) {
+      oled_set_row(2, "To trigger update,");
+      oled_set_row(3, "  Push/hold button");
+    } else {
+      oled_set_row(2, "Wrong WiFi mode:");
+      oled_set_row(3, "  Needs Access Point");
+    }
   }
 }
 #endif /* OTA_ENABLED */
 
+static byte QRcode_image[] = {
+  0xff,0xc0,0xc0,0xc0,0xff,0x00,0xff,0xc3,0xc3,0xc3,0x3c,0x00,0xfc,0x03,0x03,0x03,0x0c,0x00,0x03,0x03,0x33,0xcf,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xc0,
+  0x30,0x30,0xc0,0x00,0xf0,0x00,0x00,0x00,0xf0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x07,0x07,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0x07,0x07,0xff,0xff,0xff,0xe7,0xe7,0xe7,0xe7,0xe7,0xff,0xff,0xff,0xff,0xff,
+  0xff,0xff,0x1f,0x1f,0xff,0xff,0xff,0xff,0xff,0xe7,0xe7,0xff,0xff,0xff,0x07,0x07,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0x07,0x07,0xff,0xff,
+  0x3f,0x00,0x00,0x00,0x3f,0x00,0x3f,0x30,0x30,0x30,0x0f,0x00,0x0f,0x30,0x30,0x33,0x0f,0x00,0x0c,0x30,0x30,0x30,0x0f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0x30,
+  0x30,0x30,0x0f,0x00,0x00,0x33,0x33,0x33,0x0f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x00,0x00,0xff,0xff,0xff,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0xff,0xff,0x00,0x00,0xff,0xff,0xff,0x80,0x80,0x03,0x03,0x03,0x8f,0x8f,0x80,0x80,0x7c,
+  0x7c,0x7c,0xf0,0xf0,0xfc,0xfc,0x80,0x80,0x80,0x0c,0x0c,0xff,0xff,0xff,0x00,0x00,0xff,0xff,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0xff,0xff,0xff,0x00,0x00,0xff,0xff,
+  0xff,0x0c,0x30,0x0c,0xff,0x00,0x00,0x30,0x30,0x30,0xc0,0x00,0xf0,0xc0,0x30,0x30,0xc0,0x00,0x00,0xff,0x00,0xc0,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x00,
+  0x00,0x00,0x00,0x00,0xc0,0x30,0x30,0x30,0xc0,0x00,0xf0,0xc0,0x30,0x30,0xc0,0x00,0xc0,0x30,0x30,0xc0,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x38,0x38,0x39,0x39,0x39,0x39,0x39,0x39,0x39,0xf9,0xf9,0xf9,0xf9,0xf9,0x38,0x38,0xff,0xff,0xff,0x39,0x39,0xc6,0xc6,0xc6,0xf9,0xf9,0xc7,0xc7,0xf8,
+  0xf8,0xf8,0xff,0xff,0xf9,0xf9,0x3f,0x3f,0x3f,0x38,0x38,0x3f,0x3f,0x3f,0xf8,0xf8,0xf9,0xf9,0x39,0x39,0x39,0x39,0x39,0x39,0x39,0xf9,0xf9,0xf9,0x38,0x38,0xff,0xff,
+  0x3f,0x00,0x00,0x00,0x3f,0x00,0x0c,0x33,0x33,0x33,0x3f,0x00,0x3f,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0x03,0x0c,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0x30,
+  0x30,0x30,0x30,0x00,0x0f,0x30,0x30,0x30,0x0f,0x00,0x3f,0x00,0x00,0x00,0x00,0x00,0x0f,0x30,0x30,0x30,0x3f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x87,0x87,0x9f,0x9f,0x9f,0x1f,0x1f,0xe0,0xe0,0xf8,0xf8,0xf8,0x18,0x18,0x67,0x67,0xe0,0xe0,0xe0,0x1f,0x1f,0x78,0x78,0x78,0xff,0xff,0x1f,0x1f,0x9f,
+  0x9f,0x9f,0x80,0x80,0x9f,0x9f,0x9f,0x9f,0x9f,0xe0,0xe0,0x78,0x78,0x78,0x7f,0x7f,0x18,0x18,0x7f,0x7f,0x7f,0x9f,0x9f,0x1f,0x1f,0x78,0x78,0x78,0x7f,0x7f,0xff,0xff,
+  0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,
+  0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x30,0x30,0x30,0x30,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x3f,0x3f,0xc3,0xc3,0xc3,0xc0,0xc0,0xc3,0xc3,0x33,0x33,0x33,0xf0,0xf0,0xcc,0xcc,0x0f,0x0f,0x0f,0x30,0x30,0x30,0x30,0x30,0x33,0x33,0xf0,0xf0,0x0f,
+  0x0f,0x0f,0x33,0x33,0xc3,0xc3,0x33,0x33,0x33,0xff,0xff,0xfc,0xfc,0xfc,0xf0,0xf0,0x30,0x30,0x00,0x00,0x00,0xff,0xff,0xcc,0xcc,0xcc,0xcc,0xcc,0x30,0x30,0xff,0xff,
+  0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,
+  0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x03,0x03,0x03,0x03,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x3e,0x3e,0x3f,0x3f,0x3f,0x39,0x39,0x39,0x39,0x38,0x38,0x38,0x3f,0x3f,0x39,0x39,0xf8,0xf8,0xf8,0xc0,0xc0,0xfe,0xfe,0xfe,0xf8,0xf8,0x39,0x39,0x06,
+  0x06,0x06,0xc6,0xc6,0xff,0xff,0xfe,0xfe,0xfe,0x01,0x01,0xf9,0xf9,0xf9,0x39,0x39,0xf8,0xf8,0x00,0x00,0x00,0xf9,0xf9,0x01,0x01,0x39,0x39,0x39,0x00,0x00,0xff,0xff,
+  0x3c,0xc3,0xc3,0xc3,0x03,0x00,0xc0,0x30,0x30,0x30,0x00,0x00,0x00,0x30,0x30,0x30,0xc0,0x00,0xf0,0xc0,0x30,0x30,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x00,
+  0x00,0x00,0xff,0x00,0xff,0xc3,0xc3,0xc3,0x3c,0x00,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x3c,0x3c,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0x00,0x00,0xff,0xff,0xff,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0xff,0xff,0x00,0x00,0xff,0xff,0xff,0x1f,0x1f,0x00,0x00,0x00,0xe0,0xe0,0x63,0x63,0x00,
+  0x00,0x00,0x03,0x03,0x9f,0x9f,0xfc,0xfc,0xfc,0x80,0x80,0x63,0x63,0x63,0x03,0x03,0xe3,0xe3,0x00,0x00,0x00,0x83,0x83,0x1f,0x1f,0x00,0x00,0x00,0x9f,0x9f,0xff,0xff,
+  0x30,0x30,0x30,0x30,0x0f,0x00,0x0f,0x30,0x30,0x30,0x0c,0x00,0x0c,0x33,0x33,0x33,0x3f,0x00,0x3f,0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0f,0x30,
+  0x30,0x30,0x0f,0x00,0x3f,0x00,0x03,0x0c,0x30,0x00,0x3f,0x30,0x30,0x30,0x30,0x00,0x00,0x0f,0x0f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0xff,0xff,0xff,0xc0,0xc0,0xcf,0xcf,0xcf,0xce,0xce,0xce,0xce,0xce,0xce,0xce,0xcf,0xcf,0xc0,0xc0,0xff,0xff,0xff,0xc0,0xc0,0xc0,0xc0,0xc0,0xcf,0xcf,0xfe,0xfe,0xce,
+  0xce,0xce,0xfe,0xfe,0xcf,0xcf,0xff,0xff,0xff,0xff,0xff,0xf0,0xf0,0xf0,0xf0,0xf0,0xcf,0xcf,0xc0,0xc0,0xc0,0xcf,0xcf,0xc0,0xc0,0xce,0xce,0xce,0xcf,0xcf,0xff,0xff
+};
+
+static void oled_cmd(uint8_t command)
+{
+  Wire.beginTransmission(OLED_I2C_ADDRESS);
+  Wire.write(0x00);        // Select "Command" mode
+  Wire.write(command);     // The actual command byte
+  Wire.endTransmission();
+}
+
+static void oled_send_image (byte *buffer)
+{
+  oled_cmd(0x20);  // Set MemoryMode to next byte:
+  oled_cmd(0x00);  //  use Horizontal addressing mode for image.
+  oled_cmd(0x21);  // Set Column Address Low/High:
+  oled_cmd(0x00);  //  Low:    0
+  oled_cmd(0x7F);  //  High: 127
+  oled_cmd(0x22);  // Set Page (row) Address Low/High:
+  oled_cmd(0x00);  //  Low:    0
+  oled_cmd(0x07);  //  High:   7
+  for (byte burst = 0; burst < 64; burst++) {
+    Wire.beginTransmission(OLED_I2C_ADDRESS);
+    Wire.write(0x40);      // Select "Data" mode
+    for (unsigned int i = 0; i < 16; ++i) {
+      Wire.write(buffer[i + (burst * 16)]);
+    }
+    Wire.endTransmission();
+  }
+  oled_cmd(0x20);  // Set MemoryMode to next byte:
+  oled_cmd(0x02);  //  use Page addressing mode for text.
+}
+
+static void oled_QRcode_updatefn (void)
+{
+  if (oled_updatefn_initial_call)
+    oled_send_image(QRcode_image);
+}
+
 static void oled_off_updatefn (void)
 {
   if (!oled_turned_off) {
-    char tmp[OLED_ROW_CHARS+1];
-    oled_set_row(0, "Display Off.");
-    sprintf(tmp, HBG3_NAME "%s %s", auxrelay_detected ? "-Relay" : "", hbg3_version);
-    tmp[OLED_ROW_CHARS] = 0;
-    oled_set_row(1, tmp);
-    oled_set_row(2, VERSION_DATE);
-    snprintf(tmp, OLED_ROW_CHARS, "MinFree: %lu", heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
-    tmp[OLED_ROW_CHARS] = 0;
-    oled_set_row(3, tmp);
-    if (!oled_offtime) {
+    if (oled_updatefn_initial_call) {
+      char tmp[OLED_ROW_CHARS+1];
+      oled_set_row(0, "Display Off.");
+      sprintf(tmp, HBG3_NAME "%s %s", auxrelay_detected ? "-Relay" : "", hbg3_version);
+      tmp[OLED_ROW_CHARS] = 0;
+      oled_set_row(1, tmp);
+      oled_set_row(2, VERSION_DATE);
+      snprintf(tmp, OLED_ROW_CHARS, "MinFree: %lu", heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+      tmp[OLED_ROW_CHARS] = 0;
+      oled_set_row(3, tmp);
       oled_offtime = get_timeout(2500);
     } else if (time_after(millis(), oled_offtime)) {
       oled_offtime = 0;
@@ -4660,8 +4738,6 @@ static void oled_off_updatefn (void)
     }
   }
 }
-
-static void (*oled_updatefn[OLED_NMODES])(void);
 
 static void oled_init_modes (void)
 {
@@ -4676,8 +4752,11 @@ static void oled_init_modes (void)
   #if OTA_ENABLED
     oled_updatefn[mode++] = oled_ota_updatefn;
   #endif
+  oled_updatefn[mode++] = oled_QRcode_updatefn;
   oled_updatefn[mode++] = oled_off_updatefn;
 }
+
+static long oled_splash_timer = 0;
 
 static void oled_setup ()
 {
@@ -4694,6 +4773,11 @@ static void oled_setup ()
     oled.begin(&OLED_TYPE, OLED_I2C_ADDRESS);
     oled.clear();
     oled.setFont(OLED_FONT);
+
+    // Show splash screen briefly at start-up:
+    oled_QRcode_updatefn();
+    oled_splash_timer = get_timeout(1250); 
+    oled_updatefn_initial_call = true;
   }
 }
 
@@ -4704,6 +4788,11 @@ static void oled_loop (void)
   static byte oled_row_num = 0;
   if (!oled_detected)
     return;
+  if (oled_splash_timer) {
+    if (time_before(millis(), oled_splash_timer))
+      return;
+    oled_splash_timer = 0;
+  }
   static long next_update = 0;
   static byte oled_mode = 0;
   static long modepin_debounce = 0;
@@ -4748,6 +4837,7 @@ static void oled_loop (void)
       if (modepin_nochange) {
         modepin_nochange = false;
       } else {
+        oled_updatefn_initial_call = true;
         oled_mode    = (oled_mode + 1) % OLED_NMODES;
         next_update  = 0;
         oled_row_num = 0;
@@ -4775,6 +4865,7 @@ static void oled_loop (void)
     oled_mode = (oled_mode + 1) % OLED_NMODES;
 #endif
   oled_updatefn[oled_mode]();
+  oled_updatefn_initial_call = false;
 
   // Update the physical OLED display, but only one row at a time, so as not to unduly hog the CPU:
   byte first_row = oled_row_num;
@@ -5641,7 +5732,7 @@ static void bus_loop (struct bus_s *bus)
   txq_free_pkt(txq, p);
 }
 
-//FIXME Temporary arrangement:  second include of same file defines functions etc..
+// Temporary arrangement(?):  second include of same file defines functions etc..
 #ifdef __has_include
   #if __has_include("aio.h")
     #include "aio.h"
@@ -5690,10 +5781,10 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"reserved8",
   (char *)"reserved7",
   (char *)"reserved6",
-  (char *)"reserved5",
+  (char *)"ota.version.path",
   (char *)"auxbus.stopbits",
   (char *)"musb.rfenable",
-  (char *)"ota.timestamp",
+  (char *)"reserved2",  // was ota.timestamp until v8.5
   (char *)"ota.update.server",
   (char *)"ota.update.path",
   (char *)NULL
@@ -5734,10 +5825,10 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // reserved8
   ""                // reserved7
   ""                // reserved6
-  ""                // reserved5
+  ""                // ota.version.path
   ""                // auxbus.stopbits
   ""                // musb.rfenable
-  ""                // ota.timestamp
+  ""                // reserved2  // was ota.timestamp until v8.5
   ""                // ota.update.server
   ""                // ota.update.path
   ""                // NULL
@@ -5770,6 +5861,20 @@ static void nvram_get_nonblank_val (const char *name, char *dst)
 }
 
 static long nvram_delayed_save = 0;
+
+static void nvram_clear_reserved_slots (void)
+{
+  // Ensure "reservedNN" slots are empty, keeping them clean for future (re-)uses.
+  for (byte v = 0; v < (NVRAM_COUNT - 1); ++v) {
+    if (0 == strncmp(nvram_vars[v], "reserved", 8)) {
+      if (nvram_vals[v][0]) {
+        SERIAL_PRINTF("nvram: clearing %s: %s\r\n", nvram_vars[v], nvram_vals[v]);
+        nvram_vals[v][0] = 0;
+        nvram_delayed_save = get_timeout(200);
+      }
+    }
+  }
+}
 
 static void nvram_save_val (const char *name, int val)
 {
@@ -5838,6 +5943,7 @@ static void nvram_restore ()
     if (!ret) {
       SERIAL_PRINTLN("SPIFFS.begin failed");
     } else {
+      SERIAL_PRINTF("SPIFFS size: %lu\r\n", SPIFFS.totalBytes());  // 113201
       File vf = SPIFFS.open(NVRAM_PATH, FILE_READ);
       if (!vf) {
         SERIAL_PRINTLN("open(" NVRAM_PATH "[R]) failed");
@@ -5859,6 +5965,7 @@ static void nvram_restore ()
     nvram_load_defaults();
     nvram_save();
   }
+  nvram_clear_reserved_slots(); 
   musb_rfkill = !atoi(nvram_get_val("musb.rfenable"));
   suppress_lowbattery = !!atoi(nvram_get_val("suppress.lowbattery"));
   byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
@@ -5902,6 +6009,7 @@ static void nvram_restore ()
 #if OTA_ENABLED
   nvram_get_nonblank_val("ota.update.server", ota_update_server);
   nvram_get_nonblank_val("ota.update.path",   ota_update_path);
+  nvram_get_nonblank_val("ota.update.path",   ota_version_path);
 #endif
   mount_reversed_alt = !!atoi(nvram_get_val("mount.reversed.alt"));
   // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
@@ -6135,7 +6243,7 @@ static void manage_wifi_onoff ()
   manage_evo_wifi  (bt_is_active || musb_connected || (!esp32_wifi_off && w2000.connected()));
 }
 
-// **** Begin OTA Firmware Update **********************************************************************************************************
+// **** Begin OTA Firmware Update **************************************************************************************
 
 #if OLED_ENABLED
 #include <ArduinoOTA.h>
@@ -6231,71 +6339,86 @@ static void ota_exit (const char *msg)
   ESP.restart();
 }
 
-static void ota_fetch_update (void)
-{
-  long        timeout = get_timeout(10 * 1000);
-  ulong       clength = 0;
-  char        file_timestamp[NVRAM_VALS_MAX_LEN + 1] = {0,};
+static ulong ota_clength = 0;
 
-  ota_show_progress(0, 0);  // Initialize the display
+static void ota_wait_for_data (long timeout)
+{
+  while (!otaclient.available()) {
+    if (time_after(millis(), timeout))
+      ota_exit("Host timed-out");
+    delay(1);
+  }
+}
+
+static void ota_fetch_file (long timeout, const char *server, const char *path)
+{
   otaclient.stop();
-  SERIAL_PRINTF("Connecting to %s for %s\r\n", ota_update_server, ota_update_path);
-  if (!otaclient.connect(ota_update_server, 80))
+  SERIAL_PRINTF("Connecting to http://%s%s%s\r\n", server, (path[0] == '/') ? "" : "/", path);
+  ota_clength = 0;
+  if (!otaclient.connect(server, 80))
     ota_exit("Connection failed");
-  otaclient.printf( "GET /%s HTTP/1.1\r\n"
+  otaclient.printf( "GET %s HTTP/1.1\r\n"
                     "Host: %s\r\n"
                     "Cache-Control: no-cache\r\n"
                     "Connection: close\r\n\r\n",
-                     ota_update_path,
-                     ota_update_server );
-  while (otaclient.available() == 0) {
-    if (time_after(millis(), timeout))
-      ota_exit("Host timed-out");
-  }
-
-  while (otaclient.available()) {
+                     path,
+                     server );
+  while (1) {
+    ota_wait_for_data(timeout);
     String line = otaclient.readStringUntil('\n');
     line.trim();
-    SERIAL_PRINTF ("%s\r\n", line.c_str());
-    if (!line.length())  // End of headers?
-      break;             // Yes, get the OTA started
-    // Check if the HTTP Response is 200.  Any other response is an error.
+    SERIAL_PRINTF("server: %s\r\n", line.c_str());
+    if (!line.length())      // End of headers?
+      return;                // Yes, let caller read the actual data content
     if (line.startsWith("HTTP/1.1") && line.indexOf(" 200 ") < 0)
       ota_exit("Bad server status");
-    // If the line contains content-length information: set clength (content length counter).
-    static const char Last_Modified [] = "Last-Modified:";
     static const char Content_Length[] = "Content-Length:";
     const char *s = line.c_str();
-    if (s) {   // Eg. "Last-Modified: Tue, 23 Apr 2019 09:10:00 GMT"
-      if (strlen(s) > (strlen(Last_Modified) + 6) && 0 == strncmp(s, Last_Modified, strlen(Last_Modified))) {
-        strncpy(file_timestamp, s + (strlen(Last_Modified) + 6), sizeof(file_timestamp) - 1);
-      } else if (0 == strncmp(s, Content_Length, strlen(Content_Length))) {
-        ulong len = atoi(s + strlen(Content_Length));
-        if (len > clength)
-          clength = len;
-      }
+    if (s && 0 == strncmp(s, Content_Length, strlen(Content_Length)))
+      ota_clength = atoi(s + strlen(Content_Length));
+  }
+}
+  
+static void ota_fetch_update (void)
+{
+  long timeout = get_timeout(10 * 1000);
+  ota_show_progress(0, 0);  // Initialize the display
+  ota_fetch_file(timeout, ota_update_server, ota_version_path);
+  // Note: server seems to respond with a bytecount line as well as the actual data..
+
+  while (1) {
+    ota_wait_for_data(timeout);
+    String line = otaclient.readStringUntil('\n');
+    const char *data = line.c_str();
+    SERIAL_PRINTF("server: %s\r\n", data);
+    if (data[0] == 'v') {
+      SERIAL_PRINTF("OTA: running=" VERSION ", available=%s\r\n", data);
+      if (0 == strcmp(data, VERSION))
+        ota_exit("Already Up-to-date");
+      char tmp[OLED_ROW_CHARS + 1];
+      sprintf(tmp, "Updating to %s", data);
+      oled_set_row(0, tmp);
+      break;
     }
   }
+  if (SPIFFS.totalBytes() > 300000)
+    ota_exit("Wrong Partition Size");
 
-  // End of headers reached
-  char*old_timestamp = (char *)nvram_get_val("ota.timestamp");
+  // Now do the actual firmware download/update:
+  timeout = get_timeout(15 * 1000);
+  ota_fetch_file(timeout, ota_update_server, ota_update_path);
   const char *msg;
-  if ((old_timestamp[0] || file_timestamp[0]) && 0 == strcmp(old_timestamp, file_timestamp)) {
-    msg = "Already Up-To-Date";
-  } else if (clength <= 0) {
+  if (ota_clength <= 0)
     msg = "No data from server";
-  } else if (!firmware_update_from_stream(clength)) {
+  else if (!firmware_update_from_stream(ota_clength))
     msg = "OTA Update failed";
-  } else {
+  else
     msg = "OTA Update success";
-    strcpy(old_timestamp, file_timestamp);
-    nvram_save();
-  }
   ota_exit(msg);
 }
 #endif /* OTA_ENABLED */
 
-// **** End   OTA Firmware Update **********************************************************************************************************
+// **** End   OTA Firmware Update **************************************************************************************
 
 static const char help_serial_commands[] =
   ";                 -- Comment, ignore/print this line\r\n"
