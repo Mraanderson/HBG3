@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.10"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-10-11"
+#define VERSION "v8.11"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-10-14"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,10 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again.  WTF?
  *
+ * Version 8.11
+ *  -- Include VERSION_DATE as part of OTA Update version check.
+ *  -- Verify that single-letter commands are actually single-letters!
+ *  -- New "test_auxbus" command, to verify BUSYIN/BUSYOUT and TX/RX functionality.
  * Version 8.10
  *  -- Push and hold button for 10-seconds while on QRcode screen, and device resets to "factory defaults".
  *  -- Add '*' indicator on DirectConnect display to indicate AccessPoint mode selected but not configured.
@@ -1059,6 +1063,9 @@ static struct bus_s {
   long            delay;
   uint16_t        count;
   byte            data[96];  // Large enough to efficiently buffer Starsense 0x3c packets
+  byte            tx_pin;
+  byte            rx_pin;
+  const char     *name;
 } auxbus, auxrelay;
 
 static bool auxrelay_detected;  // Gets set when bus_init() is called from setup()
@@ -1072,9 +1079,8 @@ static inline void mkname (char *dst, const char *base, const char *suffix)
 static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
 {
   bool detected = false;
-  byte attempts = 3;
 
-  while (!detected && attempts--) {
+  for (byte attempts = 3; !detected && attempts--;) {
     detected = true;
     delay(50);
     pinMode(rx_pin, INPUT);
@@ -1098,13 +1104,65 @@ static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
   return detected;
 }
 
+// Possibly useful for debugging hardware faults:
+static void bus_test (struct bus_s *bus)
+{
+  struct txq_s *txq = bus->txq;
+  bool ok = false;
+
+  // Don't attempt test on older single-BUSY designs
+  if (!txq) {
+    SERIAL_PRINTF("%s: not present.\r\n", bus->name);
+    return;
+  }
+  if (txq->busyin_pin == txq->busyout_pin) {
+    SERIAL_PRINTF("%s: busyin==busyout, cannot test this.\r\n", bus->name);
+    return;
+  }
+  txq->uart->end();
+  pinMode(txq->busyout_pin, OUTPUT);
+  digitalWrite(txq->busyout_pin, HIGH);  // not-asserted
+  pinMode(txq->busyin_pin, INPUT);
+  delay(100);
+  for (byte attempt = 1; !ok && attempt < 3; ++attempt) {
+    pinMode(txq->busyout_pin, INPUT);  // tri-stated
+    delay(1); // was 10
+    ok = true;
+    if (digitalRead(txq->busyin_pin) != HIGH) {
+      SERIAL_PRINTF("%s: %u: BusyIn not HIGH when BusyOut tri-stated\r\n", bus->name, attempt);
+      ok = false;
+    }
+    pinMode(txq->busyout_pin, OUTPUT);
+    digitalWrite(txq->busyout_pin, LOW);  // asserted
+    delay(1);
+    if (digitalRead(txq->busyin_pin) != LOW) {
+      SERIAL_PRINTF("%s: %u: BusyIn not LOW when BusyOut LOW\r\n", bus->name, attempt);
+      ok = false;
+    }
+    digitalWrite(txq->busyout_pin, HIGH);  // not-asserted
+    delay(1);
+    if (digitalRead(txq->busyin_pin) != HIGH) {
+      SERIAL_PRINTF("%s: %u: BusyIn not HIGH when BusyOut HIGH\r\n", bus->name, attempt);
+      ok = false;
+    }
+  }
+  pinMode(txq->busyout_pin, INPUT);  // tri-stated
+  SERIAL_PRINTF("%s: Busy  test %s\r\n", bus->name, ok ? "passed" : "failed");
+  ok = bus_detect(txq->busyout_pin, bus->rx_pin, bus->tx_pin);
+  SERIAL_PRINTF("%s: Tx/Rx test %s\r\n", bus->name, ok ? "passed" : "failed");
+  txq->uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, bus->rx_pin, bus->tx_pin);
+}
+
 static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *name, HardwareSerial *uart, int rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
 {
   char tname[12];
   memset(bus, 0, sizeof(*bus));
+  bus->name = name;
   if (rx_pin == -1 || (do_loopback_test && !bus_detect(busyout_pin, rx_pin, tx_pin)))
     return false;
   bus->rxbuf = (struct rxbuf_s *)malloc(sizeof(struct rxbuf_s));
+  bus->tx_pin = tx_pin;
+  bus->rx_pin = rx_pin;
   mkname(tname, name, "_rx");
   init_rxbuf(bus->rxbuf, tname);
   bus->rxbuf->bus = bus;
@@ -4398,7 +4456,7 @@ static double dew_nvram_restore_amperage (byte channel)
 #if OLED_ENABLED
 #include <SSD1306AsciiWire.h>
 
-// Set oled type in NVRAM.  Eg.  set oled.type &SH1106_128x64
+// Set oled type in NVRAM.  Eg.  set oled.type SH1106_128x64
 //
 static const DevType *oled_type = NULL;
 
@@ -6441,7 +6499,7 @@ static void ota_fetch_file (long timeout, const char *server, const char *path)
 static void ota_fetch_update (void)
 {
   long timeout = get_timeout(10 * 1000);
-  char version[16] = {0,};
+  char version[20] = {0,};
 
   ota_show_progress(0, 0);  // Initialize the display
   if (OTA_SIMPLE_FETCH_VERSION) {
@@ -6460,10 +6518,13 @@ static void ota_fetch_update (void)
       }
     }
   }
-  SERIAL_PRINTF("OTA: running=" VERSION ", available=%s\r\n", version);
-  if (0 == strcmp(version, VERSION))
+  SERIAL_PRINTF("OTA: running=" VERSION " " VERSION_DATE ", available=%s\r\n", version);
+  if (0 == strcmp(version, VERSION " " VERSION_DATE))
     ota_exit("Already Up-to-date");
   char tmp[OLED_ROW_CHARS + 1];
+  char *space = index(version, ' ');
+  if (space)
+    *space = '\0';  // Strip date from version for display purposes
   sprintf(tmp, "Updating to %s", version);
   oled_set_row(0, tmp);
 
@@ -6561,6 +6622,8 @@ static bool handle_serial_commands (char *cmd)
       SERIAL_PRINTF("%s: Setting centre point for profile %u to 640,480\r\n", ssaa_recentre, profile);
       AUXBUS_SEND_MSG(DEV_ESP32, DEV_SSAA, SSAA_SET_PROFILE, (byte)640,(640>>8), 0x00,0x00,(byte)480, (480>>8), 0x00,0x00, (byte)profile);
     }
+  } else if (cmd[1] != 0) {
+    return false;
 #if EMULATE_DEW
   } else if (b == 'd') {
     dew_debug = !dew_debug;
@@ -6826,6 +6889,7 @@ static char help_p3000_commands[] =
 #endif
   "save              -- save any NVRAM changes from the 'set' command\r\n"
   "status            -- show some basic system information, including IP address\r\n"
+  "test_auxbus       -- low-level test for AUX bus functionality\r\n"
   "get all           -- list all NVRAM variables and values\r\n"
   "get var           -- show value of a specific variable\r\n"
   "set var val       -- change value of 'var' to 'val'\r\n"
@@ -6872,6 +6936,11 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
   } else if (0 == strcmp(cmd, "status")) {  // Show similar information to what OLED shows.
     status_command(writep);
     return true;
+  } else if (0 == strcmp(cmd, "test_auxbus")) {
+    auxtest_remaining = 0;  // cancel the automatic tests
+    bus_test(&auxbus);
+    if (auxrelay.txq)
+      bus_test(&auxrelay);
   } else if (0 == strcmp(cmd, "get all")) {
     nvram_get_all(writep);
     return true;
@@ -7074,7 +7143,8 @@ static void auxtest_loop ()
     }
   } else if (time_after(millis(), auxtest_timer)) {
     auxtest_timer = 0;
-    auxtest_send_msg();
+    if (auxtest_remaining > 0)
+      auxtest_send_msg();
   }
 }
 
