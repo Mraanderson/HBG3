@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.12"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-10-19"
+#define VERSION "v8.13"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-10-20"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,7 +36,9 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  *
- * Version 8.12
+ * Version 8.13 2023-10-20
+ *  -- Fix OLED for non-default OLED types -- was broken in v8.12
+ * Version 8.12 2023-10-19
  *  -- Turn OLED on before aio_setup(), for much earlier feedback after power-on.
  *  -- Show BT AUX/USB mode on OLED.
  *  -- Fix bugs and clean-up Bluetooth state management.
@@ -63,33 +65,6 @@
  *  -- OLED: Use longer I2C bursts for QRcode image data.
  *  -- OLED: Show QRcode only on Adafruit128x64 displays.
  *  -- OTA:  Do SPIFFS partition size check MUCH earlier, so a bad result can be shown on OLED.
- * Version 8.5
- *  -- OTA:  Implement a better version check; ota.timestamp conflicted with manual Arduino uploads.
- *  -- OLED: Add QRcode splash screen.
- * Version 8.4
- *  -- OLED: Fix slightly messed-up formatting from v8.3.
- * Version 8.3
- *  -- DEW: Retain "aggression" values using NVRAM.
- *  -- DEW: Be much more assertive with PWM percentages.
- *  -- DEW: Use degrees rather than half-degrees for "aggression" values.
- *  -- "get all" now shows variables sorted in order by name.
- *  -- New option to support hardware from the original WIFI+BT+GPS project.
- *  -- Support building for All-In-One hardware with HBG3 mainline code: everything working except USB-Host and Ethernet.
- *  -- Add NVRAM setting "musb.rfenable": set to 1 to leave WiFi+BT "on" when musb_selected: needed for port 3000 "debug".
- *  -- Add "status" command to show similar information to what OLED shows.
- *  -- Experiment with 8N1 instead of 8N2 for auxbus, with new NVRAM setting "auxbus.stopbits".
- * Version 8.2
- *  -- OTA:   Fix bug when scanning for Content-Length header line.
- *  -- OTA:   Compare file timestamp against saved (nvram) timestamp to decide if already up-to-date or not.
- *  -- NVRAM: New NVRAM setting for suppress.lowbattery: Use '1' to block Evolution Low-Battery warnings.
- *  -- NVRAM: New NVRAM settings for OTA update server and path.
- *  -- NVRAM: Change mount.reversed.alt to a simple 0/1 setting instead of "Yes".
- * Version 8.1
- *  -- P3000: Use w3000.printf() instead of unnecessary w3000_printf().
- *  -- OTA:   Introduce new Over-The-Air (OTA) firmware updates.
- * Version 8.0
- *  -- P3000: Toggle serial-debug redirection onto WiFi port 3000 with "debug" command there.
- *  -- MUSB:  Make changing the MUSB switch position trigger a reset of the HBG3 after a short delay.
  */
 #define WIFIRELAY_ENABLED         true  // When false, code for wifi_relay_mode is omitted.
 #define BLOCK_CFM_CONNECTIONS     true  // Set to false to allow CFM to attempt to interogate/update firmware (VERY RISKY!!). DO NOT DO THIS!!
@@ -4464,10 +4439,6 @@ static double dew_nvram_restore_amperage (byte channel)
 #if OLED_ENABLED
 #include <SSD1306AsciiWire.h>
 
-// Set oled type in NVRAM.  Eg.  set oled.type SH1106_128x64
-//
-static const DevType *oled_type = NULL;
-
 static struct oled_type_s {
   const char    *name;
   const DevType *oled;
@@ -4477,6 +4448,10 @@ static struct oled_type_s {
   {"SH1106_128x64",  &SH1106_128x64},
   {NULL, NULL}
 };
+
+// Set oled type in NVRAM.  Eg.  set oled.type SH1106_128x64
+//
+static const DevType *oled_type = oled_types[0].oled;
 
 static void oled_get_type (void)
 {
@@ -4492,6 +4467,8 @@ static void oled_get_type (void)
   }
   oled_type = oled_types[oled_index].oled;
   SERIAL_PRINTF("oled.type = %s\r\n", oled_types[oled_index].name);
+  if (oled_index != 0)
+    oled_setup();
 }
 
 #define OLED_I2C_ADDRESS  0x3c
@@ -4849,10 +4826,8 @@ static void oled_init_modes (void)
 
 static void oled_setup ()
 {
-  // Note: called too early to make use of any SerialDebug output.
   oled_clear(0);
   oled_init_modes();
-  oled_get_type();
   Wire.beginTransmission(OLED_I2C_ADDRESS);
   oled_detected = (Wire.endTransmission() == 0);
   if (oled_detected) {
@@ -6089,6 +6064,9 @@ static void nvram_restore ()
     nvram_save();
   }
   nvram_clear_reserved_slots();
+#if OLED_ENABLED
+  oled_get_type();
+#endif
   musb_rfkill = !atoi(nvram_get_val("musb.rfenable"));
   suppress_lowbattery = !!atoi(nvram_get_val("suppress.lowbattery"));
   byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
@@ -7232,13 +7210,13 @@ void setup (void)
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
 
-  Wire.begin();                   // Prepare the I2C bus for use
+  Wire.begin();                   // Prepare the I2C bus for use.  AIO needs this done early, here.
   Wire.setClock(100000ul);        // 400000ul causes WiFi/BT issues.
-#if OLED_ENABLED
+#if OLED_ENABLED 
   oled_setup();
 #endif
 #ifdef AIO_H
-  aio_setup_early();  // needed here for the MUSB switch which uses a USB chip GPIO
+  aio_setup_early();  // needed here for the MUSB switch which uses a USB chip GPIO; also does oled_setup().
 #endif
   // Now sort out the other uart assignments:
   if (ESP32_WIFI_MODE_PIN != -1)
@@ -7274,7 +7252,7 @@ void setup (void)
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LED_ON);   // Turn on the blue LED while initializing NVRAM
   WiFi.macAddress(wifi_mac_addr);  // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
-  nvram_restore();
+  nvram_restore();                 // Also called oled_setup() again if non-default oled_type
   digitalWrite(LED_PIN, LED_OFF);  // Turn off the blue LED
 
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u\r\n",
