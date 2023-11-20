@@ -5,3 +5,5 @@ I've made this alternative location for documentation and files for the Celestro
 [v8.13 direct from CloudyNights](https://www.cloudynights.com/index.php?app=core&module=attach&section=attach&attach_id=2432788)
 
 [Version history on Mark's website](https://rtr.ca/hbg3/history.html)
+
+[Check the Wiki for an evolving guide](https://github.com/Mraanderson/HBG3/wiki)
