@@ -5,12 +5,12 @@
  * This code is free for personal use/modification/whatever.
  *
  * This is a versatile add-on for the Celestron AUX bus.
- * Basic functionality /ncludes WiFi, Bluetooth, and USB connectivity.
+ * Basic functionality includes WiFi, Bluetooth, and USB connectivity.
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.13"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-10-20"
+#define VERSION "v8.14"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-11-16"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,9 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  *
+ * Version 8.14 2023-11-16
+ *  -- AIO: mirror the BLUE LED onto both of the AIO LEDs, as the BLUE LED is normally hidden inside the case.
+ *  -- Limit the polling frequency for detecting a Celestron Focus Motor.
  * Version 8.13 2023-10-20
  *  -- Fix OLED for non-default OLED types -- was broken in v8.12
  * Version 8.12 2023-10-19
@@ -102,7 +105,7 @@ static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
 #define READ_MUSB_SELECT_PIN()    (digitalRead(MUSB_SELECT_PIN))
 
 #define OLED_MODE_PIN             4     // For push-button switch to cycle between OLED data screens and OFF.
-#define LED_PIN                   2     // ESP32 DevKitV1 built-in (blue) LED
+#define BLUE_LED_PIN              2     // ESP32 DevKitV1 built-in (blue) LED
 #define USB_RX_PIN                3     // Internal pad; no associated pin
 #define USB_TX_PIN                1     // Internal pad; no associated pin
 
@@ -3301,7 +3304,7 @@ static void handle_preset_button (bool moving, bool button_down, struct button_s
       return;
     }
     if (time_after(millis(), b->timeout)) {
-      digitalWrite(LED_PIN, LED_ON);
+      set_blue_led(LED_ON);
       if (!fm_preset_pending) {
         b->have_position = false;
         fm_preset_pending = b;
@@ -3312,7 +3315,7 @@ static void handle_preset_button (bool moving, bool button_down, struct button_s
     b->timeout = 0;
     if (verbose || nchuck_debug)
       SERIAL_PRINTLN("Button up");
-    digitalWrite(LED_PIN, LED_OFF);
+    set_blue_led(LED_OFF);
     if (!b->have_position)
       fm_restore_preset(b);
     if (b->have_position) {
@@ -3746,13 +3749,13 @@ static void nchuck_loop ()
         nchuck_focus_only = !nchuck_focus_only;
         nvram_save_val("focus.only", !!nchuck_focus_only);
         SERIAL_PRINTF("focus_only=%u\r\n", nchuck_focus_only);
-        digitalWrite(LED_PIN, LED_OFF);
+        set_blue_led(LED_OFF);
       }
     }
   }
   if (buttons_down && time_after(millis(), buttons_down)) {
     mode_change_pending = true;
-    digitalWrite(LED_PIN, LED_ON);
+    set_blue_led(LED_ON);
   }
 
   // Handle the C/Z buttons:
@@ -3778,8 +3781,13 @@ static void nchuck_loop ()
   }
   if (nchuck_focus_only) {
     if (!fm_detected) {
-      if (nchuck_z_button() || nchuck_c_button())
-        fm_request_position(__func__, false);
+      if (nchuck_z_button() || nchuck_c_button()) {
+        static long next_time = 0;
+        if (!next_time || time_after(millis(), next_time)) {
+          fm_request_position(__func__, false);
+          next_time = get_timeout(500);
+        }
+      }
     } else if (presets_enabled) {
       bool moving = (nchuck_oldy || nchuck_oldx);
       handle_preset_button(moving, nchuck_z_button(), &z_button);
@@ -4967,6 +4975,14 @@ static inline byte packet_reset (struct rxbuf_s *rxbuf, byte ret)
   return ret;
 }
 
+static inline void set_blue_led (int on_off)
+{
+  digitalWrite(BLUE_LED_PIN, on_off);
+#ifdef AIO_H
+  aio_set_leds(on_off);
+#endif /* AIO_H */
+}
+
 static void auxtest_received_msg (struct bus_s *bus, byte *data)
 {
   if (bus != &auxbus)
@@ -4976,7 +4992,7 @@ static void auxtest_received_msg (struct bus_s *bus, byte *data)
     print_packet(bus->rxbuf->name, "auxtest", data, data[1] + 3);
   if (auxtest_remaining > 0) {
     auxtest_remaining--;
-    digitalWrite(LED_PIN, LED_ON);
+    set_blue_led(LED_ON);
     auxtest_led_timer = get_timeout(500);
   }
 }
@@ -7135,7 +7151,7 @@ static void auxtest_loop ()
 {
   if (auxtest_led_timer && time_after(millis(), auxtest_led_timer)) {
     auxtest_led_timer = 0;
-    digitalWrite(LED_PIN, LED_OFF);
+    set_blue_led(LED_OFF);
   } else if (!auxtest_timer) {
     if (auxtest_remaining > 0) {
       if (millis() > 15000)
@@ -7210,7 +7226,7 @@ void setup (void)
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
 
-  Wire.begin();                   // Prepare the I2C bus for use.  AIO needs this done early, here.
+  Wire.begin();                   // Prepare the I2C bus for use.  Needed for OLED and AIO.
   Wire.setClock(100000ul);        // 400000ul causes WiFi/BT issues.
 #if OLED_ENABLED 
   oled_setup();
@@ -7248,12 +7264,12 @@ void setup (void)
     musb_uart->flush(false);
   }
 
+  pinMode(BLUE_LED_PIN, OUTPUT);
   fram_setup();
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LED_ON);   // Turn on the blue LED while initializing NVRAM
-  WiFi.macAddress(wifi_mac_addr);  // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
-  nvram_restore();                 // Also called oled_setup() again if non-default oled_type
-  digitalWrite(LED_PIN, LED_OFF);  // Turn off the blue LED
+  set_blue_led(LED_ON);
+  WiFi.macAddress(wifi_mac_addr);       // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
+  nvram_restore();                      // Also called oled_setup() again if non-default oled_type
+  set_blue_led(LED_OFF);
 
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u\r\n",
          hbg3_version, auxrelay_detected, EMULATE_GPS, BLOCK_CFM_CONNECTIONS,
