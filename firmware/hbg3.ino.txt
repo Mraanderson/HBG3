@@ -6,11 +6,11 @@
  *
  * This is a versatile add-on for the Celestron AUX bus.
  * Basic functionality includes WiFi, Bluetooth, and USB connectivity.
- * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
+ * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.16"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-11-23"
+#define VERSION "v8.17"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-11-24"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -35,7 +35,10 @@
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
+ * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.17 2023-11-24
+ *  -- Only do EVO WiFi commands if Evo mount detected, and retry if no ACK is received.
  * Version 8.16 2023-11-23
  *  -- Add NMEA_playback feature for debugging/fixing GPS NMEA decoding.
  *  -- Fix two bugs in the NMEA parsing, which were preventing a "fix" from being reported with some GPS modules.
@@ -53,29 +56,6 @@
  *  -- Turn OLED on before aio_setup(), for much earlier feedback after power-on.
  *  -- Show BT AUX/USB mode on OLED.
  *  -- Fix bugs and clean-up Bluetooth state management.
- * Version 8.11
- *  -- Include VERSION_DATE as part of OTA Update version check.
- *  -- Verify that single-letter commands are actually single-letters!
- *  -- New "test_auxbus" command, to verify BUSYIN/BUSYOUT and TX/RX functionality.
- * Version 8.10
- *  -- Push and hold button for 10-seconds while on QRcode screen, and device resets to "factory defaults".
- *  -- Add '*' indicator on DirectConnect display to indicate AccessPoint mode selected but not configured.
- *  -- Move call to aio_setup() to AFTER oled_setup(), so that the AIO's OLED lights up MUCH sooner at power-on.
- * Version 8.9
- *  -- Note that OTA Updates will NOT work on ethernet because of limitations of the underlying library.
- *  -- Get ethernet working on AIO, including with p3000_debug.
- *  -- Get bt_mode_usb working on AIO: Celestron USB Hand-Controller gets exported over Bluetooth.
- *  -- Tidying.
- * Version 8.8
- *  -- NCHK: Improve Nunchuck/focuser fix from v8.7, by NOT sending DEV_AZM/DEV_ALT packets out on relay bus.
- *  -- Add PIN definitions for coolick PCBs.
- * Version 8.7
- *  -- NCHK: Send Nunchuck focuser (and other) packets out on relay bus as well as auxbus.
- * Version 8.6
- *  -- OLED: Use NVRAM setting "oled.type" instead of a build-time setting.
- *  -- OLED: Use longer I2C bursts for QRcode image data.
- *  -- OLED: Show QRcode only on Adafruit128x64 displays.
- *  -- OTA:  Do SPIFFS partition size check MUCH earlier, so a bad result can be shown on OLED.
  */
 #define WIFIRELAY_ENABLED         true  // When false, code for wifi_relay_mode is omitted.
 #define BLOCK_CFM_CONNECTIONS     true  // Set to false to allow CFM to attempt to interogate/update firmware (VERY RISKY!!). DO NOT DO THIS!!
@@ -315,7 +295,7 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
   sprintf(current_ipaddr, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
-// Known devices on AUX bus:
+// Known devices on AUX bus (6 chars or less for nice formatting):
 #define DEV_UART    0x00
 #define DEV_MOUNT   0x01
 #define DEV_HC4     0x04
@@ -346,6 +326,9 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_DUMMY   0xe3
 #define DEV_RELAY   0xe4
 #define DEV_FF      0xff
+
+#define EVOLUTION_MODEL  0x1687
+static uint16_t mount_model = 0x0000;
 
 static byte DEV_ESP32;  // Either DEV_HBG3 or DEV_RELAY, from setup()
 
@@ -683,6 +666,7 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   {0xff, NULL}
 };
 
+#define SET_EVO_WIFI   0x10
 #define UART_SET_BAUD  0x51
 
 // Oddball ops:
@@ -697,6 +681,7 @@ static const struct auxdev_oddball_s {
   {DEV_BATT,   0x10, "BATT_GET_VOLTAGE"},
   {DEV_LEDS,   0x10, "LEDS_GET_LEVEL"},
   {DEV_UART,   UART_SET_BAUD, "SET_BAUD"},
+  {DEV_EVWIFI, SET_EVO_WIFI, "SET_EVO_WIFI"},
   {0xff, 0xff, NULL}
 };
 
@@ -767,8 +752,8 @@ static const char *get_model_decoder (byte *data)
       case 0x1189: desc = "CPC-Deluxe";        break;
       case 0x1283: desc = "GT-Series";         break;
       case 0x1485: desc = "AVX";               break;
-      case 0x1687: desc = "Evolution";         break;
       case 0x1788: desc = "CGX";               break;
+      case EVOLUTION_MODEL: desc = "Evolution";break;
       default: {
         switch (model >> 8) {
           case 0x05: desc = "CGE";             break;
@@ -2389,7 +2374,7 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
     case OP(SSAG_SET_TIME_NOW,7): {          // 4-bytes out: time = [44, 137, 45, 19] 2C-89-2D-13  (2023-09-04 20:04:35.701 -04:00)
       break;
     }
-    case OP(SSAG_45,3): {                    // 4-bytes in
+    case OP(SSAG_45,3): {                    // 4-bytes in, sometimes all zeros..
       reply[len++] = 0x42;
       reply[len++] = 0xe1;
       reply[len++] = 0x79;
@@ -5541,23 +5526,33 @@ static void negate_16bit_position (byte *p)
   p[0] = (byte)(pos >> 8);
 }
 
-static byte cordwrap_original_op = 0;
+static byte cordwrap_original_op    = 0;
+static long evo_wifi_change_pending = 0;
 
 /* Try and achieve compatibility with older mounts such as the Nexstar GPS NXGPS */
 static uint16_t hack_response_pkt (byte *data, uint16_t len)
 {
   byte src = data[2], dst = data[3], op = data[4];
+  if (op == DEV_GET_MODEL && (src == DEV_AZM || src == DEV_ALT)) {
+    if (data[1] == 4) {
+      // 1-byte response from a Nexstar-GPS: {0x3b,0x04,0x10,0x20,0x05,0x01,0xc6}:
+      // Latest CPWI is happy with it now, but older versions were not.
+      // And SkyPortal/SkySafari still expect a 2-byte response.
+      if (TVERBOSE(data))
+        SERIAL_PRINTLN("Translating MC_GET_MODEL response");
+      data[1] += 1;
+      data[6] = 0x00;  // append one extra byte to convert 1-byte model to 2-byte model.
+      update_checksum(data);
+      len += 1;
+    }
+    if (data[1] == 5)  // Save mount_model for other uses.  Eg. Evo Wifi on/off.
+      mount_model = (((uint16_t)data[5]) << 8) | data[6];
+    return len;
+  }
   uint16_t op_len = OP(op,data[1]);
-  // MC_GET_MODEL 1-byte response from a GPS-8 mount: {0x3b,0x04,0x10,0x20,0x05,0x01,0xc6}:
-  // Latest CPWI is happy with it as-is now; older versions were not.
-  // But SkyPortal/SkySafari still expect a 2-byte response to GET_MODEL (0x05).
-  if ((src == DEV_AZM || src == DEV_ALT) && op_len == OP(DEV_GET_MODEL,4)) {
-    if (TVERBOSE(data))
-      SERIAL_PRINTLN("Translating MC_GET_MODEL response");
-    data[1] += 1;
-    data[6] = 0x00;  // append one extra byte to convert 1-byte model to 2-byte model.
-    update_checksum(data);
-    return len + 1;
+  if (src == DEV_EVWIFI && op_len == OP(SET_EVO_WIFI, 3)) {
+    evo_wifi_change_pending = 0;
+    return len;
   }
   // StarSense-For-Skywatcher box replies from DEV_SSSWI instead of DEV_AZM: 3b 07 b8 0e fe 01 00 17 90 8d
   if (src == DEV_SSSWI && dst == DEV_SW && op == DEV_GET_VERSION) {
@@ -6481,16 +6476,39 @@ static void set_esp32_wifi_onoff ()
 
 static bool evo_wifi_want_off = false;
 static bool evo_wifi_is_off   = false;
+static long evo_wifi_attempts = 0;
 
-static void set_evo_wifi_onoff ()
+static void send_evo_wifi_onoff ()
 {
-  if (!auxbus_passive_mode && evo_wifi_is_off != evo_wifi_want_off) {
-    evo_wifi_is_off = evo_wifi_want_off;
-    if (verbose)
-      SERIAL_PRINTF("evo_wifi %s\r\n", evo_wifi_is_off ? "OFF" : "ON");
-    byte msg[] = {0x3b, 0x04, DEV_ESP32, DEV_EVWIFI, 0x10, !evo_wifi_is_off, 0x00};
-    update_checksum(msg);
-    tx_enq(NULL, &auxbus, forward_no, REGULAR_PKT, msg, sizeof(msg));
+  if (evo_wifi_attempts == 0)
+    return;
+  evo_wifi_attempts--;
+  if (verbose)
+    SERIAL_PRINTF("evo_wifi %s\r\n", evo_wifi_is_off ? "OFF" : "ON");
+  byte msg[] = {0x3b, 0x04, DEV_ESP32, DEV_EVWIFI, SET_EVO_WIFI, !evo_wifi_is_off, 0x00};
+  update_checksum(msg);
+  tx_enq(NULL, &auxbus, forward_no, REGULAR_PKT, msg, sizeof(msg));
+  evo_wifi_change_pending = get_timeout(1000);
+}
+
+static void manage_evo_wifi (bool want_off)
+{
+  if ((!auxbus.txq->is_alive) || (mount_model && mount_model != EVOLUTION_MODEL))
+    return;
+  static long evo_wifi_delay_timer = 0;
+  if (want_off != evo_wifi_want_off) {
+    evo_wifi_want_off = want_off;
+    evo_wifi_delay_timer = get_timeout(5000);
+  } else if (evo_wifi_delay_timer && time_after(millis(), evo_wifi_delay_timer)) {
+    evo_wifi_delay_timer = 0;
+    evo_wifi_attempts = 3;
+    if (!auxbus_passive_mode && evo_wifi_is_off != evo_wifi_want_off) {
+      evo_wifi_is_off = evo_wifi_want_off;
+      send_evo_wifi_onoff();
+    }
+  } else if (evo_wifi_change_pending && time_after(millis(), evo_wifi_change_pending)) {
+    evo_wifi_change_pending = 0;
+    send_evo_wifi_onoff();
   }
 }
 
@@ -6505,20 +6523,6 @@ static void manage_esp32_wifi (bool want_off)
   } else if (time_after(millis(), esp32_wifi_off_timer)) {
     esp32_wifi_off_timer = 0;
     set_esp32_wifi_off(true);
-  }
-}
-
-static void manage_evo_wifi (bool want_off)
-{
-  if (!auxbus.txq->is_alive)
-    return;
-  static long evo_wifi_timer = 0;
-  if (want_off != evo_wifi_want_off) {
-    evo_wifi_want_off = want_off;
-    evo_wifi_timer = get_timeout(5000);
-  } else if (evo_wifi_timer && time_after(millis(), evo_wifi_timer)) {
-    evo_wifi_timer = 0;
-    set_evo_wifi_onoff();
   }
 }
 
@@ -6765,7 +6769,7 @@ static const char help_serial_commands[] =
 #if EMULATE_GPS
   "w                 -- Force GPS receiver on/off\r\n"
 #endif
-  "$$$               -- Enter ASCII pass-through mode to the EVWIFI config interface\r\n"
+  "$$$               -- Enter ASCII pass-through mode to the Evolution-WiFi config interface\r\n"
   "ssaa_recentre N   -- Reset SSAA Camera centre point to 640,480 for Profile slot N: 0-2\r\n"
   ;
 
