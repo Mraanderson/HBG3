@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.15"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-11-21"
+#define VERSION "v8.16"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-11-23"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,9 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  *
+ * Version 8.16 2023-11-23
+ *  -- Add NMEA_playback feature for debugging/fixing GPS NMEA decoding.
+ *  -- Fix two bugs in the NMEA parsing, which were preventing a "fix" from being reported with some GPS modules.
  * Version 8.15 2023-11-21
  *  -- Try and fix garbage on Serial port at boot time.
  *  -- Improve the polling fix from 8.14.
@@ -1427,6 +1430,11 @@ static byte long_to_4bytes (byte *dest, ulong v)
 
 #if EMULATE_GPS
 
+static bool     gps_debug = false;  // GPS info. Can be toggled at run-time (hit 'g' on serial monitor)
+static bool     GPS_debug = false;  // GPS NMEA sentences. Can be toggled at run-time (hit 'G' on serial monitor)
+
+//#include "NMEA_playback.h" // For debugging GPS NMEA decoding.
+
 // ****Begin TinyGPS++ **********************************************************************************************************
 
 /*
@@ -1623,7 +1631,7 @@ static int fromHex(char a)
     return a - '0';
 }
 
-static bool get_digits (const char *term, byte n, uint32_t *ret_p)
+static bool get_digits (const char *term, byte n, uint32_t *ret_p, bool excess_ok)
 {
   uint32_t t = 0;
   for (byte i = 0; i < n; ++i) {
@@ -1632,7 +1640,7 @@ static bool get_digits (const char *term, byte n, uint32_t *ret_p)
       return false;
     t = (t * 10) + ((unsigned)c - '0');
   }
-  if (term[n] >= '0' && term[n] <= '9')
+  if (!excess_ok && term[n] >= '0' && term[n] <= '9')
     return false;
   *ret_p = t;
   return true;
@@ -1641,7 +1649,7 @@ static bool get_digits (const char *term, byte n, uint32_t *ret_p)
 static bool get_time (const char *term, uint32_t *time)
 {
   uint32_t t1 = 0, t2 = 0;
-  if (!get_digits(term, 6, &t1) || term[6] != '.' || !get_digits(term + 7, 2, &t2))
+  if (!get_digits(term, 6, &t1, false) || term[6] != '.' || !get_digits(term + 7, 2, &t2, true))
     return false;
   *time = t1 * 100 + t2;
   return true;
@@ -1679,6 +1687,7 @@ bool GPSPlus::endOfTermHandler()
   if (isChecksumTerm) {
     byte checksum = 16 * fromHex(term[0]) + fromHex(term[1]);
     if (checksum != parity) {
+      //if (GPS_debug) SERIAL_PRINTLN("GPS: bad csum\r\n");
       switch(curSentenceType) {
         case GPS_SENTENCE_GPGSV:
           satellitesInViewGP.have_newval = false;
@@ -1699,7 +1708,6 @@ bool GPSPlus::endOfTermHandler()
       prevSentenceType = ~0;
       return false;
     }
-    bool handled = true;
     if (curSentenceType != prevSentenceType) {
       switch(prevSentenceType) {
         case GPS_SENTENCE_GPGSV:
@@ -1717,32 +1725,29 @@ bool GPSPlus::endOfTermHandler()
         case GPS_SENTENCE_GBGSV:
           satellitesInViewGB.commit();
           break;
-        default:
-          handled = false;
       }
       prevSentenceType = curSentenceType;
     }
-    if (!handled) {
-      switch(curSentenceType) {
-        case GPS_SENTENCE_GPRMC:
-          date.commit();
-          time.commit();
-          if (sentenceHasFix)
-             location.commit();
-          break;
-        case GPS_SENTENCE_GPGGA:
-          time.commit();
-          if (sentenceHasFix)
-            location.commit();
-          satellites.commit();
-          break;
-        case GPS_SENTENCE_GNGLL:
-          time.commit();
-          if (sentenceHasFix)
-            location.commit();
-          break;
-      }
+    switch(curSentenceType) {
+      case GPS_SENTENCE_GPRMC:
+        date.commit();
+        time.commit();
+        if (sentenceHasFix)
+           location.commit();
+        break;
+      case GPS_SENTENCE_GPGGA:
+        time.commit();
+        if (sentenceHasFix)
+          location.commit();
+        satellites.commit();
+        break;
+      case GPS_SENTENCE_GNGLL:
+        time.commit();
+        if (sentenceHasFix)
+          location.commit();
+        break;
     }
+    //if (GPS_debug && sentenceHasFix) SERIAL_PRINTF("GPS: %u hasFix: D%u T%u L%u\r\n", curSentenceType, date.is_valid(), time.is_valid(), location.is_valid());
     return true;
   }
 
@@ -1801,7 +1806,7 @@ bool GPSPlus::endOfTermHandler()
         location.rawNewLngData.negative = term[0] == 'W';
         break;
       case COMBINE(GPS_SENTENCE_GPRMC, 9): // Date (GPRMC)
-        date.have_newval = get_digits(term, 6, &date.newval);
+        date.have_newval = get_digits(term, 6, &date.newval, false);
         break;
       case COMBINE(GPS_SENTENCE_GPGGA, 6): // Fix data (GPGGA)
         sentenceHasFix = term[0] > '0';
@@ -1914,7 +1919,7 @@ void     GPSInteger::set(const char *term) { newval = atol(term); have_newval = 
 void GPSInteger::cond_set2 (const char *term)
 {
   uint32_t v = 0;
-  if (get_digits(term, 2, &v)) {
+  if (get_digits(term, 2, &v, false)) {
     if (!have_newval || v > newval) {
       have_newval = true;
       newval      = v;
@@ -1947,8 +1952,6 @@ void GPSPlus::invalidate (void)
 // *** End TinyGPS++ ************************************************************************************************************
 
 static GPSPlus  gps;
-static bool     gps_debug = false;  // GPS info. Can be toggled at run-time (hit 'g' on serial monitor)
-static bool     GPS_debug = false;  // GPS NMEA sentences. Can be toggled at run-time (hit 'G' on serial monitor)
 static ulong    gps_uart_baud = 0;
 static long     gps_last_baud_change = 0;
 
@@ -1969,8 +1972,10 @@ static bool    gps_using_swserial;
 #define SWSERIAL_bufCapacity   96  // library default is 64; WARNING: uses a LOT of memory!
 
 static void GPS_UART_WRITE     (byte b) { if (GPS_TX_PIN != -1) {gps_using_swserial ? swserial0.write(b) : hwserial1.write(b);} }
+#ifndef NMEA_playback_h
 static byte GPS_UART_READ        (void) { return gps_using_swserial ? swserial0.read()      : hwserial1.read();      }
 static int  GPS_UART_AVAILABLE   (void) { return gps_using_swserial ? swserial0.available() : hwserial1.available(); }
+#endif
 static void GPS_UART_FLUSH       (void) {        gps_using_swserial ? swserial0.flush()     : hwserial1.flush(false);}
 static const char *GPS_UART_NAME (void) { return gps_using_swserial ? "swserial0"           : "hwserial1"; }
 
