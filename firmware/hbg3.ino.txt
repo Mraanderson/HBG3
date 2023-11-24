@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.14"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-11-16"
+#define VERSION "v8.15"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-11-21"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,11 @@
  *
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  *
+ * Version 8.15 2023-11-21
+ *  -- Try and fix garbage on Serial port at boot time.
+ *  -- Improve the polling fix from 8.14.
+ *  -- OLED: Add GPS Location Save/Restore options.
+ *  -- OLED: Other improvements.
  * Version 8.14 2023-11-16
  *  -- AIO: mirror the BLUE LED onto both of the AIO LEDs, as the BLUE LED is normally hidden inside the case.
  *  -- Limit the polling frequency for detecting a Celestron Focus Motor.
@@ -187,7 +192,7 @@ static long            bt_connected = 0;
  * Too complex to attempt debug over SoftwareSerial for now.
  * But one can instead use port 3000 and the "debug" command there instead.
  */
-HardwareSerial          hwserial0(0);   // debug or MUSB.
+HardwareSerial          *hwserial0 = &Serial;
 HardwareSerial          hwserial1(1);   // MUSB, auxrelay, GPS, or debug (in that order).
 HardwareSerial          auxbus_uart(2); // auxbus
 #define auxrelay_uart   hwserial1
@@ -656,7 +661,7 @@ static const struct auxdev_op_s aux_ssaa_ops[] = {
 #define SSAG_GET_GUIDING_DATA          0x23  // 10-bytes in:  Error(0, 0) Correction(0, 0) MoveRa = False MoveDec = False StopAll = TrueGuideStars = 0Quality = 0 00-00-00-00-91-00-00-00-00-00
 #define SSAG_SET_MOUNT_INFO            0x30  // 8-bytes out, ack: mountModel = 4, isAltAz = True, azmFirmwareVersion = [40, 99] 04-01-28-63-00-00
 #define SSAG_SET_GEOLOCATION           0x31  // 8-bytes out, ack: location = [66, 34, 203, 75, 194, 149, 204, 45] 42-22-CB-4B-C2-95-CC-2D
-#define SSAG_SET_TIME                  0x32  // 4-bytes out, ack: ime = [44, 137, 45, 19] 2C-89-2D-13  (2023-09-04 20:04:35.701 -04:00)
+#define SSAG_SET_TIME_NOW              0x32  // 4-bytes out, ack: time = [44, 137, 45, 19] 2C-89-2D-13  (2023-09-04 20:04:35.701 -04:00)
 #define SSAG_45                        0x45  // 4-bytes in
 
 static const struct auxdev_op_s aux_ssag_ops[] = {
@@ -670,7 +675,7 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   AUX_DEV_OP(SSAG_GET_GUIDING_DATA),
   AUX_DEV_OP(SSAG_SET_MOUNT_INFO),
   AUX_DEV_OP(SSAG_SET_GEOLOCATION),
-  AUX_DEV_OP(SSAG_SET_TIME),
+  AUX_DEV_OP(SSAG_SET_TIME_NOW),
   AUX_DEV_OP(SSAG_45),
   {0xff, NULL}
 };
@@ -1938,6 +1943,7 @@ void GPSPlus::invalidate (void)
   satellitesInViewGA.validTimeout = 0;
   satellitesInViewGB.validTimeout = 0;
 }
+
 // *** End TinyGPS++ ************************************************************************************************************
 
 static GPSPlus  gps;
@@ -2059,6 +2065,31 @@ static bool gps_fix_is_valid()
   return gps.date.is_valid() && gps.time.is_valid() && gps.location.is_valid();
 }
 
+static int32_t gps_saved_location_lat = 0;
+static int32_t gps_saved_location_lng = 0;
+static bool    gps_use_saved_location = false;
+
+static inline bool gps_has_saved_location (void) { return gps_saved_location_lat && gps_saved_location_lng; }
+
+static void gps_save_location (void)
+{
+  if (gps_has_fix) {
+    gps_saved_location_lat = (int32_t)(gps.location.lat() * GPS_MULT_FACTOR);
+    gps_saved_location_lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
+  } else {
+    gps_saved_location_lat = 0;
+    gps_saved_location_lng = 0;
+  }
+  nvram_save_val("gps.location.lat", gps_saved_location_lat);
+  nvram_save_val("gps.location.lng", gps_saved_location_lng);
+  gps_use_saved_location = false;
+}
+
+static void gps_restore_location (void)
+{
+  gps_use_saved_location = gps_has_saved_location();
+}
+
 static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
   byte reply[AUXBUS_PKT_MAX], len, op = data[4];
@@ -2071,16 +2102,17 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
   switch (OP(op,data[1]))
   {
     case OP(GPS_TIME_VALID,3): {
-      bool valid = gps.time.is_valid();
+      bool valid = gps.date.is_valid() && gps.time.is_valid();
       reply[len++] = valid;
       if (gps_debug)
         SERIAL_PRINTF("GPS TIME_VALID: %s  %02u/%02u\r\n", valid ? "true" : "false", gps.satellites.value(), gps.satellitesInView());
       break;
     }
     case OP(GPS_LINKED,3): {
-      reply[len++] = gps_has_fix;
+      bool has_fix = gps_use_saved_location ? (gps.date.is_valid() && gps.time.is_valid()) : gps_has_fix;
+      reply[len++] = has_fix;
       if (gps_debug)
-        SERIAL_PRINTF("GPS LINKED: %s  %02u/%02u\r\n", gps_has_fix ? "true" : "false", gps.satellites.value(), gps.satellitesInView());
+        SERIAL_PRINTF("GPS LINKED: %s  %02u/%02u\r\n", gps_has_fix ? "true" : (has_fix ? "saved" : "false"), gps.satellites.value(), gps.satellitesInView());
       break;
     }
     case OP(GPS_GET_TIME,3): {
@@ -2112,7 +2144,11 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_GET_LAT,3): {
-      int32_t lat = (int32_t) (gps.location.lat() * GPS_MULT_FACTOR);
+      int32_t lat;
+      if (gps_use_saved_location && !gps_has_fix)
+        lat = gps_saved_location_lat;
+      else
+        lat = (int32_t)(gps.location.lat() * GPS_MULT_FACTOR);
       uint8_t* latBytePtr = (uint8_t*)&lat;
       reply[len++] = latBytePtr[2];
       reply[len++] = latBytePtr[1];
@@ -2122,7 +2158,11 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_GET_LONG,3): {
-      int32_t lng = (int32_t) (gps.location.lng() * GPS_MULT_FACTOR);
+      int32_t lng;
+      if (gps_use_saved_location && !gps_has_fix)
+        lng = gps_saved_location_lng;
+      else
+        lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
       uint8_t* lngBytePtr = (uint8_t*)&lng;
       reply[len++] = lngBytePtr[2];
       reply[len++] = lngBytePtr[1];
@@ -2341,7 +2381,7 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
     case OP(SSAG_SET_GEOLOCATION,11): {      // 8-bytes out: location = [66, 34, 203, 75, 194, 149, 204, 45] 42-22-CB-4B-C2-95-CC-2D
       break;
     }
-    case OP(SSAG_SET_TIME,7): {              // 4-bytes out: ime = [44, 137, 45, 19] 2C-89-2D-13  (2023-09-04 20:04:35.701 -04:00)
+    case OP(SSAG_SET_TIME_NOW,7): {          // 4-bytes out: time = [44, 137, 45, 19] 2C-89-2D-13  (2023-09-04 20:04:35.701 -04:00)
       break;
     }
     case OP(SSAG_45,3): {                    // 4-bytes in
@@ -3779,13 +3819,15 @@ static void nchuck_loop ()
     if (!focus_selected || !newx || !newy)  // For focus, Prevent x and y from fighting each other!
       nchuck_send_mc_cmd(fast_range|focus_selected, devy, newy);
   }
+  static long next_poll = 0;
+  if (next_poll && time_after(millis(), next_poll))
+    next_poll = 0;
   if (nchuck_focus_only) {
     if (!fm_detected) {
       if (nchuck_z_button() || nchuck_c_button()) {
-        static long next_time = 0;
-        if (!next_time || time_after(millis(), next_time)) {
+        if (!next_poll) {
+          next_poll = get_timeout(500);
           fm_request_position(__func__, false);
-          next_time = get_timeout(500);
         }
       }
     } else if (presets_enabled) {
@@ -4483,15 +4525,17 @@ static void oled_get_type (void)
 static  SSD1306AsciiWire  oled;
 
 #define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
-#define OLED_NMODES       (((byte)EMULATE_DEW) + ((byte)EMULATE_GPS) + ((byte)ETHERNET_ENABLED) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
+#define OLED_NMODES       (((byte)EMULATE_DEW) + (2*(byte)EMULATE_GPS) + ((byte)ETHERNET_ENABLED) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
 
-static void (*oled_updatefn[OLED_NMODES])(void);
+static bool (*oled_updatefn[OLED_NMODES])(void);
 static char oled_data[4][OLED_ROW_CHARS + 1] = {{0,},};   // Four rows of OLED data
 static bool oled_data_updated[4] = {false,false,false,false};
 static bool oled_turned_off      = false;
 static long oled_offtime         = 0;
 static long oled_splash_timer    = 0;
 static bool oled_updatefn_initial_call = true;
+static long modepin_longpress    = 0;
+static byte oled_mode            = 0;
 
 static const uint8_t HomeBrew5x14_font[] = {  // two groups of 5-bytes-across for each character. Each byte is vertical pixels.
  0x0,  0x0,     5,   14, 0x20, 0x61,
@@ -4584,14 +4628,10 @@ static void oled_clear (byte from_row)
 
 #if EMULATE_GPS
 static long oled_gps_timer = 0;
+static bool gps_location_selected;
 
-static void oled_gps_updatefn (void)
+static void oled_manage_gps_sleep (void)
 {
-  if (!gps_detected) {
-    oled_set_row(0, "GPS not detected.");
-    oled_clear(1);
-    return;
-  }
   if (gps_is_on) {
     oled_gps_timer = 0;
     gps_stop_timeout();
@@ -4602,21 +4642,98 @@ static void oled_gps_updatefn (void)
     oled_gps_timer = 0;
     gps_turn_on(false, false);
   }
+}
+
+static bool oled_location_updatefn (void)
+{
+  static bool saving;
+  static long done = 0;
+  if (!gps_detected)
+    return false;  // skip this screen
+  oled_manage_gps_sleep();
+  if (oled_updatefn_initial_call) {
+    saving = gps_has_fix;
+    if (!saving && !gps_has_saved_location())
+      return false;  // skip this screen
+    gps_location_selected = false;
+    done = 0;
+  }
+  if (saving) {
+    oled_set_row(0, "Save GPS Location?");
+    oled_clear(1);
+    if (gps_location_selected) {
+      if (!done) {
+        done = get_timeout(1500);
+        gps_save_location();
+      }
+      oled_set_row(2, "SAVED.");
+    } else {
+      oled_set_row(2, "Press and hold");
+      oled_set_row(3, "  to Save:");
+    }
+  } else {
+    oled_set_row(0, "Restore GPS Location?");
+    oled_clear(1);
+    if (gps_location_selected) {
+      if (!done) {
+        done = get_timeout(1500);
+        gps_restore_location();
+      }
+      oled_set_row(2, "RESTORED.");
+    } else {
+      oled_set_row(2, "Press and hold");
+      oled_set_row(3, "  to Restore:");
+    }
+  }
+  if (done) {
+    if (modepin_longpress) {
+      done = get_timeout(1500);
+    } else if (time_after(millis(), done)) {
+      oled_mode -= 2;  // go back to main GPS status display
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool oled_gps_updatefn (void)
+{
+  if (!gps_detected) {
+    oled_set_row(0, "GPS not detected.");
+    oled_clear(1);
+    return true;
+  }
+  oled_manage_gps_sleep();
   char tmp[OLED_ROW_CHARS + 1];
   tmp[OLED_ROW_CHARS] = 0;
   snprintf(tmp, OLED_ROW_CHARS, "GPS Sats: %02u/%02u", gps.satellites.value(), gps.satellitesInView());
   oled_set_row(0, tmp);
-  if (gps_has_fix)
-    snprintf(tmp, OLED_ROW_CHARS, "Latitude:  %c%9s", ((gps.location.lat() < 0.0) ? 'S' : 'N'), String(fabs(gps.location.lat()), 5).c_str());
+
+  char colon = ':';
+  double lat, lng;
+  bool has_fix = gps_has_fix;
+  if (has_fix) {
+    lat = gps.location.lat();
+    lng = gps.location.lng();
+  } else if (gps_use_saved_location) {
+    lat = ((double)gps_saved_location_lat) / GPS_MULT_FACTOR;
+    lng = ((double)gps_saved_location_lng) / GPS_MULT_FACTOR;
+    colon = '?';
+    has_fix = true;
+  }
+  
+  if (has_fix)
+    snprintf(tmp, OLED_ROW_CHARS, "Latitude%c  %c%9s", colon, ((lat < 0.0) ? 'S' : 'N'), String(fabs(lat), 5).c_str());
   else
     snprintf(tmp, OLED_ROW_CHARS, "Latitude:  ----.-----");
   oled_set_row(1, tmp);
 
-  if (gps_has_fix)
-    snprintf(tmp, OLED_ROW_CHARS, "Longitude: %c%9s", ((gps.location.lng() < 0.0) ? 'W' : 'E'), String(fabs(gps.location.lng()), 5).c_str());
+  if (has_fix)
+    snprintf(tmp, OLED_ROW_CHARS, "Longitude%c %c%9s", colon, ((lng < 0.0) ? 'W' : 'E'), String(fabs(lng), 5).c_str());
   else
     snprintf(tmp, OLED_ROW_CHARS, "Longitude: ----.-----");
   oled_set_row(2, tmp);
+
   int n;
   if (gps.date.is_valid())
     n = snprintf(tmp, OLED_ROW_CHARS, "%02d/%02d/%02d UTC ", gps.date.day(), gps.date.month(), gps.date.year() % 100);
@@ -4628,23 +4745,22 @@ static void oled_gps_updatefn (void)
   else
     snprintf(tmp + n, OLED_ROW_CHARS - n, "%s", "--:--:--");
   oled_set_row(3, tmp);
+  return true;
 }
 #endif
 
 #if EMULATE_DEW
-static void oled_dewcontrol_updatefn (void)
+static bool oled_dewcontrol_updatefn (void)
 {
-  if (!dew_detected) {
-    oled_set_row(0, "DewControl: no SHT3x");
-    oled_clear(1);
-  } else {
-    for (byte row = 0; row < 4; ++row)
-       oled_set_row(row, dew_oled_rows[row]);
-  }
+  if (!dew_detected)
+    return false;  // skip this screen
+  for (byte row = 0; row < 4; ++row)
+     oled_set_row(row, dew_oled_rows[row]);
+  return true;
 }
 #endif /* EMULATE_DEW */
 
-static void oled_connectstatus_updatefn (void)
+static bool oled_connectstatus_updatefn (void)
 {
   char tmp[OLED_ROW_CHARS + 1];
   tmp[OLED_ROW_CHARS] = 0;
@@ -4683,14 +4799,23 @@ static void oled_connectstatus_updatefn (void)
     snprintf(tmp, OLED_ROW_CHARS, "  IP: %s", current_ipaddr);
     oled_set_row(3, tmp);
   }
+  return true;
 }
 
 #if OTA_ENABLED
 static bool ota_partition_size_okay = false;
 
-static void oled_ota_updatefn (void)
+static bool oled_ota_updatefn (void)
 {
-  if (oled_updatefn_initial_call) {
+  static bool need_redraw    = false;
+  static bool update_allowed = false;
+
+  if (modepin_longpress && update_allowed) {
+    need_redraw = true;
+    oled_set_row(3, "  Keep holding..");
+  } else if (oled_updatefn_initial_call || need_redraw) {
+    need_redraw = false;
+    update_allowed = false;
     oled_set_row(0, "OTA Firmware Update");
     oled_set_row(1, "===================");
     if (!ota_partition_size_okay) {
@@ -4699,11 +4824,13 @@ static void oled_ota_updatefn (void)
     } else if (wifi_client_mode) {  // Unfortunately, the OTA library doesn't work over Ethernet.
       oled_set_row(2, "To trigger update,");
       oled_set_row(3, "  Push/hold button");
+      update_allowed = true;
     } else {
       oled_set_row(2, "Wrong WiFi mode:");
       oled_set_row(3, "  Needs Access Point");
     }
   }
+  return true;
 }
 #endif /* OTA_ENABLED */
 
@@ -4770,11 +4897,28 @@ static void oled_send_image (byte *image, unsigned int image_size)
   }
   oled_cmd(0x20);  // Set MemoryMode to next byte:
   oled_cmd(0x02);  //  use Page addressing mode for text.
+
+  // Prevent oled_loop() from overwriting the image:
+  oled_data_updated[0] = false;
+  oled_data_updated[1] = false;
+  oled_data_updated[2] = false;
+  oled_data_updated[3] = false;
 }
 
-static void oled_QRcode_updatefn (void)
+static bool oled_QRcode_updatefn (void)
 {
-  if (oled_updatefn_initial_call) {
+  static bool need_redraw = false;
+  if (modepin_longpress) {
+    oled_set_row(0, HBG3_NAME " by Mark Lord");
+    oled_set_row(1, "");
+    oled_set_row(2, "Press and hold");
+    oled_set_row(3, "  for Factory Reset:");
+    need_redraw = true;
+  } else if (oled_updatefn_initial_call || need_redraw) {
+    if (need_redraw) {
+      need_redraw = false;
+      oled_clear(0);
+    }
     if (oled_type == &Adafruit128x64) {
       oled_send_image(QRcode_image, sizeof(QRcode_image));
     } else {
@@ -4787,12 +4931,13 @@ static void oled_QRcode_updatefn (void)
       }
     }
   }
+  return true;
 }
 
-static void oled_off_updatefn (void)
+static bool oled_off_updatefn (void)
 {
   if (oled_turned_off)
-    return;
+    return true;
   if (oled_updatefn_initial_call) {
     char tmp[OLED_ROW_CHARS+1];
     oled_set_row(0, "Display Off.");
@@ -4810,6 +4955,7 @@ static void oled_off_updatefn (void)
     oled_clear(0);
     oled.ssd1306WriteCmd(SSD1306_DISPLAYOFF);
   }
+  return true;
 }
 
 static void oled_init_modes (void)
@@ -4824,6 +4970,7 @@ static void oled_init_modes (void)
   #endif
   #if EMULATE_GPS
     oled_updatefn[mode++] = oled_gps_updatefn;
+    oled_updatefn[mode++] = oled_location_updatefn;
   #endif
   #if OTA_ENABLED
     oled_updatefn[mode++] = oled_ota_updatefn;
@@ -4854,7 +5001,6 @@ static void oled_setup ()
 
 static void oled_loop (void)
 {
-  static long modepin_longpress = 0;
   static bool modepin_nochange  = false;
   static byte oled_row_num = 0;
   if (!oled_detected)
@@ -4866,56 +5012,76 @@ static void oled_loop (void)
     oled.clear();
   }
   static long next_update = 0;
-  static byte oled_mode = 0;
   static long modepin_debounce = 0;
+  static long modepin_low;
   static int modepin = HIGH;
+
   int this_modepin = (OLED_MODE_PIN != -1) ? digitalRead(OLED_MODE_PIN) : HIGH;
   if (modepin != this_modepin) {
     modepin = this_modepin;
     modepin_debounce = get_timeout(100);
   } else if (modepin_debounce && time_after(millis(), modepin_debounce)) {
     if (modepin == LOW) {
-      if (oled_updatefn[oled_mode] == oled_QRcode_updatefn) {
-        if (!modepin_longpress) {
-          modepin_longpress = get_timeout(10 * 1000);
-        } else if (time_after(millis(), modepin_longpress)) {
-          nvram_load_defaults();
-          nvram_save();
-          delay(500);
-          ESP.restart();
-        }
+      if (!modepin_low) {
+        modepin_low = get_timeout(800);
       }
+      if (time_after(millis(), modepin_low)) {
+        if (oled_updatefn[oled_mode] == oled_QRcode_updatefn) {
+          if (!modepin_longpress) {
+            modepin_longpress = get_timeout(10 * 1000);
+          } else if (time_after(millis(), modepin_longpress)) {
+            nvram_load_defaults();
+            nvram_save();
+            delay(500);
+            ESP.restart();
+          }
+        }
 #if OTA_ENABLED
-      if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn && ota_partition_size_okay) {
-        if (!modepin_longpress) {
-          modepin_longpress = get_timeout(3000);
-        } else if (time_after(millis(), modepin_longpress)) {
-          modepin_longpress = 0;
-          ota_fetch_update();
+        if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn && ota_partition_size_okay) {
+          if (!modepin_longpress) {
+            modepin_longpress = get_timeout(3000);
+          } else if (time_after(millis(), modepin_longpress)) {
+            modepin_longpress = 0;
+            ota_fetch_update();
+          }
         }
-      }
+#endif /* OTA_ENABLED */
+#if EMULATE_GPS
+        if (oled_updatefn[oled_mode] == oled_location_updatefn) {
+          if (!modepin_longpress) {
+            modepin_longpress = get_timeout(2000);
+          } else if (time_after(millis(), modepin_longpress)) {
+            modepin_longpress = 0;
+            gps_location_selected = true;
+          }
+        }
 #endif /* OTA_ENABLED */
 #if EMULATE_DEW
-      if (dew_detected && dew_automode[0] && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
-        if (!modepin_longpress) {
-          modepin_longpress = get_timeout(1000);
-        } else if (time_after(millis(), modepin_longpress)) {
-          modepin_nochange = true;
-          modepin_longpress = get_timeout(1000);
-          if (++dew_aggression[0] > 10)
-            dew_aggression[0] = 1;
-          dew_set_aggression(0, dew_aggression[0]);
-          oled_row_num = 2;
-          next_update = millis();
-          dew_oled_set_aggr(0);
-          if (dew_debug)
-            SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
+        if (dew_detected && dew_automode[0] && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
+          if (!modepin_longpress) {
+            modepin_longpress = get_timeout(1000);
+          } else if (time_after(millis(), modepin_longpress)) {
+            modepin_longpress = get_timeout(1000);
+            if (++dew_aggression[0] > 10)
+              dew_aggression[0] = 1;
+            dew_set_aggression(0, dew_aggression[0]);
+            oled_row_num = 2;
+            next_update = millis();
+            dew_oled_set_aggr(0);
+            if (dew_debug)
+              SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
+          }
         }
-      }
 #endif /* EMULATE_DEW */
+      }
     } else { // (modepin == HIGH)
       modepin_debounce = 0;
-      modepin_longpress = 0;
+      if (modepin_longpress) {
+        modepin_longpress = 0;
+        if (modepin_low && time_after(millis(), modepin_low))
+          modepin_nochange  = true;
+      }
+      modepin_low = 0;
       if (modepin_nochange) {
         modepin_nochange = false;
       } else {
@@ -4941,12 +5107,9 @@ static void oled_loop (void)
   if (next_update && time_before(millis(), next_update))
     return;
 
-#if EMULATE_DEW
-  if (!dew_detected && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn)
-    oled_mode = (oled_mode + 1) % OLED_NMODES;
-#endif
   // Update the in-RAM copy of the display: oled_data[]:
-  oled_updatefn[oled_mode]();
+  while (false == oled_updatefn[oled_mode]())
+    oled_mode = (oled_mode + 1) % OLED_NMODES;
   oled_updatefn_initial_call = false;
 
   // Update the physical OLED display, but only one row at a time, so as not to unduly hog the CPU:
@@ -5888,8 +6051,8 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"dew1.aggression",
   (char *)"reserved13",
   (char *)"suppress.lowbattery",
-  (char *)"reserved11",
-  (char *)"reserved10",
+  (char *)"gps.location.lat",
+  (char *)"gps.location.lng",
   (char *)"reserved9",
   (char *)"reserved8",
   (char *)"reserved7",
@@ -5932,8 +6095,8 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // dew1.aggression
   ""                // reserved13
   ""                // suppress.lowbattery
-  ""                // reserved11
-  ""                // reserved10
+  ""                // gps.location.lat
+  ""                // rgps.location.lng
   ""                // reserved9
   ""                // reserved8
   ""                // reserved7
@@ -6107,6 +6270,8 @@ static void nvram_restore ()
   gps_disabled    = !!atoi(nvram_get_val("disable.gps"));
   if (gps_disabled)
     SERIAL_PRINTLN("disable.gps=1");
+  gps_saved_location_lat = atoi(nvram_get_val("gps.location.lat"));
+  gps_saved_location_lng = atoi(nvram_get_val("gps.location.lng"));
 #endif
   const char *cw = nvram_get_val("cordwrap.override");
   if (cw) {
@@ -7241,19 +7406,20 @@ void setup (void)
     pinMode(MUSB_SELECT_PIN, INPUT_PULLUP);
     delay(5);
   }
-  musb_selected = musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
 
+  hwserial0->end();
+  musb_selected = musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
   if (!musb_selected) {
     musb_uart   = NULL;
-    SerialDebug = &hwserial0;
+    SerialDebug = hwserial0;
     SerialDebug->begin(115200, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN); // The USB pins are the main debug/command port:
     SerialDebug->flush(false);
   } else {
     if (EMULATE_GPS || auxrelay_detected) {
       SerialDebug = NULL;
-      musb_uart   = &hwserial0;
+      musb_uart   = hwserial0;
     } else {
-      SerialDebug = &hwserial0;
+      SerialDebug = hwserial0;
       SerialDebug->begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
       SerialDebug->flush(false);
       musb_uart   = &hwserial1;
