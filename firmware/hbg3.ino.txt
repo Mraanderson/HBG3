@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.17"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-11-24"
+#define VERSION "v8.18"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-11-27"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,16 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.18 2023-11-27
+ *  -- Handle aborted AUX messages where 0x3b reappears within first 4-bytes.
+ *  -- Don't forward incomplete (pkt_fail) packets.
+ *  -- OTA:  Fix ota.version.path retrieval from NVRAM.
+ *  -- OTA:  Improve version checking.
+ *  -- SSAG: Fix decoding of MC replies to SSAG.
+ *  -- DEW: Be much more aggressive in "Auto" mode.DEW:
+ *  -- DEW: Make longpress on Dew-OLED cycle through manual PWM as well as Auto aggressions.
+ *  -- DEW: Save "automode" and "manual PWM" settings in NVRAM.
+ *  -- DEW: Enable use of manual PWM for channels without thermistors.
  * Version 8.17 2023-11-24
  *  -- Only do EVO WiFi commands if Evo mount detected, and retry if no ACK is received.
  * Version 8.16 2023-11-23
@@ -73,9 +83,12 @@
 #define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
 
 #define NVRAM_VALS_MAX_LEN 31
+#if OTA_ENABLED
 static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
 static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
 static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
+static bool ota_partition_size_okay = false;
+#endif /* OTA_ENABLED */
 
 // PIN definitions for this project:
 
@@ -205,6 +218,9 @@ static bool auxrelay_ssforward  = false;  // When true, AUXRELAY will forward St
 static bool suppress_lowbattery = false;  // For low-battery warnings spewed from the Evolution mount.
 static bool p3000_debug         = false;  // When true, serial debug commands/output will be redirected to the port 3000 connection.
 
+#define NVRAM_SAVE_VAL_DELAY ((long)1000)
+static long nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
+
 #if ETHERNET_ENABLED
   static char p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
   #define E3000_ENDLINE() do { e3000.write("\r\n"); e3000.flush(); } while (0)
@@ -322,6 +338,8 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_SSAG    0xb9
 #define DEV_DEWBB   0xbb
 #define DEV_LEDS    0xbf
+//                  0x3b  // No device should use this ID; fix packet_decoder() if something ever does though.
+//                  0x3c  // No device should use this ID; fix packet_decoder() if something ever does though.
 #define DEV_HBG3    0xe2
 #define DEV_DUMMY   0xe3
 #define DEV_RELAY   0xe4
@@ -455,7 +473,7 @@ struct auxdev_op_s {
 #define MC_ENABLE_CORDWRAP             0x38
 #define MC_DISABLE_CORDWRAP            0x39
 #define MC_SET_CORDWRAP_POS            0x3a
-#define MC_POLL_CORDWRAP               0x3b
+#define MC_POLL_CORDWRAP               0x3b  // Ugh. Dumb. Should never have an opcode matching the 0x3b sync byte!!
 #define MC_GET_CORDWRAP_POS            0x3c
 #define MC_SET_SHUTTER                 0x3d
 #define MC_GET_POS_BACKLASH            0x40
@@ -655,7 +673,7 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   AUX_DEV_OP(SSAG_GET_PLATE_STATUS),
   AUX_DEV_OP(SSAG_START_CALIBRATE),
   AUX_DEV_OP(SSAG_GET_CALIBRATE_STATUS),
-  AUX_DEV_OP(SSAG_06),
+  AUX_DEV_OP(SSAG_06),  // FIXME: does this really exist?
   AUX_DEV_OP(SSAG_07),
   AUX_DEV_OP(SSAG_SET_GUIDING),
   AUX_DEV_OP(SSAG_GET_GUIDING_DATA),
@@ -883,6 +901,8 @@ static const char *op_decoder (byte *data)
     case DEV_SSAA:
       return op_lookup(op, aux_ssaa_ops);
     case DEV_SSAG:
+      if (src == DEV_AZM || src == DEV_ALT)
+        return op_lookup(op, aux_mc_ops);
       return op_lookup(op, aux_ssag_ops);
   }
   for (const struct auxdev_oddball_s *d = aux_oddball_ops; d->name; ++d) {
@@ -3836,11 +3856,13 @@ static void nchuck_loop ()
 // Support up to four Dew Control "channels", by defining pairs of non-zero pin numbers here:
 static bool   dew_detected                      = false;
 static double dew_input_current_limit           = 3.000;      // amperage
-static byte   dew_automode     [DEW_NUMCHANNELS] = { 1,  1};  // Must be from GPIOs 32..39.
 static byte   dew_pwm_percent  [DEW_NUMCHANNELS] = { 0,  0};  // percent 0..100
-static byte   dew_aggression   [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 degrees (NVRAM)
+static byte   dew_aggression   [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 (NVRAM)
+static byte   dew_manual_pwm   [DEW_NUMCHANNELS] = { 0,  0};  // 0..100 (NVRAM)
 static double dew_temperature  [DEW_NUMCHANNELS] = { 0,  0};  // degrees
 static double dew_max_amperage [DEW_NUMCHANNELS] = { 0,  0};  // kept in NVRAM
+static byte   dew_aggression_to_degreesC [11] = {0, 2, 3, 4, 5, 7, 9, 10, 12, 14, 15};
+static bool   thermistor_detected [DEW_NUMCHANNELS] = {false, false};
 
 static char   dew_oled_rows[4][22] = {{0,},};
 
@@ -3880,11 +3902,14 @@ static byte double_to_2bytes (byte out[2], double val)
 
 static void dew_set_aggression (byte channel, byte aggr)
 {
-  dew_aggression[channel] = aggr;
-  dew_automode  [channel] = 1;
-  char name[] = "dew0.aggression";
-  name[3] += channel;
-  nvram_save_val(name, aggr);
+  if (aggr > 10)
+    aggr = 10;
+  if (aggr != dew_aggression[channel]) {
+    dew_aggression[channel] = aggr;
+    char name[] = "dew0.aggression";
+    name[3] += channel;
+    nvram_save_val(name, aggr);
+  }
 }
 
 static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
@@ -4001,11 +4026,11 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
       byte channel = data[5];
       reply[len++] = channel + 1;
       if (channel < DEW_NUMCHANNELS) {
-        reply[len++] = dew_automode[channel];
+        reply[len++] = (dew_aggression[channel] != 0);
         reply[len++] = dew_pwm_percent[channel] * 2.55 + 0.5;  // percent as fraction of 255
         double amps  = dew_pwm_percent[channel] * dew_max_amperage[channel] / 100;
         len += double_to_2bytes(reply + len, amps);
-        reply[len++] = dew_aggression[channel]; // aggression 1..10 degrees over dewpoint
+        reply[len++] = dew_aggression[channel]; // aggression 1..10
         len += double_to_4bytes(reply + len, dew_temperature[channel]);
       }
       if (dew_debug)
@@ -4022,9 +4047,11 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
     }
     case OP(DEW_SET_AUTO_AGGR,5): {
       byte channel = data[5];
-      byte aggr    = data[6];  // aggression 1..10: degrees over dewpoint
-      if (channel < DEW_NUMCHANNELS)
+      byte aggr    = data[6];  // aggression 1..10
+      if (channel < DEW_NUMCHANNELS && aggr >= 1 && aggr <= 10) {
         dew_set_aggression(channel, aggr);
+        oled_dew_update(channel);
+      }
       if (dew_debug)
         SERIAL_PRINTF("DEW SET_AUTO_AGGR[%u] %u\r\n", channel, aggr);
       break;
@@ -4034,8 +4061,9 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
       byte pwm     = data[6];  // percent = (pwm / 255)
       byte percent = pwm / 2.55 + 0.5;
       if (channel < DEW_NUMCHANNELS) {
-        dew_pwm_percent[channel] = percent;
-        dew_automode[channel] = 0;
+        dew_set_aggression(channel, 0);
+        dew_set_pwm_percent(channel, percent);
+        oled_dew_update(channel);
       }
       if (dew_debug)
         SERIAL_PRINTF("DEW SET_MANUAL_PWM[%u] %u (%u%%)\r\n", channel, pwm, percent);
@@ -4192,11 +4220,19 @@ static bool sht3x_fetch_measurement (void)
 #define PWM_FREQUENCY   8192  // high enough to be inaudible
 #define PWM_RESOLUTION  8      // 8-bits is enough here
 
-static void dew_pwm_set_percent (int channel, uint percent)
+static void dew_set_pwm_percent (int channel, uint percent)
 {
   dew_pwm_percent[channel] = percent;
   byte duty_cycle = percent * ((1 << PWM_RESOLUTION) - 1) / 100;
   ledcWrite(channel, duty_cycle);
+  if (dew_aggression[channel] == 0) {  // Manual mode?
+    if (percent != dew_manual_pwm[channel]) {
+      dew_manual_pwm[channel] = percent;
+      char name[] = "dew0.manual.pwm";
+      name[3] += channel;
+      nvram_save_val(name, percent);
+    }
+  }
 }
 
 static void dew_pwm_setup()
@@ -4206,7 +4242,7 @@ static void dew_pwm_setup()
       pinMode(dew_pwm_pins[channel], OUTPUT);
       ledcSetup(channel, PWM_FREQUENCY, PWM_RESOLUTION);
       ledcAttachPin(dew_pwm_pins[channel], channel);
-      dew_pwm_set_percent(channel, 0);
+      dew_set_pwm_percent(channel, 0);
     }
   }
 }
@@ -4251,23 +4287,16 @@ static double dew_pinval_to_temperature (double adc)
   return Tc;
 }
 
-static double dew_read_thermistor (byte channel, double *return_p)
+static void dew_read_thermistor (byte channel)
 {
-  static long   next_sample[DEW_NUMCHANNELS] = {0,};
-  static double sums       [DEW_NUMCHANNELS] = {0,};
-  static uint   samples    [DEW_NUMCHANNELS] = {0,};
+  static double sums    [DEW_NUMCHANNELS] = {0,};
+  static uint   samples [DEW_NUMCHANNELS] = {0,};
   double fpinval;
-  int    ThermistorPin = thermistor_pins[channel];
 
-  // Avoid reading thermistor too often: doing so causes it to heat up and mis-read.
-  if (next_sample[channel] && time_before(millis(), next_sample[channel]))
-    return false;
-  next_sample[channel] = millis() + 4000;
-
-  int pinval = analogRead(ThermistorPin);
+  int pinval = analogRead(thermistor_pins[channel]);
   if (pinval < 10 || pinval == ADCMAX) {
     if (samples[channel])
-      SERIAL_PRINTF("Th%u: Bad pinval=%d\r\n", channel, pinval);
+      SERIAL_PRINTF("Th%u: Bad reading=%d\r\n", channel, pinval);
     goto bad_reading;
   }
 #ifdef ADC_LUT_H
@@ -4280,31 +4309,16 @@ static double dew_read_thermistor (byte channel, double *return_p)
   sums[channel] += pinval;
 
   fpinval = sums[channel] / samples[channel];
-  *return_p = dew_temperature[channel] = dew_pinval_to_temperature(fpinval);
-  if (*return_p > 45.0 || *return_p < -40.0)
-    goto bad_reading;
-  return true;
+  dew_temperature[channel] = dew_pinval_to_temperature(fpinval);
+  if (dew_temperature[channel] <= 45.0 && dew_temperature[channel] >= -40.0) {
+    thermistor_detected[channel] = true;
+    return;
+  }
+  SERIAL_PRINTF("Th%u: Bad reading=%d %f\r\n", channel, pinval, dew_temperature[channel]);
 bad_reading:
-   sums[channel] = samples[channel] = 0;
-   if (OLED_ENABLED)
-     sprintf(dew_oled_rows[2 + channel], "Th%u:  not connected.", channel);
-  dew_pwm_set_percent(channel, 0);
-  return false;
-}
-
-static bool dew_read_next_channel (byte *channel_p, double *return_p)
-{
-  static byte channel = DEW_NUMCHANNELS - 1;
-  byte first_channel = channel;
-
-  do {
-    channel = (channel + 1) % DEW_NUMCHANNELS;
-    if (dew_read_thermistor(channel, return_p)) {
-      *channel_p = channel;
-      return true;
-    }
-  } while (channel != first_channel);
-  return false;
+  thermistor_detected[channel] = false;
+  sums[channel] = samples[channel] = 0;
+  dew_set_pwm_percent(channel, dew_aggression[channel] ? 0 : dew_manual_pwm[channel]);
 }
 
 static void dew_tenths (const char *prefix, double T, const char *suffix, bool pm)
@@ -4317,81 +4331,97 @@ static void dew_tenths (const char *prefix, double T, const char *suffix, bool p
   SERIAL_PRINTF(pm ? "%s%+d.%u%s" : "%s%d.%u%s", prefix, degrees, tenths, suffix);
 }
 
-static void dew_oled_set_aggr (byte channel)
+static void dew_oled_show_aggr (byte channel)
 {
-  if (OLED_ENABLED) {
-    char *out = dew_oled_rows[2 + channel] + 12;
-    byte aggr = dew_aggression[channel];
-    if (aggr > 9) {
-      *out++ = '+';
-      *out++ = '1';
-      *out++ = '0' + (aggr - 10);
-    } else {
-      *out++ = ' ';
-      *out++ = '+';
-      *out++ = '0' + aggr;
-    }
-    *out++ = 'C';
+#if OLED_ENABLED
+  char *out = dew_oled_rows[2 + channel] + 12;
+  byte aggr = dew_aggression_to_degreesC[dew_aggression[channel]];
+  if (aggr > 9) {
+    *out++ = '+';
+    *out++ = '1';
+    *out++ = '0' + (aggr - 10);
+  } else {
+    *out++ = ' ';
+    *out++ = '+';
+    *out++ = '0' + aggr;
   }
+  *out++ = 'C';
+#endif /* OLED_DETECTED */
 }
 
-static void dew_manage_next_channel (void)
+static void dew_oled_show_intensity (byte channel)
 {
-  byte channel;
-  double dewring, target, delta;
-  if (!dew_read_next_channel(&channel, &dewring))
-    return;
+#if OLED_ENABLED
+  if (dew_aggression[channel]) {
+    sprintf(dew_oled_rows[2 + channel] + 12, "+XXC %3u%%", dew_pwm_percent[channel]);
+    dew_oled_show_aggr(channel);
+  } else {
+    sprintf(dew_oled_rows[2 + channel] + 12, "Man: %3u%%", dew_pwm_percent[channel]);
+  }
+#endif /* OLED_DETECTED */
+}
+
+static void oled_dew_update (byte channel)
+{
+#if OLED_ENABLED
+  int t, degrees, tenths;
+  t       = dew_temperature[channel] * 10.0;
+  tenths  = t;
+  degrees = t / 10;
+  tenths  = abs(tenths - (degrees * 10));
+  if (thermistor_detected[channel])
+    sprintf(dew_oled_rows[2 + channel], "Ch%u: %3d.%uC ", channel, degrees, tenths);
+  else
+    sprintf(dew_oled_rows[2 + channel], "Ch%u:        ", channel);
+  dew_oled_show_intensity(channel);
+#endif /* OLED_DETECTED */
+}
+
+static void dew_manage_channel (byte channel)
+{
+  double target, delta;
   uint pwm;
-  if (!dew_automode[channel]) {
-    pwm = dew_pwm_percent[channel];
+
+  dew_read_thermistor(channel);
+  if (!dew_aggression[channel]) {
+    pwm = dew_manual_pwm[channel];
   } else {
     pwm = 0;
-    if (!sht3x_calibration_running) {
-      target = sht3x_dewpoint + dew_aggression[channel];
-      delta  = target - dewring;
-      if (delta > 0) {
-        if (delta <= 2.0)
-          pwm = delta * 45 + 5;
-        else
-          pwm = 100;
+    if (thermistor_detected[channel]) {
+      if (!sht3x_calibration_running) {
+        target = sht3x_dewpoint + dew_aggression_to_degreesC[dew_aggression[channel]];
+        delta  = target - dew_temperature[channel];
+        if (delta > 0)
+          pwm = (delta <= 1.5) ? delta * 50 + 20 : 100;
       }
     }
   }
-  dew_pwm_set_percent(channel, pwm);  // This also does: dew_pwm_percent[channel] = pwm;
+  dew_set_pwm_percent(channel, pwm);  // This also does: dew_pwm_percent[channel] = pwm;
 
   if (dew_debug) {
     char pm = (delta <= 0) ? '+' : '-';
-    SERIAL_PRINTF("Th%u: ", channel);
+    SERIAL_PRINTF("Ch%u: ", channel);
     dew_tenths("Ambient=",  sht3x_temperature, "C", false);
     dew_tenths(" RH=",      sht3x_relhumidity, "%", false);
     dew_tenths(" DewPt=",   sht3x_dewpoint,    "C", false);
     dew_tenths(" Target=",  target,            "C", false);
-    dew_tenths(" DewRing=", dewring,           "C", false);
-    dew_tenths(" delta=",  -delta,             "C", true);
-    SERIAL_PRINTF(" PWM=%s.%u%%\r\n", dew_automode[channel] ? "auto" : "manual", pwm);
+    if (thermistor_detected[channel]) {
+      dew_tenths(" Temp=",  dew_temperature[channel], "C", false);
+      dew_tenths(" delta=", -delta,            "C", true);
+    } else {
+      SERIAL_PRINTF(" Temp=??C delta=??C");
+    }
+    SERIAL_PRINTF(" PWM=%s.%u%%\r\n", dew_aggression[channel] ? "auto" : "manual", pwm);
   }
-  if (OLED_ENABLED) {
-    int t, degrees, tenths;
-    t       = dewring * 10.0;
-    tenths  = t;
-    degrees = t / 10;
-    tenths  = abs(tenths - (degrees * 10));
-    if (dew_automode[channel]) {
-      sprintf(dew_oled_rows[2 + channel], "Th%u: %3d.%uC +XXC %3u%%", channel, degrees, tenths, pwm);
-      dew_oled_set_aggr(channel);
-     } else {
-      sprintf(dew_oled_rows[2 + channel], "Th%u: %3d.%uC Man: %3u%%", channel, degrees, tenths, pwm);
-     }
-  }
+  oled_dew_update(channel);
 }
 
 static void dew_loop ()
 {
   static long nexttime = 0;
-  static byte channel  = 0;
   if (nexttime && time_before(millis(), nexttime))
     return;
-  nexttime = get_timeout(1000);
+  nexttime = get_timeout(4000);
 
   if (sht3x_calibration_running) {
     if (OLED_ENABLED) {
@@ -4435,8 +4465,9 @@ static void dew_loop ()
     tenths  = abs(tenths - (degrees * 10));
     sprintf(dew_oled_rows[1], "Air: %3d.%uC  RH: %3u%%", degrees, tenths, (int)(sht3x_relhumidity + 0.5));
   }
-next_ch:
-  dew_manage_next_channel();  // Manages a single channel per call, cycling through them over time
+  static byte channel  = DEW_NUMCHANNELS - 1;
+  channel = (channel + 1) % DEW_NUMCHANNELS;
+  dew_manage_channel(channel);  // Manages a single channel per call, cycling through them over time
 }
 
 static void dew_setup ()
@@ -4748,6 +4779,36 @@ static bool oled_dewcontrol_updatefn (void)
      oled_set_row(row, dew_oled_rows[row]);
   return true;
 }
+
+static void oled_dew_next_mode (byte channel)
+{
+  byte aggr = dew_aggression [channel];
+  byte pwm  = dew_pwm_percent[channel];
+
+  if (!thermistor_detected[channel]) {
+    if (aggr) {
+      aggr = 0;
+      pwm  = 100; // this immediately rolls around to 0 below
+    }
+  }
+  if (aggr) {
+    if (++aggr > 10) {
+      aggr = 0;
+      pwm  = 0;
+    }
+  } else {
+    pwm = pwm - (pwm % 20) + 20;
+    if (pwm > 100) {
+      pwm = 0;
+      if (thermistor_detected[channel])
+        aggr = 1;
+    }
+  }
+  nvram_save_val_delay = 2500;
+  dew_set_aggression (channel, aggr);
+  dew_set_pwm_percent(channel, pwm);
+  nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
+}
 #endif /* EMULATE_DEW */
 
 static bool oled_connectstatus_updatefn (void)
@@ -4793,8 +4854,6 @@ static bool oled_connectstatus_updatefn (void)
 }
 
 #if OTA_ENABLED
-static bool ota_partition_size_okay = false;
-
 static bool oled_ota_updatefn (void)
 {
   static bool need_redraw    = false;
@@ -5047,17 +5106,16 @@ static void oled_loop (void)
         }
 #endif /* OTA_ENABLED */
 #if EMULATE_DEW
-        if (dew_detected && dew_automode[0] && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
+        if (dew_detected && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
           if (!modepin_longpress) {
             modepin_longpress = get_timeout(1000);
           } else if (time_after(millis(), modepin_longpress)) {
             modepin_longpress = get_timeout(1000);
-            if (++dew_aggression[0] > 10)
-              dew_aggression[0] = 1;
-            dew_set_aggression(0, dew_aggression[0]);
-            oled_row_num = 2;
+            const byte channel = 0;  // Only channel-0 supported for this right now
+            oled_dew_next_mode(channel);
+            oled_row_num = 2 + channel;
             next_update = millis();
-            dew_oled_set_aggr(0);
+            dew_oled_show_intensity(channel);
             if (dew_debug)
               SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
           }
@@ -5334,6 +5392,7 @@ static byte decode_starsense (struct rxbuf_s *rxbuf, byte b)
 
 static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
 {
+restart:
   rxbuf->data[rxbuf->len++] = b;
   if (rxbuf->sscount)
     return decode_starsense(rxbuf, b);
@@ -5348,9 +5407,18 @@ static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
     }
     return packet_reset(rxbuf, pkt_fail);
   }
+#if 1  // SSAG on relay observed to send 0x3b 0x06, then repeat them with the rest of the packet..
+  if ((b == 0x3b || b == 0x3c) && rxbuf->len <= 4) {  // Okay, because no devices use 0x3b/0x3c as DEV_id
+    packet_reset(rxbuf, pkt_fail);
+    rxbuf->len = 0;
+    SERIAL_PRINTF("RS_%02x\r\n", b);
+    goto restart;
+  }
+#endif
   rxbuf->csum += b;
   if (rxbuf->len == 2) {
-    if (b < 3 || b > (sizeof(rxbuf->data) - 3)) {
+    //if (b < 3 || b > (sizeof(rxbuf->data) - 3)) {
+    if (b < 3 || b > 16) {  // Mmm.. limits 0x3b packets to 19-bytes.  Not currently an issue though.
       if (verbose) {
         auxbus_raw_break();
         SERIAL_PRINTF("%s: bad len %02x\r\n", rxbuf->name, b);
@@ -5483,6 +5551,12 @@ static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
     len++;             // make room for checksum byte
     data[1] = len - 3; // excludes 0x3b, itself, and checksum
     update_checksum(data);
+#if 0 //FIXME testing
+    if (data[2] == DEV_SSAA && data[4] == SSAA_CAPTURE_GET_STATUS) {
+      SERIAL_PRINTLN("Injecting partial packet");
+      tx_enq(NULL, rxbuf->bus, forward_yes, false, data, 2);  // Send first two bytes of "aborted packet"
+    }
+#endif
   }
   if (!rxbuf) {
     tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
@@ -5705,6 +5779,8 @@ static void forward_from_bus_to_outside (struct rxbuf_s *rxbuf, byte status, byt
   bool regular_pkt = (status == pkt_complete);
   bool from_ssaa   = (status == pkt_ssinprogress || status == pkt_sscomplete);
 
+  if (status == pkt_fail)
+    return;  // Don't forward failed packets
   if (!regular_pkt) {
     if (verbose || (from_ssaa && trace_dev == DEV_SSAA))
       print_packet(rxbuf->name, NULL, data, len);
@@ -5814,7 +5890,7 @@ static void bus_rx (struct bus_s *bus)
     if (status == pkt_inprogress) {
       if (rxbuf->len == 1 && bus->count) {
         // New 0x3b packet, so flush anything left over from before.
-        forward_from_bus_to_outside(rxbuf, pkt_fail, bus->data, bus->count);
+        //forward_from_bus_to_outside(rxbuf, pkt_fail, bus->data, bus->count);
         bus->count = 0;
         bus->delay = 0;
       }
@@ -5824,7 +5900,8 @@ static void bus_rx (struct bus_s *bus)
       rxbuf->len = 0;
       if (status == pkt_complete || status == pkt_sscomplete || bus->count >= (sizeof(bus->data) - AUXBUS_PKT_MAX)) {
         txq_set_is_alive(bus->txq, true, __func__);
-        forward_from_bus_to_outside(rxbuf, status, bus->data, bus->count);
+        if (status != pkt_fail)
+          forward_from_bus_to_outside(rxbuf, status, bus->data, bus->count);
         bus->count = 0;
         bus->delay = 0;
         return;  // Give others a chance
@@ -6015,11 +6092,6 @@ static void bus_loop (struct bus_s *bus)
   txq_free_pkt(txq, p);
 }
 
-struct nvram_variable_s {
-  char *name;
-  char value[64];
-};
-
 #define NVRAM_COUNT 40
 
 // No need to keep these in order; they now get sorted by name when displayed with "get all".
@@ -6053,8 +6125,8 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"suppress.lowbattery",
   (char *)"gps.location.lat",
   (char *)"gps.location.lng",
-  (char *)"reserved9",
-  (char *)"reserved8",
+  (char *)"dew0.manual.pwm",
+  (char *)"dew1.manual.pwm",
   (char *)"reserved7",
   (char *)"oled.type",
   (char *)"ota.version.path",
@@ -6097,8 +6169,8 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // suppress.lowbattery
   ""                // gps.location.lat
   ""                // rgps.location.lng
-  ""                // reserved9
-  ""                // reserved8
+  ""                // dew0.manual.pwm
+  ""                // dew1.manual.pwm
   ""                // reserved7
   ""                // oled.type
   ""                // ota.version.path
@@ -6159,7 +6231,7 @@ static void nvram_save_val (const char *name, int val)
     char *val_p = nvram_vals[x];
     if (atoi(val_p) != val) {
       sprintf(val_p, "%d", val);
-      nvram_delayed_save = get_timeout(500);
+      nvram_delayed_save = get_timeout(nvram_save_val_delay);
     }
   }
 }
@@ -6219,7 +6291,9 @@ static void nvram_restore ()
     if (!ret) {
       SERIAL_PRINTLN("SPIFFS.begin failed");
     } else {
+#if OTA_ENABLED
       ota_partition_size_okay = (SPIFFS.totalBytes() < 300000);
+#endif /* OTA_ENABLED */
       //SERIAL_PRINTF("SPIFFS size: %lu\r\n", SPIFFS.totalBytes());  // 113201
       File vf = SPIFFS.open(NVRAM_PATH, FILE_READ);
       if (!vf) {
@@ -6257,17 +6331,17 @@ static void nvram_restore ()
   focus_calibrated   = !!atoi(nvram_get_val("focus.calibrated"));
 #endif
 #if EMULATE_SSAA
-  emulate_ssaa    = !!atoi(nvram_get_val("emulate.ssaa"));
+  emulate_ssaa = !!atoi(nvram_get_val("emulate.ssaa"));
   if (emulate_ssaa)
     SERIAL_PRINTF("emulate.ssaa=%u\r\n", emulate_ssaa);
 #endif
 #if EMULATE_SSAG
-  emulate_ssag    = !!atoi(nvram_get_val("emulate.ssag"));
+  emulate_ssag = !!atoi(nvram_get_val("emulate.ssag"));
   if (emulate_ssag)
     SERIAL_PRINTF("emulate.ssag=%u\r\n", emulate_ssag);
 #endif
 #if EMULATE_GPS
-  gps_disabled    = !!atoi(nvram_get_val("disable.gps"));
+  gps_disabled = !!atoi(nvram_get_val("disable.gps"));
   if (gps_disabled)
     SERIAL_PRINTLN("disable.gps=1");
   gps_saved_location_lat = atoi(nvram_get_val("gps.location.lat"));
@@ -6286,14 +6360,18 @@ static void nvram_restore ()
   dew_max_amperage[0] = dew_nvram_restore_amperage(0);
   dew_max_amperage[1] = dew_nvram_restore_amperage(1);
   tmp = atoi(nvram_get_val("dew0.aggression"));
-  if (tmp) dew_aggression[0] = tmp;
+  if (tmp >= 0 && tmp <= 10) dew_aggression[0] = tmp;
   tmp = atoi(nvram_get_val("dew1.aggression"));
-  if (tmp) dew_aggression[1] = tmp;
+  if (tmp >= 0 && tmp <= 10) dew_aggression[1] = tmp;
+  tmp = atoi(nvram_get_val("dew0.manual.pwm"));
+  if (tmp >= 0 && tmp <= 100) dew_manual_pwm[0] = tmp;
+  tmp = atoi(nvram_get_val("dew1.manual.pwm"));
+  if (tmp >= 0 && tmp <= 100) dew_manual_pwm[1] = tmp;
 #endif
 #if OTA_ENABLED
   nvram_get_nonblank_val("ota.update.server", ota_update_server);
   nvram_get_nonblank_val("ota.update.path",   ota_update_path);
-  nvram_get_nonblank_val("ota.update.path",   ota_version_path);
+  nvram_get_nonblank_val("ota.version.path",  ota_version_path);
 #endif
   mount_reversed_alt = !!atoi(nvram_get_val("mount.reversed.alt"));
   // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
@@ -6535,18 +6613,19 @@ static void manage_wifi_onoff ()
 
 // **** Begin OTA Firmware Update **************************************************************************************
 
-#if OLED_ENABLED
+#if OTA_ENABLED
 #include <ArduinoOTA.h>
 #include <Update.h>
 
 #define otaclient w2000   // Re-use w2000 for this (saves memory)
 
+#if OLED_ENABLED
 static void oled_refresh_all (void)
 {
-    oled_write_row(0);
-    oled_write_row(1);
-    oled_write_row(2);
-    oled_write_row(3);
+  oled_write_row(0);
+  oled_write_row(1);
+  oled_write_row(2);
+  oled_write_row(3);
 }
 
 static void oled_show_progress (byte percent, size_t progress, size_t total)
@@ -6565,7 +6644,6 @@ static void oled_show_progress (byte percent, size_t progress, size_t total)
 }
 #endif /* OLED_ENABLED */
 
-#if OTA_ENABLED
 static void ota_show_progress (size_t progress, size_t total)
 {
   static byte old_percent;
@@ -6640,38 +6718,19 @@ static void ota_wait_for_data (long timeout)
   }
 }
 
-#define OTA_SIMPLE_FETCH_VERSION false
-
-static void ota_fetch_version (char *version, int maxlen, long timeout, const char *server, const char *path)
-{
-  if (OTA_SIMPLE_FETCH_VERSION) {
-    otaclient.stop();
-    SERIAL_PRINTF("Connecting to http://%s%s%s\r\n", server, (path[0] == '/') ? "" : "/", path);
-    ota_clength = 0;
-    if (!otaclient.connect(server, 80, timeout))
-      ota_exit("Connection failed");
-    otaclient.printf( "GET %s\r\n\r\n", path);
-    ota_wait_for_data(timeout);
-    String line = otaclient.readStringUntil('\n');
-    line.trim();
-    SERIAL_PRINTF("server: %s\r\n", line.c_str());
-    const char *v = line.c_str();
-    strncpy(version, v, maxlen);
-  }
-}
-
-static void ota_fetch_file (long timeout, const char *server, const char *path)
+static void ota_fetch_file (long timeout, const char *server, const char *part1, const char *part2)
 {
   otaclient.stop();
-  SERIAL_PRINTF("Connecting to http://%s%s%s\r\n", server, (path[0] == '/') ? "" : "/", path);
+  const char *qmark = part2[0] ? "?" : "";
+  SERIAL_PRINTF("Connecting to http://%s%s%s%s%s\r\n", server, (part1[0] == '/') ? "" : "/", part1, qmark, part2);
   ota_clength = 0;
   if (!otaclient.connect(server, 80, timeout))
     ota_exit("Connection failed");
-  otaclient.printf( "GET %s HTTP/1.1\r\n"
+  otaclient.printf( "GET %s%s%s HTTP/1.1\r\n"
                     "Host: %s\r\n"
                     "Cache-Control: no-cache\r\n"
                     "Connection: close\r\n\r\n",
-                     path,
+                     part1, qmark, part2,
                      server );
   while (1) {
     ota_wait_for_data(timeout);
@@ -6695,35 +6754,33 @@ static void ota_fetch_update (void)
   char version[20] = {0,};
 
   ota_show_progress(0, 0);  // Initialize the display
-  if (OTA_SIMPLE_FETCH_VERSION) {
-    ota_fetch_version(version, sizeof(version) - 1, timeout, ota_update_server, ota_version_path);
-  } else {
-    ota_fetch_file(timeout, ota_update_server, ota_version_path);
-    // Note: server seems to respond with a bytecount line as well as the actual data..
-    while (1) {
-      ota_wait_for_data(timeout);
-      String line = otaclient.readStringUntil('\n');
-      const char *data = line.c_str();
-      SERIAL_PRINTF("server: %s\r\n", data);
-      if (data[0] == 'v') {
-        strncpy(version, data, sizeof(version) - 1);
-        break;
-      }
+  ota_fetch_file(timeout, ota_update_server, ota_version_path, ota_update_path);
+  // Note: server seems to respond with a bytecount line as well as the actual data..
+  while (1) {
+    ota_wait_for_data(timeout);
+    String line = otaclient.readStringUntil('\n');
+    const char *data = line.c_str();
+    SERIAL_PRINTF("server: %s\r\n", data);
+    if (data[0] == 'v') {
+      strncpy(version, data, sizeof(version) - 1);
+      break;
     }
   }
   SERIAL_PRINTF("OTA: running=" VERSION " " VERSION_DATE ", available=%s\r\n", version);
   if (0 == strcmp(version, VERSION " " VERSION_DATE))
     ota_exit("Already Up-to-date");
+#if OLED_ENABLED
   char tmp[OLED_ROW_CHARS + 1];
   char *space = index(version, ' ');
   if (space)
     *space = '\0';  // Strip date from version for display purposes
   sprintf(tmp, "Updating to %s", version);
   oled_set_row(0, tmp);
+#endif /* OLED_ENABLED */
 
   // Now do the actual firmware download/update:
   timeout = get_timeout(15 * 1000);
-  ota_fetch_file(timeout, ota_update_server, ota_update_path);
+  ota_fetch_file(timeout, ota_update_server, ota_update_path, "");
   const char *msg;
   if (ota_clength <= 0)
     msg = "No data from server";
