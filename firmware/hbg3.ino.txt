@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.18"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-11-27"
+#define VERSION "v8.19"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-11-29"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,13 +37,18 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.19 2023-11-29
+ *  -- OLED: Revamp longpresses (major update).
+ *  -- Fix minor bug in new Evo WiFi logic.
+ *  -- New 'a' command for toggling whether w2000/bt/musb packets are shown when tracing.
+ *  -- By default, show only AUX/Relay packets when tracing.
  * Version 8.18 2023-11-27
  *  -- Handle aborted AUX messages where 0x3b reappears within first 4-bytes.
  *  -- Don't forward incomplete (pkt_fail) packets.
  *  -- OTA:  Fix ota.version.path retrieval from NVRAM.
  *  -- OTA:  Improve version checking.
  *  -- SSAG: Fix decoding of MC replies to SSAG.
- *  -- DEW: Be much more aggressive in "Auto" mode.DEW:
+ *  -- DEW: Be much more aggressive in "Auto" mode.
  *  -- DEW: Make longpress on Dew-OLED cycle through manual PWM as well as Auto aggressions.
  *  -- DEW: Save "automode" and "manual PWM" settings in NVRAM.
  *  -- DEW: Enable use of manual PWM for channels without thermistors.
@@ -204,6 +209,7 @@ static bool mount_reversed_alt  = false; // Use "set mount.reversed.alt Yes" for
 static bool auxbus_passive_mode = false;
 static byte auxtest_remaining   = 3;
 static bool verbose             = false;
+static bool aux_only_tracing    = true;   // By default, don't show packets coming/in out on w2000, bt, or musb.
 static bool aux_ascii_passthru  = false;
 static bool auxbus_raw_tracing  = false;
 static byte auxbus_raw_count    = 0;
@@ -876,7 +882,6 @@ static const char *op_decoder (byte *data)
       if (op == MC_SET_CORDWRAP_POS) {
         SERIAL_PRINT(" MC_SET_CORDWRAP_POS ");
         print_24bits(data + 5);
-        SERIAL_ENDLINE();
         return NULL;
       }
     }
@@ -1189,6 +1194,10 @@ static void print_packet (const char *prefix1, const char *prefix2, byte *data, 
 {
   const char *opname = NULL;
 
+  if (aux_only_tracing) {
+    if (0 == strncmp(prefix1, "w2000_", 6) || 0 == strncmp(prefix1, "musb_", 5) || 0 == strncmp(prefix1, "bt_", 3))
+      return;
+  }
   if (prefix2 == TIMED_OUT) {
     opname  = TIMED_OUT;
     prefix2 = NULL;
@@ -4295,7 +4304,7 @@ static void dew_read_thermistor (byte channel)
 
   int pinval = analogRead(thermistor_pins[channel]);
   if (pinval < 10 || pinval == ADCMAX) {
-    if (samples[channel])
+    if (dew_debug && samples[channel])
       SERIAL_PRINTF("Th%u: Bad reading=%d\r\n", channel, pinval);
     goto bad_reading;
   }
@@ -4314,7 +4323,8 @@ static void dew_read_thermistor (byte channel)
     thermistor_detected[channel] = true;
     return;
   }
-  SERIAL_PRINTF("Th%u: Bad reading=%d %f\r\n", channel, pinval, dew_temperature[channel]);
+  if (dew_debug)
+    SERIAL_PRINTF("Th%u: Bad reading=%d %f\r\n", channel, pinval, dew_temperature[channel]);
 bad_reading:
   thermistor_detected[channel] = false;
   sums[channel] = samples[channel] = 0;
@@ -4548,14 +4558,15 @@ static  SSD1306AsciiWire  oled;
 #define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
 #define OLED_NMODES       (((byte)EMULATE_DEW) + (2*(byte)EMULATE_GPS) + ((byte)ETHERNET_ENABLED) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
 
-static bool (*oled_updatefn[OLED_NMODES])(void);
-static char oled_data[4][OLED_ROW_CHARS + 1] = {{0,},};   // Four rows of OLED data
+static bool (*oled_updatefn[OLED_NMODES])(byte);  // oled_arg_t
+typedef enum {oled_firstcall, oled_normal, oled_longpress, oled_timeout} oled_arg_t;
+
+static char oled_data[4][OLED_ROW_CHARS + 1];   // Four rows of OLED data
 static bool oled_data_updated[4] = {false,false,false,false};
 static bool oled_turned_off      = false;
 static long oled_offtime         = 0;
 static long oled_splash_timer    = 0;
-static bool oled_updatefn_initial_call = true;
-static long modepin_longpress    = 0;
+static long oled_timer           = 0;  // for longpress timings in various updatefn()'s
 static byte oled_mode            = 0;
 
 static const uint8_t HomeBrew5x14_font[] = {  // two groups of 5-bytes-across for each character. Each byte is vertical pixels.
@@ -4647,9 +4658,14 @@ static void oled_clear (byte from_row)
   }
 }
 
+static void oled_force_clear (void)
+{
+  memset(oled_data, ' ', sizeof(oled_data));
+  oled_clear(0);
+}
+
 #if EMULATE_GPS
 static long oled_gps_timer = 0;
-static bool gps_location_selected;
 
 static void oled_manage_gps_sleep (void)
 {
@@ -4665,59 +4681,49 @@ static void oled_manage_gps_sleep (void)
   }
 }
 
-static bool oled_location_updatefn (void)
+static bool oled_location_updatefn (byte arg)  // oled_arg_t
 {
-  static bool saving;
-  static long done = 0;
+  static bool got_action, saving;
+  static long done;
+
   if (!gps_detected)
     return false;  // skip this screen
   oled_manage_gps_sleep();
-  if (oled_updatefn_initial_call) {
+  if (arg == oled_firstcall) {
     saving = gps_has_fix;
     if (!saving && !gps_has_saved_location())
       return false;  // skip this screen
-    gps_location_selected = false;
+    got_action = false;
     done = 0;
+    oled_set_row(0, saving ? "Save GPS Location?" : "Restore GPS Location?");
   }
-  if (saving) {
-    oled_set_row(0, "Save GPS Location?");
-    oled_clear(1);
-    if (gps_location_selected) {
-      if (!done) {
-        done = get_timeout(1500);
-        gps_save_location();
-      }
+  if (arg == oled_longpress && !oled_timer)
+    oled_timer = get_timeout(1200);
+  else if (arg == oled_timeout)
+    got_action = true;
+  oled_set_row(1, "==================");
+
+  if (!got_action) {
+    oled_set_row(2, "Press and hold");
+    oled_set_row(3, saving ? "  to Save:" : "  to Restore:");
+  } else if (!done) {
+    oled_clear(3);
+    done = get_timeout(1500);
+    if (saving) {
       oled_set_row(2, "SAVED.");
+      gps_save_location();
     } else {
-      oled_set_row(2, "Press and hold");
-      oled_set_row(3, "  to Save:");
-    }
-  } else {
-    oled_set_row(0, "Restore GPS Location?");
-    oled_clear(1);
-    if (gps_location_selected) {
-      if (!done) {
-        done = get_timeout(1500);
-        gps_restore_location();
-      }
       oled_set_row(2, "RESTORED.");
-    } else {
-      oled_set_row(2, "Press and hold");
-      oled_set_row(3, "  to Restore:");
+      gps_restore_location();
     }
-  }
-  if (done) {
-    if (modepin_longpress) {
-      done = get_timeout(1500);
-    } else if (time_after(millis(), done)) {
-      oled_mode -= 2;  // go back to main GPS status display
-      return false;
-    }
+  } else if (time_after(millis(), done)) {
+    oled_mode -= 2;  // go back to main GPS status display
+    return false;
   }
   return true;
 }
 
-static bool oled_gps_updatefn (void)
+static bool oled_gps_updatefn (byte arg)  // oled_arg_t
 {
   if (!gps_detected) {
     oled_set_row(0, "GPS not detected.");
@@ -4771,11 +4777,24 @@ static bool oled_gps_updatefn (void)
 #endif
 
 #if EMULATE_DEW
-static bool oled_dewcontrol_updatefn (void)
+static bool oled_dewcontrol_updatefn (byte arg)  // oled_arg_t
 {
   if (!dew_detected)
     return false;  // skip this screen
-  for (byte row = 0; row < 4; ++row)
+  if (arg == oled_longpress && !oled_timer) {
+    oled_timer = get_timeout(200);
+    oled_set_row(3, "Ch0: Cycling values..");
+  } else if (arg == oled_timeout) {
+    oled_timer = get_timeout(1000);
+    const byte channel = 0;  // Only channel-0 supported for this right now
+    oled_dew_next_mode(channel);
+    dew_oled_show_intensity(channel);
+    if (dew_debug)
+      SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
+  } else if (arg == oled_normal || arg == oled_firstcall) {
+    oled_set_row(3, dew_oled_rows[3]);
+  }
+  for (byte row = 0; row < 3; ++row)
      oled_set_row(row, dew_oled_rows[row]);
   return true;
 }
@@ -4785,11 +4804,9 @@ static void oled_dew_next_mode (byte channel)
   byte aggr = dew_aggression [channel];
   byte pwm  = dew_pwm_percent[channel];
 
-  if (!thermistor_detected[channel]) {
-    if (aggr) {
-      aggr = 0;
-      pwm  = 100; // this immediately rolls around to 0 below
-    }
+  if (aggr && !thermistor_detected[channel]) {
+    aggr = 0;
+    pwm  = 100; // this immediately rolls around to 0 below
   }
   if (aggr) {
     if (++aggr > 10) {
@@ -4811,7 +4828,7 @@ static void oled_dew_next_mode (byte channel)
 }
 #endif /* EMULATE_DEW */
 
-static bool oled_connectstatus_updatefn (void)
+static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
 {
   char tmp[OLED_ROW_CHARS + 1];
   tmp[OLED_ROW_CHARS] = 0;
@@ -4854,31 +4871,33 @@ static bool oled_connectstatus_updatefn (void)
 }
 
 #if OTA_ENABLED
-static bool oled_ota_updatefn (void)
+static bool oled_ota_updatefn (byte arg)  // oled_arg_t
 {
-  static bool need_redraw    = false;
-  static bool update_allowed = false;
+  static bool fwupdate_possible = false;
 
-  if (modepin_longpress && update_allowed) {
-    need_redraw = true;
-    oled_set_row(3, "  Keep holding..");
-  } else if (oled_updatefn_initial_call || need_redraw) {
-    need_redraw = false;
-    update_allowed = false;
+  if (arg == oled_firstcall) {
+    fwupdate_possible = false;
     oled_set_row(0, "OTA Firmware Update");
     oled_set_row(1, "===================");
     if (!ota_partition_size_okay) {
       oled_set_row(2, "Wrong Partition Size");
       oled_clear(3);
-    } else if (wifi_client_mode) {  // Unfortunately, the OTA library doesn't work over Ethernet.
-      oled_set_row(2, "To trigger update,");
-      oled_set_row(3, "  Push/hold button");
-      update_allowed = true;
-    } else {
+    } else if (!wifi_client_mode) {  // Unfortunately, the OTA library doesn't work over Ethernet.
       oled_set_row(2, "Wrong WiFi mode:");
       oled_set_row(3, "  Needs Access Point");
+    } else {
+      oled_set_row(3, " to trigger update.");
+      fwupdate_possible = true;
     }
+  } else if (arg == oled_longpress && !oled_timer && fwupdate_possible) {
+    oled_timer = get_timeout(3000);
+  } else if (arg == oled_timeout) {
+    ota_fetch_update();
   }
+  if (oled_timer)
+    oled_set_row(2, "Keep holding");
+  else if (fwupdate_possible)
+    oled_set_row(2, "Push/hold button");
   return true;
 }
 #endif /* OTA_ENABLED */
@@ -4918,7 +4937,7 @@ static byte QRcode_image[] = {
   0xce,0xce,0xfe,0xfe,0xcf,0xcf,0xff,0xff,0xff,0xff,0xff,0xf0,0xf0,0xf0,0xf0,0xf0,0xcf,0xcf,0xc0,0xc0,0xc0,0xcf,0xcf,0xc0,0xc0,0xce,0xce,0xce,0xcf,0xcf,0xff,0xff
 };
 
-static void oled_cmd(uint8_t command)
+static void oled_cmd (uint8_t command)
 {
   Wire.beginTransmission(OLED_I2C_ADDRESS);
   Wire.write(0x00);        // Select "Command" mode
@@ -4928,14 +4947,15 @@ static void oled_cmd(uint8_t command)
 
 static void oled_send_image (byte *image, unsigned int image_size)
 {
-  oled_cmd(0x20);  // Set MemoryMode to next byte:
-  oled_cmd(0x00);  //  use Horizontal addressing mode for image.
-  oled_cmd(0x21);  // Set Column Address Low/High:
-  oled_cmd(0x00);  //  Low:    0
-  oled_cmd(0x7F);  //  High: 127
-  oled_cmd(0x22);  // Set Page (row) Address Low/High:
-  oled_cmd(0x00);  //  Low:    0
-  oled_cmd(0x07);  //  High:   7
+  oled_force_clear(); // so that next use after this works
+  oled_cmd(0x20);     // Set MemoryMode to next byte:
+  oled_cmd(0x00);     //  use Horizontal addressing mode for image.
+  oled_cmd(0x21);     // Set Column Address Low/High:
+  oled_cmd(0x00);     //  Low:    0
+  oled_cmd(0x7F);     //  High: 127
+  oled_cmd(0x22);     // Set Page (row) Address Low/High:
+  oled_cmd(0x00);     //  Low:    0
+  oled_cmd(0x07);     //  High:   7
   const byte burst_size = 32;
   for (byte burst = 0; burst < (image_size / burst_size); burst++) {
     Wire.beginTransmission(OLED_I2C_ADDRESS);
@@ -4945,7 +4965,7 @@ static void oled_send_image (byte *image, unsigned int image_size)
     Wire.endTransmission();
   }
   oled_cmd(0x20);  // Set MemoryMode to next byte:
-  oled_cmd(0x02);  //  use Page addressing mode for text.
+  oled_cmd(0x02);  //   use Page addressing mode for text.
 
   // Prevent oled_loop() from overwriting the image:
   oled_data_updated[0] = false;
@@ -4954,24 +4974,28 @@ static void oled_send_image (byte *image, unsigned int image_size)
   oled_data_updated[3] = false;
 }
 
-static bool oled_QRcode_updatefn (void)
+static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
 {
   static bool need_redraw = false;
-  if (modepin_longpress) {
-    oled_set_row(0, HBG3_NAME " by Mark Lord");
-    oled_set_row(1, "");
-    oled_set_row(2, "Press and hold");
-    oled_set_row(3, "  for Factory Reset:");
-    need_redraw = true;
-  } else if (oled_updatefn_initial_call || need_redraw) {
-    if (need_redraw) {
-      need_redraw = false;
-      oled_clear(0);
+  if (arg == oled_longpress) {
+    if (!oled_timer) {
+      oled_timer = get_timeout(10 * 1000);
+      oled_set_row(0, HBG3_NAME " by Mark Lord");
+      oled_set_row(1, "====================");
+      oled_set_row(2, "Keep holding");
+      oled_set_row(3, "  for Factory Reset.");
     }
+    need_redraw = true;
+  } else if (arg == oled_timeout) {
+    nvram_load_defaults();
+    nvram_save();
+    delay(500);
+    ESP.restart();
+  } else if (arg == oled_firstcall || need_redraw) {
+    need_redraw = false;
     if (oled_type == &Adafruit128x64) {
       oled_send_image(QRcode_image, sizeof(QRcode_image));
     } else {
-      oled_clear(0);
       oled_set_row(1, HBG3_NAME " by Mark Lord");
       oled_set_row(2, "https://rtr.ca/hbg3/");
       if (oled_splash_timer) {
@@ -4983,11 +5007,11 @@ static bool oled_QRcode_updatefn (void)
   return true;
 }
 
-static bool oled_off_updatefn (void)
+static bool oled_off_updatefn (byte arg)  // oled_arg_t
 {
   if (oled_turned_off)
     return true;
-  if (oled_updatefn_initial_call) {
+  if (arg == oled_firstcall) {
     char tmp[OLED_ROW_CHARS+1];
     oled_set_row(0, "Display Off.");
     sprintf(tmp, HBG3_NAME "%s %s", auxrelay_detected ? "-Relay" : "", hbg3_version);
@@ -5030,7 +5054,7 @@ static void oled_init_modes (void)
 
 static void oled_setup ()
 {
-  oled_clear(0);
+  oled_force_clear();
   oled_init_modes();
   Wire.beginTransmission(OLED_I2C_ADDRESS);
   oled_detected = (Wire.endTransmission() == 0);
@@ -5043,15 +5067,18 @@ static void oled_setup ()
 
     // Show splash screen briefly at start-up:
     oled_splash_timer = get_timeout(1300);
-    oled_QRcode_updatefn();
-    oled_updatefn_initial_call = true;
+    oled_QRcode_updatefn(oled_firstcall);
   }
 }
 
 static void oled_loop (void)
 {
-  static bool modepin_nochange  = false;
+  static oled_arg_t arg = oled_firstcall;
+  static bool modepin_nochange = false;
   static byte oled_row_num = 0;
+  static long modepin_low, modepin_debounce = 0, next_update = 0;
+  static int modepin = HIGH;
+
   if (!oled_detected)
     return;
   if (oled_splash_timer) {
@@ -5060,10 +5087,6 @@ static void oled_loop (void)
     oled_splash_timer = 0;
     oled.clear();
   }
-  static long next_update = 0;
-  static long modepin_debounce = 0;
-  static long modepin_low;
-  static int modepin = HIGH;
 
   int this_modepin = (OLED_MODE_PIN != -1) ? digitalRead(OLED_MODE_PIN) : HIGH;
   if (modepin != this_modepin) {
@@ -5073,71 +5096,30 @@ static void oled_loop (void)
     if (modepin == LOW) {
       if (!modepin_low) {
         modepin_low = get_timeout(800);
-      }
-      if (time_after(millis(), modepin_low)) {
-        if (oled_updatefn[oled_mode] == oled_QRcode_updatefn) {
-          if (!modepin_longpress) {
-            modepin_longpress = get_timeout(10 * 1000);
-          } else if (time_after(millis(), modepin_longpress)) {
-            nvram_load_defaults();
-            nvram_save();
-            delay(500);
-            ESP.restart();
-          }
-        }
-#if OTA_ENABLED
-        if (wifi_client_mode && oled_updatefn[oled_mode] == oled_ota_updatefn && ota_partition_size_okay) {
-          if (!modepin_longpress) {
-            modepin_longpress = get_timeout(3000);
-          } else if (time_after(millis(), modepin_longpress)) {
-            modepin_longpress = 0;
-            ota_fetch_update();
-          }
-        }
-#endif /* OTA_ENABLED */
-#if EMULATE_GPS
-        if (oled_updatefn[oled_mode] == oled_location_updatefn) {
-          if (!modepin_longpress) {
-            modepin_longpress = get_timeout(2000);
-          } else if (time_after(millis(), modepin_longpress)) {
-            modepin_longpress = 0;
-            gps_location_selected = true;
-          }
-        }
-#endif /* OTA_ENABLED */
-#if EMULATE_DEW
-        if (dew_detected && oled_updatefn[oled_mode] == oled_dewcontrol_updatefn) {
-          if (!modepin_longpress) {
-            modepin_longpress = get_timeout(1000);
-          } else if (time_after(millis(), modepin_longpress)) {
-            modepin_longpress = get_timeout(1000);
-            const byte channel = 0;  // Only channel-0 supported for this right now
-            oled_dew_next_mode(channel);
-            oled_row_num = 2 + channel;
-            next_update = millis();
-            dew_oled_show_intensity(channel);
-            if (dew_debug)
-              SERIAL_PRINTF("dew_aggression[0]=%u\r\n", dew_aggression[0]);
-          }
-        }
-#endif /* EMULATE_DEW */
+      } else if (time_after(millis(), modepin_low)) {
+        if (oled_timer && time_after(millis(), oled_timer))
+          arg = oled_timeout;
+        //if (arg != oled_longpress)
+        else
+          arg = oled_longpress;
       }
     } else { // (modepin == HIGH)
       modepin_debounce = 0;
-      if (modepin_longpress) {
-        modepin_longpress = 0;
-        if (modepin_low && time_after(millis(), modepin_low))
-          modepin_nochange  = true;
+      if (arg == oled_longpress || arg == oled_timeout) {
+        arg = oled_normal;
+        oled_timer = 0;
+        modepin_nochange = true;
       }
       modepin_low = 0;
       if (modepin_nochange) {
         modepin_nochange = false;
       } else {
-        oled_updatefn_initial_call = true;
+        arg          = oled_firstcall;
         oled_mode    = (oled_mode + 1) % OLED_NMODES;
         next_update  = 0;
         oled_row_num = 0;
         oled_offtime = 0;
+        oled_timer   = 0;
 #if EMULATE_GPS
         oled_gps_timer = 0;
         if (gps_prevent_sleep) {
@@ -5156,9 +5138,10 @@ static void oled_loop (void)
     return;
 
   // Update the in-RAM copy of the display: oled_data[]:
-  while (false == oled_updatefn[oled_mode]())
+  while (!oled_updatefn[oled_mode](arg))
     oled_mode = (oled_mode + 1) % OLED_NMODES;
-  oled_updatefn_initial_call = false;
+  if (arg == oled_firstcall)
+    arg = oled_normal;
 
   // Update the physical OLED display, but only one row at a time, so as not to unduly hog the CPU:
   byte first_row = oled_row_num;
@@ -6558,6 +6541,7 @@ static long evo_wifi_attempts = 0;
 
 static void send_evo_wifi_onoff ()
 {
+  evo_wifi_change_pending = 0;
   if (evo_wifi_attempts == 0)
     return;
   evo_wifi_attempts--;
@@ -6585,7 +6569,6 @@ static void manage_evo_wifi (bool want_off)
       send_evo_wifi_onoff();
     }
   } else if (evo_wifi_change_pending && time_after(millis(), evo_wifi_change_pending)) {
-    evo_wifi_change_pending = 0;
     send_evo_wifi_onoff();
   }
 }
@@ -6797,6 +6780,7 @@ static void ota_fetch_update (void)
 static const char help_serial_commands[] =
   ";                 -- Comment, ignore/print this line\r\n"
   "#                 -- Comment, ignore/print this line\r\n"
+  "a                 -- Toggle AUX-bus only mode for traces\r\n"
   "cls               -- Clear screen\r\n"
   "devs              -- List devnames usable with t1/t2 commands\r\n"
 #if EMULATE_DEW
@@ -6874,6 +6858,9 @@ static bool handle_serial_commands (char *cmd)
     }
   } else if (cmd[1] != 0) {
     return false;
+  } else if (b == 'a') {
+    aux_only_tracing = !aux_only_tracing;
+    SERIAL_PRINTF("aux_only_tracing=%u\r\n", aux_only_tracing);
 #if EMULATE_DEW
   } else if (b == 'd') {
     dew_debug = !dew_debug;
