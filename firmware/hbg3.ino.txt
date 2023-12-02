@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.19"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-11-29"
+#define VERSION "v8.20"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-01"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,12 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.20 2023-12-01
+ *  -- Light up BLUE LED while calibrating a newly plugged-in Nunchuck after boot.
+ *  -- New NVRAM variable for "focus.limits"
+ *  -- New OLED interface for FOCUS status and setting of FOCUS limits.
+ *  -- Don't show GPS on OLED unless detected.
+ *  -- Fix factory reset function: wasn't working after v8.19.
  * Version 8.19 2023-11-29
  *  -- OLED: Revamp longpresses (major update).
  *  -- Fix minor bug in new Evo WiFi logic.
@@ -225,6 +231,7 @@ static bool suppress_lowbattery = false;  // For low-battery warnings spewed fro
 static bool p3000_debug         = false;  // When true, serial debug commands/output will be redirected to the port 3000 connection.
 
 #define NVRAM_SAVE_VAL_DELAY ((long)1000)
+static long nvram_delayed_save   = 0;
 static long nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
 
 #if ETHERNET_ENABLED
@@ -265,7 +272,6 @@ static bool emulate_ssag        = false;
 #define AUXBUS_PKT_MAX            16  // Max length of a regular 0x3b style auxbus packet.
 #define AUXBUS_SSAA_PKT_MAX       848 // Theoretically up to 2470 bytes.  In practice, nothing is ever larger than about 832 bytes.
 
-static long auxtest_led_timer   = 0;
 static long auxtest_timer       = 0;
 
 static WiFiClient w2000;             // The wifi application port 2000, for controlling the mount
@@ -310,6 +316,17 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
 } while (0)
 
 #define Serial      Serial_UNDEFINED  // Prevent using "Serial" by accident
+
+static long blue_led_timer = 0;
+
+static inline void set_blue_led (int on_off)
+{
+  blue_led_timer = 0;
+  digitalWrite(BLUE_LED_PIN, on_off);
+#ifdef AIO_H
+  aio_set_leds(on_off);
+#endif /* AIO_H */
+}
 
 static void set_wifi_info (const char *ssid, IPAddress ip)
 {
@@ -680,6 +697,8 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   AUX_DEV_OP(SSAG_START_CALIBRATE),
   AUX_DEV_OP(SSAG_GET_CALIBRATE_STATUS),
   AUX_DEV_OP(SSAG_06),  // FIXME: does this really exist?
+                        // auxbus_rx: 3b 0d 0d b9 06 40 09 49 2d 3f c4 7c 2e 3e 1f 5e    [HC5    -> SSAG  ]
+                        // auxbus_rx: 3b 0b b9 0d 06 40 11 d2 9e 3f c6 3f e0 44          [SSAG   -> HC5   ]
   AUX_DEV_OP(SSAG_07),
   AUX_DEV_OP(SSAG_SET_GUIDING),
   AUX_DEV_OP(SSAG_GET_GUIDING_DATA),
@@ -2741,30 +2760,31 @@ static bool fram_read (uint16_t addr, void *datap, uint16_t len)
 /************************** Begin Stepper motor emulation of Celestron Focus Motor *************************/
 #if EMULATE_FOCUS
 
-#define FOCUS_ZERO_POS             30000ul // "zero position" for positive-only values; use  +/- around zero
-#define FOCUS_ONE_ROTATION         (200 * stepper_microsteps)
+#define FOCUS_ZERO_POS                 30000ul  // "zero position" for positive-only values; use  +/- around zero
+#define FOCUS_ONE_ROTATION             (200 * stepper_microsteps)
 
-// For mount safety, when "calibrated", limit travel to 9 full rotations
-#define FOCUS_MAX_TRAVEL           (focus_calibrated ? 9 * FOCUS_ONE_ROTATION : FOCUS_ZERO_POS)
+#define FOCUS_MAX_TRAVEL               (FOCUS_ZERO_POS)
 
-#define FOCUS_LIMIT_MIN            ((FOCUS_ZERO_POS) - (FOCUS_MAX_TRAVEL))
-#define FOCUS_LIMIT_MAX            ((FOCUS_ZERO_POS) + (FOCUS_MAX_TRAVEL))
+#define FOCUS_LIMIT_MIN                ((ulong)((FOCUS_ZERO_POS) - (FOCUS_MAX_TRAVEL)))
+#define FOCUS_LIMIT_MAX                ((ulong)((FOCUS_ZERO_POS) + (FOCUS_MAX_TRAVEL)))
 
-#define FOCUS_TO_STEPPER_POS(pos)  (((long)(pos)) - (FOCUS_ZERO_POS))
-#define STEPPER_TO_FOCUS_POS(pos)  (((long)(pos)) + (FOCUS_ZERO_POS))
+#define FOCUS_TO_STEPPER_POS(pos)      (((long)(pos)) - (FOCUS_ZERO_POS))
+#define STEPPER_TO_FOCUS_POS(pos)      (((long)(pos)) + (FOCUS_ZERO_POS))
 
-static bool focus_debug               = false;
-static bool focus_calibrated          = false;  // saved in NVRAM
-static long focus_calibration_running = 0;
-static byte focus_backlash_pos        = 0;      // saved in NVRAM
-static byte focus_backlash_neg        = 0;      // saved in NVRAM
-static long focus_backlash_timeout    = 0;      // Used by backlash compensation logic
-static byte focus_prev_move_dev       = 0;      // Used by backlash compensation logic
-static byte focus_prev_move_op        = 0;      // Used by backlash compensation logic
-static int  focus_speed               = 0;      // Used by backlash compensation logic
-static long focus_target_pos          = FOCUS_ZERO_POS;
-static bool stepper_is_stopping       = false;
-static uint stepper_microsteps        = 0;  // Configurable using MS1/MS2/MS2 pins on STEP/DIR motor drivers
+static bool focus_calibrated           = false;  // saved in NVRAM
+static ulong focus_limit_min           = FOCUS_LIMIT_MIN;  // saved in NVRAM
+static ulong focus_limit_max           = FOCUS_LIMIT_MAX;  // saved in NVRAM
+static bool  focus_debug               = false;
+static long  focus_calibration_running = 0;
+static byte  focus_backlash_pos        = 0;      // saved in NVRAM
+static byte  focus_backlash_neg        = 0;      // saved in NVRAM
+static long  focus_backlash_timeout    = 0;      // Used by backlash compensation logic
+static byte  focus_prev_move_dev       = 0;      // Used by backlash compensation logic
+static byte  focus_prev_move_op        = 0;      // Used by backlash compensation logic
+static int   focus_speed               = 0;      // Used by backlash compensation logic
+static long  focus_target_pos          = FOCUS_ZERO_POS;
+static bool  stepper_is_stopping       = false;
+static uint  stepper_microsteps        = 0;      // Configurable using MS1/MS2/MS2 pins on STEP/DIR motor drivers
 
 #define STEPPER_DRIVER_NONE       0
 #define STEPPER_DRIVER_STEPDIR    1
@@ -3014,11 +3034,13 @@ static ulong focus_restore_pos (void)
 
 static inline void focus_save_pos (ulong pos)
 {
-  static ulong saved_pos = ~0ul;
-  if (pos == saved_pos)
-    return;
-  saved_pos = pos;
-  fram_write(FRAM_STEPPER_POS, &saved_pos, sizeof(saved_pos));
+  if (fram_detected) {
+    static ulong saved_pos = ~0ul;
+    if (pos != saved_pos) {
+      saved_pos = pos;
+      fram_write(FRAM_STEPPER_POS, &saved_pos, sizeof(saved_pos));
+    }
+  }
 }
 
 static inline ulong focus_currentPosition (void)
@@ -3058,16 +3080,15 @@ static inline void stepper_loop (void)
     if (uln2003_enabled)
       uln2003->run();
   }
-  if (fram_detected)
-    focus_currentPosition();  // update fram
+  focus_currentPosition();  // update position
 }
 
 static inline long focus_apply_limits (ulong pos)
 {
-  if (pos > FOCUS_LIMIT_MAX)
-    pos = FOCUS_LIMIT_MAX;
-  else if (pos < FOCUS_LIMIT_MIN)
-    pos = FOCUS_LIMIT_MIN;
+  if (pos > focus_limit_max)
+    pos = focus_limit_max;
+  else if (pos < focus_limit_min)
+    pos = focus_limit_min;
   return pos;
 }
 
@@ -3077,7 +3098,7 @@ static void focus_move (byte src, byte op, byte speed_0_to_9)
   if (focus_debug)
     SERIAL_PRINTF("FOCUS MOVE_%s: s=%d speed=%d pos=%ld\r\n", (op == MC_MOVE_NEG) ? "NEG" : "POS", speed_0_to_9, speed, focus_currentPosition());
   if (speed)
-    stepper_moveTo((op == MC_MOVE_NEG) ? FOCUS_TO_STEPPER_POS(FOCUS_LIMIT_MIN) : FOCUS_TO_STEPPER_POS(FOCUS_LIMIT_MAX));
+    stepper_moveTo((op == MC_MOVE_NEG) ? FOCUS_TO_STEPPER_POS(focus_limit_min) : FOCUS_TO_STEPPER_POS(focus_limit_max));
 }
 
 static inline bool focus_begin_backlash_compensation (byte op, uint amount)
@@ -3098,8 +3119,7 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
   switch (OP(op,data[1]))
   {
     case OP(MC_GET_POS,3): {
-      ulong p;
-      p = focus_currentPosition();
+      ulong p = focus_currentPosition();
       if (focus_debug && src == DEV_SW) {
         static ulong last_pos = -1;
         if (p != last_pos) {  // Prevent SkyPortal FLOODING us with these
@@ -3160,8 +3180,8 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(MC_GET_LIMITS,3): {   // two 4-byte positions (low, high) or zeros
-      len += long_to_4bytes(reply + len, focus_calibrated ? FOCUS_LIMIT_MIN : 0);
-      len += long_to_4bytes(reply + len, focus_calibrated ? FOCUS_LIMIT_MAX : 0);
+      len += long_to_4bytes(reply + len, focus_calibrated ? focus_limit_min : 0);
+      len += long_to_4bytes(reply + len, focus_calibrated ? focus_limit_max : 0);
       if (focus_debug)
         SERIAL_PRINTLN("FOCUS GET_LIMITS");
       break;
@@ -3233,6 +3253,30 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
   }
   emulate_send_reply(rxbuf, reply, len);
   return false;
+}
+
+static void focus_set_save_limits (bool force, ulong min, ulong max)
+{
+  char tbuf[16], *flimits = (char *)nvram_get_val("focus.limits");
+  tbuf[0] = '\0';
+  if (min < FOCUS_LIMIT_MIN || min >= max || max > FOCUS_LIMIT_MAX) {
+    if (force) {
+      *flimits = '\0';
+      nvram_delayed_save = get_timeout(nvram_save_val_delay);
+      focus_calibrated = 0;
+      nvram_save_val("focus.calibrated", focus_calibrated);
+    }
+  } else {
+    focus_limit_min = min;
+    focus_limit_max = max;
+    sprintf(tbuf, "%lu %lu", min, max);
+    if (strcmp(tbuf, flimits)) {
+      strcpy(flimits, tbuf);
+      nvram_delayed_save = get_timeout(nvram_save_val_delay);
+    }
+    focus_calibrated = 1;
+    nvram_save_val("focus.calibrated", focus_calibrated);
+  }
 }
 
 /************************** End   Stepper motor emulation of Celestron Focus Motor *************************/
@@ -3519,6 +3563,7 @@ static bool nchuck_c_button() {return (     (nchuck_buffer[5] >> 1) & 0x01) == 0
 static bool nchuck_detected = false;
 static int  nchuck_oldx = 0, nchuck_oldy = 0;
 static byte nchuck_measuring_middle, nchuck_x_mhi, nchuck_x_mlo, nchuck_y_mhi, nchuck_y_mlo;
+static bool nchuck_blink_led = false;
 
 #define NCHUCK_POLL_INTERVAL   25 /* milli-seconds */
 #define NCHUCK_MIDDLE_SAMPLES  (750 / NCHUCK_POLL_INTERVAL)
@@ -3535,6 +3580,10 @@ static void nchuck_request_data()
   // Stop movements when Nunchuck is unplugged mid-operation:
   if (!nchuck_detected) {
     SERIAL_PRINTLN("Nunchuck unplugged");
+    if (nchuck_blink_led) {
+      nchuck_blink_led = false;
+      set_blue_led(LED_OFF);
+    }
     if (nchuck_oldx) {
       nchuck_oldx = 0;
       nchuck_send_mc_cmd(0, DEV_AZM, 0);
@@ -3644,7 +3693,7 @@ static void nchuck_set_ranges (char axis, byte *ranges, byte *cdata, byte mhi, b
        max, mhi, mlo, min, ranges[0], ranges[1], ranges[2], ranges[3], ranges[4], ranges[5], ranges[6], ranges[7], ranges[8], ranges[9]);
 }
 
-static bool nchuck_detect ()
+static bool nchuck_detect (bool blink_led)
 {
   static long next_poll = 0;
   if (nchuck_detected || (next_poll && time_before(millis(), next_poll)))
@@ -3680,7 +3729,12 @@ static bool nchuck_detect ()
       return nchuck_detected;
     }
   }
-  SERIAL_PRINTLN("Nunchuck detected");
+  // Newly plugged-in Nunchuck: turn on BLUE LED while calibrating, except during boot.
+  SERIAL_PRINTLN("nchuck detected");
+  if (blink_led) {
+    nchuck_blink_led = blink_led;
+    set_blue_led(LED_ON);
+  }
   // Fetch calibration data from the Nunchuck
   Wire.beginTransmission(NCHUCK_DEVICE_ID);
   Wire.write(0x20);
@@ -3749,6 +3803,10 @@ static bool nchuck_measure_middle (byte newx, byte newy)
 #endif
   nchuck_set_ranges('X', nchuck_xranges, nchuck_cdata +  8, nchuck_x_mhi, nchuck_x_mlo);
   nchuck_set_ranges('Y', nchuck_yranges, nchuck_cdata + 11, nchuck_y_mhi, nchuck_y_mlo);
+  if (nchuck_blink_led) {
+    nchuck_blink_led = false;
+    set_blue_led(LED_OFF);
+  }
   return false;
 }
 
@@ -3757,7 +3815,7 @@ static void nchuck_loop ()
   if (nchuck_focus_only)
     fm_delayed_query_slew_done();
   static int xp, yp, devx = 0, devy = 0;
-  if (!nchuck_detect() || !nchuck_get_data())
+  if (!nchuck_detect(true) || !nchuck_get_data())
     return;
   int newx, x = nchuck_x_thumb();
   int newy, y = nchuck_y_thumb();
@@ -4556,7 +4614,7 @@ static void oled_get_type (void)
 static  SSD1306AsciiWire  oled;
 
 #define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
-#define OLED_NMODES       (((byte)EMULATE_DEW) + (2*(byte)EMULATE_GPS) + ((byte)ETHERNET_ENABLED) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
+#define OLED_NMODES       (((byte)EMULATE_DEW) + (2*(byte)EMULATE_GPS) + (byte)EMULATE_FOCUS + ((byte)ETHERNET_ENABLED) + 4)  // Network, OTA, QRcode, and blank/off are the other modes
 
 static bool (*oled_updatefn[OLED_NMODES])(byte);  // oled_arg_t
 typedef enum {oled_firstcall, oled_normal, oled_longpress, oled_timeout} oled_arg_t;
@@ -4681,10 +4739,97 @@ static void oled_manage_gps_sleep (void)
   }
 }
 
+#if EMULATE_FOCUS
+static bool focus_updatefn (byte arg)  // oled_arg_t
+{
+  static byte which_screen;
+  static bool got_action, draw_screen;
+  static ulong p, min = ~0ul, max = ~0ul;
+  static long final_delay, next_poll = 0;
+  char tmp[OLED_ROW_CHARS + 1];
+
+  if (stepper_driver == STEPPER_DRIVER_NONE)
+    return false;  // skip this screen
+  if (arg == oled_firstcall) {
+    next_poll = 0;
+    got_action = false;
+    which_screen = 0;
+    final_delay = 0;
+    draw_screen = true;
+  } else if (next_poll && time_before(millis(), next_poll)) {
+    return true;
+  }
+
+  p = focus_currentPosition();
+  next_poll = get_timeout(500);  // Updating OLED REALLY interferes with the stepper motor!
+  snprintf(tmp, OLED_ROW_CHARS, "    Pos: %5lu", p);
+  oled_set_row(2, tmp);
+  if (which_screen == 0) {
+    if (draw_screen) {
+      draw_screen = false;
+      oled_set_row(0, "Focus Motor:");
+      oled_set_row(3, "Press/Hold for Limits");
+      min = focus_limit_min;
+      max = focus_limit_max;
+      snprintf(tmp, OLED_ROW_CHARS, "Min/Max: %-5lu %-5lu", min, max);
+      oled_set_row(1, tmp);
+    }
+    if (arg == oled_normal) {
+      if (got_action) {
+        got_action = false;
+        which_screen = 1;
+        draw_screen = true;
+        next_poll = 0;
+      }
+    } else if (arg == oled_longpress && !oled_timer) {
+      oled_timer = get_timeout(700);
+    } else if (arg == oled_timeout) {
+      got_action = true;
+      oled_set_row(3, "Okay. Let Go Now.");
+    }
+    return true;
+  }
+  if (draw_screen) {
+    draw_screen = false;
+    if (which_screen == 1) {
+      focus_limit_min = FOCUS_LIMIT_MIN;
+      oled_set_row(0, "Focus Min-Limit:  ");
+      oled_set_row(1, "Move motor to Min:");
+    } else {
+      focus_limit_max = FOCUS_LIMIT_MAX;
+      oled_set_row(0, "Focus Max-Limit:  ");
+      oled_set_row(1, "Move motor to Max:");
+    }
+    oled_set_row(3, "Push/hold to Set.");
+  }
+  if (arg == oled_normal) {
+    if (got_action) {
+      got_action = false;
+      draw_screen = true;
+      next_poll = 0;
+      if (which_screen++ == 2) {
+        focus_set_save_limits(false, min, max);
+        which_screen = 0;
+      }
+    }
+  } else if (arg == oled_longpress && !oled_timer) {
+    oled_timer = get_timeout(1000);
+  } else if (arg == oled_timeout) {
+    got_action = true;
+    if (which_screen == 1)
+      min = p;
+    else
+      max = p;
+    oled_set_row(3, "Okay. Let Go Now.");
+  }
+  return true;
+}
+#endif /* EMULATE_FOCUS */
+
 static bool oled_location_updatefn (byte arg)  // oled_arg_t
 {
   static bool got_action, saving;
-  static long done;
+  static long final_delay;
 
   if (!gps_detected)
     return false;  // skip this screen
@@ -4694,7 +4839,7 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
     if (!saving && !gps_has_saved_location())
       return false;  // skip this screen
     got_action = false;
-    done = 0;
+    final_delay = 0;
     oled_set_row(0, saving ? "Save GPS Location?" : "Restore GPS Location?");
   }
   if (arg == oled_longpress && !oled_timer)
@@ -4706,9 +4851,9 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
   if (!got_action) {
     oled_set_row(2, "Press and hold");
     oled_set_row(3, saving ? "  to Save:" : "  to Restore:");
-  } else if (!done) {
+  } else if (!final_delay) {
     oled_clear(3);
-    done = get_timeout(1500);
+    final_delay = get_timeout(1500);
     if (saving) {
       oled_set_row(2, "SAVED.");
       gps_save_location();
@@ -4716,7 +4861,7 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
       oled_set_row(2, "RESTORED.");
       gps_restore_location();
     }
-  } else if (time_after(millis(), done)) {
+  } else if (time_after(millis(), final_delay)) {
     oled_mode -= 2;  // go back to main GPS status display
     return false;
   }
@@ -4725,11 +4870,8 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
 
 static bool oled_gps_updatefn (byte arg)  // oled_arg_t
 {
-  if (!gps_detected) {
-    oled_set_row(0, "GPS not detected.");
-    oled_clear(1);
-    return true;
-  }
+  if (!gps_detected)
+      return false;
   oled_manage_gps_sleep();
   char tmp[OLED_ROW_CHARS + 1];
   tmp[OLED_ROW_CHARS] = 0;
@@ -4895,7 +5037,7 @@ static bool oled_ota_updatefn (byte arg)  // oled_arg_t
     ota_fetch_update();
   }
   if (oled_timer)
-    oled_set_row(2, "Keep holding");
+    oled_set_row(2, "Hold for 3 seconds");
   else if (fwupdate_possible)
     oled_set_row(2, "Push/hold button");
   return true;
@@ -4977,22 +5119,35 @@ static void oled_send_image (byte *image, unsigned int image_size)
 static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
 {
   static bool need_redraw = false;
-  if (arg == oled_longpress) {
+  static long doing_reset = 0;
+
+  if (arg == oled_firstcall) {
+    need_redraw = true;
+  } else if (doing_reset) {
+    if (time_after(millis(), doing_reset))
+      ESP.restart();
+  } else if (arg == oled_longpress) {
     if (!oled_timer) {
       oled_timer = get_timeout(10 * 1000);
       oled_set_row(0, HBG3_NAME " by Mark Lord");
       oled_set_row(1, "====================");
-      oled_set_row(2, "Keep holding");
+      oled_set_row(2, "Hold for 10 seconds");
       oled_set_row(3, "  for Factory Reset.");
     }
-    need_redraw = true;
+    need_redraw = true; // In case button is not held long enough to begin the reset
+    return true;
   } else if (arg == oled_timeout) {
+    doing_reset = get_timeout(2000);
+    SERIAL_PRINTLN("Factory Reset");
+    oled_set_row(2, "");
+    oled_set_row(3, "Doing FACTORY RESET");
     nvram_load_defaults();
     nvram_save();
-    delay(500);
-    ESP.restart();
-  } else if (arg == oled_firstcall || need_redraw) {
     need_redraw = false;
+  }
+  if (need_redraw) {
+    need_redraw = false;
+    doing_reset = 0;
     if (oled_type == &Adafruit128x64) {
       oled_send_image(QRcode_image, sizeof(QRcode_image));
     } else {
@@ -5044,6 +5199,9 @@ static void oled_init_modes (void)
   #if EMULATE_GPS
     oled_updatefn[mode++] = oled_gps_updatefn;
     oled_updatefn[mode++] = oled_location_updatefn;
+  #endif
+  #if EMULATE_FOCUS
+    oled_updatefn[mode++] = focus_updatefn;
   #endif
   #if OTA_ENABLED
     oled_updatefn[mode++] = oled_ota_updatefn;
@@ -5169,14 +5327,6 @@ static inline byte packet_reset (struct rxbuf_s *rxbuf, byte ret)
   return ret;
 }
 
-static inline void set_blue_led (int on_off)
-{
-  digitalWrite(BLUE_LED_PIN, on_off);
-#ifdef AIO_H
-  aio_set_leds(on_off);
-#endif /* AIO_H */
-}
-
 static void auxtest_received_msg (struct bus_s *bus, byte *data)
 {
   if (bus != &auxbus)
@@ -5187,7 +5337,7 @@ static void auxtest_received_msg (struct bus_s *bus, byte *data)
   if (auxtest_remaining > 0) {
     auxtest_remaining--;
     set_blue_led(LED_ON);
-    auxtest_led_timer = get_timeout(500);
+    blue_led_timer = get_timeout(500);
   }
 }
 
@@ -5534,12 +5684,6 @@ static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
     len++;             // make room for checksum byte
     data[1] = len - 3; // excludes 0x3b, itself, and checksum
     update_checksum(data);
-#if 0 //FIXME testing
-    if (data[2] == DEV_SSAA && data[4] == SSAA_CAPTURE_GET_STATUS) {
-      SERIAL_PRINTLN("Injecting partial packet");
-      tx_enq(NULL, rxbuf->bus, forward_yes, false, data, 2);  // Send first two bytes of "aborted packet"
-    }
-#endif
   }
   if (!rxbuf) {
     tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
@@ -6104,7 +6248,7 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"cordwrap.override",
   (char *)"dew0.aggression",
   (char *)"dew1.aggression",
-  (char *)"reserved13",
+  (char *)"focus.limits",
   (char *)"suppress.lowbattery",
   (char *)"gps.location.lat",
   (char *)"gps.location.lng",
@@ -6148,7 +6292,7 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // cordwrap.override
   ""                // dew0.aggression
   ""                // dew1.aggression
-  ""                // reserved13
+  ""                // focus.limits
   ""                // suppress.lowbattery
   ""                // gps.location.lat
   ""                // rgps.location.lng
@@ -6191,8 +6335,6 @@ static void nvram_get_nonblank_val (const char *name, char *dst)
     strcpy(dst, tmp);
 }
 
-static long nvram_delayed_save = 0;
-
 static void nvram_clear_reserved_slots (void)
 {
   // Ensure "reservedNN" slots are empty, keeping them clean for future (re-)uses.
@@ -6201,7 +6343,7 @@ static void nvram_clear_reserved_slots (void)
       if (nvram_vals[v][0]) {
         SERIAL_PRINTF("nvram: clearing %s: %s\r\n", nvram_vars[v], nvram_vals[v]);
         nvram_vals[v][0] = 0;
-        nvram_delayed_save = get_timeout(200);
+        nvram_delayed_save = get_timeout(nvram_save_val_delay);
       }
     }
   }
@@ -6312,7 +6454,11 @@ static void nvram_restore ()
   focus_backlash_pos =   atoi(nvram_get_val("focus.backlash.pos"));
   focus_backlash_neg =   atoi(nvram_get_val("focus.backlash.neg"));
   focus_calibrated   = !!atoi(nvram_get_val("focus.calibrated"));
-#endif
+  char *flimits = (char *)nvram_get_val("focus.limits");
+  ulong min = ~0ul, max=~0ul;
+  sscanf(flimits, "%lu %lu", &min, &max);
+  focus_set_save_limits(true, min, max);
+#endif /* EMULATE_FOCUS */
 #if EMULATE_SSAA
   emulate_ssaa = !!atoi(nvram_get_val("emulate.ssaa"));
   if (emulate_ssaa)
@@ -7367,10 +7513,7 @@ static void w2000_loop()
 
 static void auxtest_loop ()
 {
-  if (auxtest_led_timer && time_after(millis(), auxtest_led_timer)) {
-    auxtest_led_timer = 0;
-    set_blue_led(LED_OFF);
-  } else if (!auxtest_timer) {
+  if (!auxtest_timer) {
     if (auxtest_remaining > 0) {
       if (millis() > 15000)
         auxtest_remaining = 0;
@@ -7395,6 +7538,8 @@ static void non_wifi_loop (void)
 {
   if (nvram_delayed_save && time_after(millis(), nvram_delayed_save))
     nvram_save();
+  if (blue_led_timer && time_after(millis(), blue_led_timer))
+    set_blue_led(LED_OFF); // Also clears the timer
   if (SerialDebug)
     serial_loop();
   auxtest_loop();
@@ -7510,7 +7655,7 @@ void setup (void)
   SERIAL_PRINTF("OLED %sdetected\r\n", oled_detected ? "" : "not ");
 
 #if NCHUCK_ENABLED
-  nchuck_detect();  // Do this part earlier than the rest so user can touch thumbstick sooner
+  nchuck_detect(false);  // Do this part earlier than the rest so user can touch thumbstick sooner
 #endif
 #if EMULATE_DEW
   dew_setup();
