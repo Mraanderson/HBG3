@@ -9,7 +9,7 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.20"               /* MUST begin with 'v' */
+#define VERSION "v8.21"               /* MUST begin with 'v' */
 #define VERSION_DATE "2023-12-01"
 /*
  * Arduino IDE configuration for this project:
@@ -37,9 +37,15 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.21 2023-12-01
+ *  -- Change "Not Connected" to "No Session"
+ *  -- Change "W2 Connected" to "WiFi Connected"
+ *  -- Change "W3 Connected" to "WiF3 Connected"
+ *  -- Change "E2 Connected" to "Eth Connected"
+ *  -- Change "E3 Connected" to "Eth3 Connected"
  * Version 8.20 2023-12-01
  *  -- Light up BLUE LED while calibrating a newly plugged-in Nunchuck after boot.
- *  -- New NVRAM variable for "focus.limits"
+ *  -- New NVRAM variable for "focus.limits".
  *  -- New OLED interface for FOCUS status and setting of FOCUS limits.
  *  -- Don't show GPS on OLED unless detected.
  *  -- Fix factory reset function: wasn't working after v8.19.
@@ -4977,8 +4983,8 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
   const char *connection = get_connection_type();
   if (musb_switch_timer)
     snprintf(tmp, OLED_ROW_CHARS, "%-5s Reset Pending..", hbg3_version);
-  else if (connection[0] == 'N' && musb_selected)
-    snprintf(tmp, OLED_ROW_CHARS, "%-5s MUSB Selected",   hbg3_version);
+  else if (connection[0] == 'N')
+    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s", hbg3_version, musb_selected ? "MUSB Selected" : "No Session");
   else
     snprintf(tmp, OLED_ROW_CHARS, "%-5s %s Connected",    hbg3_version, connection);
   oled_set_row(0, tmp);
@@ -7185,13 +7191,13 @@ static const char *get_connection_type (void)
   const char *connection;
        if (bt_connected)      connection = "BT";
   else if (musb_connected)    connection = "USB";
-  else if (w2000.connected()) connection = "W2";
+  else if (w2000.connected()) connection = "WiFi";
 #if ETHERNET_ENABLED
-  else if (e2000.connected()) connection = "E2";
+  else if (e2000.connected()) connection = "Eth";
 #endif
-  else if (w3000.connected()) connection = "W3";
+  else if (w3000.connected()) connection = "WiF3";
 #if ETHERNET_ENABLED
-  else if (w3000.connected()) connection = "E3";
+  else if (w3000.connected()) connection = "Eth3";
 #endif
   else                        connection = "Not";
   return connection;
@@ -7232,8 +7238,8 @@ static void status_command (void (*writep)(const char *))
   sprintf(tmp, "%s %s, ", HBG3_NAME, hbg3_version);
   if (musb_switch_timer) {
     strcat(tmp, "Reset Pending");
-  } else if (connection[0] == 'N' && musb_selected) {
-    strcat(tmp, "MUSB Selected");
+  } else if (connection[0] == 'N') {
+    strcat(tmp, musb_selected ? "MUSB Selected" : "No Session");
   } else {
     strcat(tmp, connection);
     strcat(tmp, "-Connected");
