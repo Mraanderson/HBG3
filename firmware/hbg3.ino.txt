@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.21"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-01"
+#define VERSION "v8.22"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-02"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,12 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.22 2023-12-02
+ *  -- AIO: Show Ethernet status on OLED connection status screen when WiFi is Off.
+ *  -- AIO: Fix errors with p3000_debug_ethernet.
+ *  -- AIO: Fix hangs when switching ethernet client/server modes.
+ *  -- Ensure only char* is used with SERIAL_PRINTLN(), not Strings or QStrings.
+ *  -- Implement Push-to-Reset on OLED connection status screen.
  * Version 8.21 2023-12-01
  *  -- Change "Not Connected" to "No Session"
  *  -- Change "W2 Connected" to "WiFi Connected"
@@ -83,6 +89,11 @@
  *  -- Turn OLED on before aio_setup(), for much earlier feedback after power-on.
  *  -- Show BT AUX/USB mode on OLED.
  *  -- Fix bugs and clean-up Bluetooth state management.
+ *
+ * Random note:
+ *   For Camera shutter release triggering via RTS:
+ *   The RTS pin of the CP2102 USB-Serial chip (on the ESP32 * module) is wired through
+ *     a resistor and transistor, eventually connecting to * GPIO0 on the WROOM-32 module.
  */
 #define WIFIRELAY_ENABLED         true  // When false, code for wifi_relay_mode is omitted.
 #define BLOCK_CFM_CONNECTIONS     true  // Set to false to allow CFM to attempt to interogate/update firmware (VERY RISKY!!). DO NOT DO THIS!!
@@ -307,7 +318,7 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
 } while (0)
 
 #define SERIAL_PRINTLN(x) do {                                                                             \
-  if (p3000_debug) {if (p3000_debug_ethernet) w3000.write(x); else e3000.write(x); SERIAL_ENDLINE();} else \
+  if (p3000_debug) {if (p3000_debug_ethernet) e3000.write(x); else w3000.write(x); SERIAL_ENDLINE();} else \
   if (SerialDebug) {SerialDebug->println(x); SERIAL_FLUSH(true);}                                          \
 } while (0)
 
@@ -317,7 +328,7 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
 } while (0)
 
 #define SERIAL_PRINT(x) do {                                                             \
-  if (p3000_debug) {if (p3000_debug_ethernet) w3000.write(x); else e3000.write(x);} else \
+  if (p3000_debug) {if (p3000_debug_ethernet) e3000.write(x); else w3000.write(x);} else \
   if (SerialDebug) {SerialDebug->print(x);}                                              \
 } while (0)
 
@@ -5003,7 +5014,14 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
     oled_set_row(3, tmp);
   } else if (esp32_wifi_off) {
     oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : "WiFi is off");
+#if ETHERNET_ENABLED
+    snprintf(tmp, OLED_ROW_CHARS,   "Eth DHCP %s", ethernet_client_mode ? "Client" : "Server");
+    oled_set_row(2, tmp);
+    snprintf(tmp, OLED_ROW_CHARS,   "Eth %s", Ethernet.localIP().toString().c_str());
+    oled_set_row(3, tmp);
+#else
     oled_clear(2);
+#endif /* ETHERNET_ENABLED */
   } else {
     const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
     if (WIFIRELAY_ENABLED && wifi_relay_mode)
@@ -5014,6 +5032,13 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
     oled_set_row(2, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "  IP: %s", current_ipaddr);
     oled_set_row(3, tmp);
+  }
+  if (arg == oled_longpress) {
+    oled_set_row(0, "Hold 5 secs to RESET");
+    if (!oled_timer)
+      oled_timer = get_timeout(5000);
+  } else if (arg == oled_timeout) {
+    ESP.restart();
   }
   return true;
 }
@@ -6630,7 +6655,7 @@ static bool wifi_begin_client_mode()
     }
   }
   SERIAL_PRINTF("\r\nWiFi connected to %s, IP address: ", ssid);
-  SERIAL_PRINTLN(WiFi.localIP());
+  SERIAL_PRINTLN(WiFi.localIP().toString().c_str());
 #if OLED_ENABLED
   set_wifi_info(ssid, WiFi.localIP());
 #endif
@@ -6809,7 +6834,7 @@ static bool firmware_update_from_stream (uint32_t clength)
     ulong wrote = Update.writeStream(otaclient);
     SERIAL_ENDLINE();
     if (wrote != clength) {  // Update.writeStream() does the download/update
-      SERIAL_PRINTF("Write failed! %lu/%lu %s\r\n", wrote, clength, Update.errorString());
+      SERIAL_PRINTF("Write failed! %lu/%lu %s\r\n", wrote, clength, Update.errorString());  // errorString() returns char*
       Update.abort();
       return false;
     }
@@ -6823,7 +6848,7 @@ static bool firmware_update_from_stream (uint32_t clength)
         SERIAL_PRINTLN("Update not finished!");
       }
     } else {
-      SERIAL_PRINTF("Error Occurred. Error %s\r\n", Update.errorString());
+      SERIAL_PRINTF("Error Occurred. Error %s\r\n", Update.errorString());  // errorString() returns char*
     }
   }
   return false;
