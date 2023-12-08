@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.22"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-02"
+#define VERSION "v8.23"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-07"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,14 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.23 2023-12-07
+ *  -- GPS: New NVRAM variable gps.force.saved.location to always use saved lat/lng when no better fix available.
+ *  -- GPS: Keep recent GPS Location data when sleeping the GPS, for replay on wake-up (still requires time/date fix).
+ *  -- GPS: Increase gps_idle_timeout from 10 minutes to 20 minutes, and allow nvram override.
+ *  -- GPS: Rename "disable.gps" to "gps.disable" for better consistency.
+ *  -- OLED: Show "HBG3 Idle" instead of "No Session".
+ *  -- OLED: Show "BT Session" instead of "BT Connected" when link is up but no activity.
+ *  -- OLED: On OLED, show ':' after lat/lng for real Location, '?' for saved Location, and '-' for recent Location.
  * Version 8.22 2023-12-02
  *  -- AIO: Show Ethernet status on OLED connection status screen when WiFi is Off.
  *  -- AIO: Fix errors with p3000_debug_ethernet.
@@ -210,6 +218,7 @@ static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUX
 BluetoothSerial        bt;
 static char            bt_id[32];
 static long            bt_connected = 0;
+static long            bt_active = 0;
 
 /*
  * There is no serial "debug" port if (musb_selected && relay_detected).
@@ -1797,7 +1806,6 @@ bool GPSPlus::endOfTermHandler()
           location.commit();
         break;
     }
-    //if (GPS_debug && sentenceHasFix) SERIAL_PRINTF("GPS: %u hasFix: D%u T%u L%u\r\n", curSentenceType, date.is_valid(), time.is_valid(), location.is_valid());
     return true;
   }
 
@@ -2059,12 +2067,14 @@ static void GPS_UART_SET_BAUD (ulong baud)
 static const double GPS_MULT_FACTOR = 46603.37778;  // = 2^24 / 360
 
 static bool gps_is_on         = false;
+static bool gps_has_date_time = false;
 static bool gps_has_fix       = false;
 static bool gps_prevent_sleep = false;  // true when oled_gps_updatefn() is active
 static long gps_sleep_timeout = 0;
 static long gps_started       = 0;      // used to derive Time-To-Fix (TTF)
 
-#define GPS_IDLE_TIMEOUT      (10 * 60)  // power-down GPS after idle for this long
+#define GPS_IDLE_TIMEOUT      (20 * 60)  // power-down GPS after idle for this long
+static ulong gps_idle_timeout = GPS_IDLE_TIMEOUT;
 
 static void gps_start_timeout (uint secs)
 {
@@ -2113,30 +2123,67 @@ void gps_turn_on (bool force, bool quietly)
   gps.invalidate();           // Tell GPS it has no valid data
 }
 
-static bool gps_fix_is_valid()
+static bool    gps_has_recent_location = false;
+static double  gps_recent_lat = 0;
+static double  gps_recent_lng = 0;
+static int32_t gps_saved_lat  = 0;
+static int32_t gps_saved_lng  = 0;
+static bool    gps_use_saved_location   = false;
+static bool    gps_force_saved_location = false;
+
+static inline bool gps_has_saved_location (void) { return gps_saved_lat && gps_saved_lng; }
+
+enum                                 {no_fix,   true_fix,   recent_fix,   saved_fix};
+static const char *gps_fix_type[] = {"no_fix", "true_fix", "recent_fix", "saved_fix"};
+
+static inline byte gps_get_fix_type (void)  // for oled_location_updatefn()
 {
-  if (!gps_is_on)
-    return false;
-  return gps.date.is_valid() && gps.time.is_valid() && gps.location.is_valid();
+  if (gps_has_fix)
+    return true_fix;
+  if (gps_has_date_time) {
+    if (gps_has_recent_location)
+      return recent_fix;
+    if (gps_has_saved_location() && (gps_use_saved_location || gps_force_saved_location))
+      return saved_fix;
+  }
+  return no_fix;
 }
 
-static int32_t gps_saved_location_lat = 0;
-static int32_t gps_saved_location_lng = 0;
-static bool    gps_use_saved_location = false;
-
-static inline bool gps_has_saved_location (void) { return gps_saved_location_lat && gps_saved_location_lng; }
+static inline byte gps_get_lat_lng (int32_t *lat, int32_t *lng)
+{
+  if (gps_has_fix) {
+    *lat = (int32_t)(gps.location.lat() * GPS_MULT_FACTOR);
+    *lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
+    return true_fix;
+  }
+  if (gps_has_date_time) {
+    if (gps_has_recent_location) {
+      *lat = gps_recent_lat * GPS_MULT_FACTOR;
+      *lng = gps_recent_lng * GPS_MULT_FACTOR;
+      return recent_fix;
+    }
+    if (gps_has_saved_location() && (gps_use_saved_location || gps_force_saved_location)) {
+      *lat = gps_saved_lat;
+      *lng = gps_saved_lng;
+      return saved_fix;
+    }
+  }
+  return no_fix;
+}
 
 static void gps_save_location (void)
 {
-  if (gps_has_fix) {
-    gps_saved_location_lat = (int32_t)(gps.location.lat() * GPS_MULT_FACTOR);
-    gps_saved_location_lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
+  int32_t lat, lng;
+  byte fix_type = gps_get_lat_lng(&lat, &lng);
+  if (fix_type == true_fix || recent_fix) {
+    gps_saved_lat = lat;
+    gps_saved_lng = lng;
   } else {
-    gps_saved_location_lat = 0;
-    gps_saved_location_lng = 0;
+    gps_saved_lat = 0;
+    gps_saved_lng = 0;
   }
-  nvram_save_val("gps.location.lat", gps_saved_location_lat);
-  nvram_save_val("gps.location.lng", gps_saved_location_lng);
+  nvram_save_val("gps.location.lat", gps_saved_lat);
+  nvram_save_val("gps.location.lng", gps_saved_lng);
   gps_use_saved_location = false;
 }
 
@@ -2147,27 +2194,28 @@ static void gps_restore_location (void)
 
 static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
+  int32_t lat, lng;
   byte reply[AUXBUS_PKT_MAX], len, op = data[4];
 
   len = emulate_begin("gps_rx", data, reply);
   if (!gps_is_on && op != DEV_GET_VERSION)
     gps_turn_on(false, false);
-  gps_start_timeout(gps_has_fix ? GPS_IDLE_TIMEOUT : 0ul);
+  gps_start_timeout((gps_has_fix && gps_idle_timeout) ? gps_idle_timeout : 0ul);
+
+  byte fix_type = gps_get_lat_lng(&lat, &lng);
 
   switch (OP(op,data[1]))
   {
     case OP(GPS_TIME_VALID,3): {
-      bool valid = gps.date.is_valid() && gps.time.is_valid();
-      reply[len++] = valid;
+      reply[len++] = gps_has_date_time;
       if (gps_debug)
-        SERIAL_PRINTF("GPS TIME_VALID: %s  %02u/%02u\r\n", valid ? "true" : "false", gps.satellites.value(), gps.satellitesInView());
+        SERIAL_PRINTF("GPS TIME_VALID: %s  %02u/%02u\r\n", gps_has_date_time ? "true" : "false", gps.satellites.value(), gps.satellitesInView());
       break;
     }
     case OP(GPS_LINKED,3): {
-      bool has_fix = gps_use_saved_location ? (gps.date.is_valid() && gps.time.is_valid()) : gps_has_fix;
-      reply[len++] = has_fix;
+      reply[len++] = (fix_type != no_fix);
       if (gps_debug)
-        SERIAL_PRINTF("GPS LINKED: %s  %02u/%02u\r\n", gps_has_fix ? "true" : (has_fix ? "saved" : "false"), gps.satellites.value(), gps.satellitesInView());
+        SERIAL_PRINTF("GPS LINKED: %s  %02u/%02u\r\n", gps_fix_type[fix_type], gps.satellites.value(), gps.satellitesInView());
       break;
     }
     case OP(GPS_GET_TIME,3): {
@@ -2199,11 +2247,6 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_GET_LAT,3): {
-      int32_t lat;
-      if (gps_use_saved_location && !gps_has_fix)
-        lat = gps_saved_location_lat;
-      else
-        lat = (int32_t)(gps.location.lat() * GPS_MULT_FACTOR);
       uint8_t* latBytePtr = (uint8_t*)&lat;
       reply[len++] = latBytePtr[2];
       reply[len++] = latBytePtr[1];
@@ -2213,11 +2256,6 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_GET_LONG,3): {
-      int32_t lng;
-      if (gps_use_saved_location && !gps_has_fix)
-        lng = gps_saved_location_lng;
-      else
-        lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
       uint8_t* lngBytePtr = (uint8_t*)&lng;
       reply[len++] = lngBytePtr[2];
       reply[len++] = lngBytePtr[1];
@@ -2305,7 +2343,19 @@ static void gps_loop ()
   bool old_fix = gps_has_fix;
 
   gps_receive();
-  gps_has_fix = gps_detected && gps_fix_is_valid();
+
+  if (!gps_is_on) {
+    gps_has_date_time = false;
+    gps_has_fix       = false;
+  } else {
+    gps_has_date_time = gps.date.is_valid() && gps.time.is_valid();
+    gps_has_fix       = gps_has_date_time && gps.location.is_valid();
+    if (gps_has_fix) {
+      gps_recent_lat = gps.location.lat();
+      gps_recent_lng = gps.location.lng();
+      gps_has_recent_location = true;
+    }
+  }
   if (gps_has_fix != old_fix) {
     old_fix = gps_has_fix;
     if (gps_debug)
@@ -2324,7 +2374,8 @@ static void gps_loop ()
     if (!gps_has_fix) {
       gps_stop_timeout();
     } else if (!gps_sleep_timeout) {
-      gps_start_timeout(GPS_IDLE_TIMEOUT);
+      if (gps_idle_timeout)
+        gps_start_timeout(gps_idle_timeout);
     } else if (time_after(millis(), gps_sleep_timeout)) {
       gps_turn_off();
     }
@@ -4852,7 +4903,8 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
     return false;  // skip this screen
   oled_manage_gps_sleep();
   if (arg == oled_firstcall) {
-    saving = gps_has_fix;
+    byte fix_type = gps_get_fix_type();
+    saving = (fix_type == true_fix || fix_type == recent_fix);
     if (!saving && !gps_has_saved_location())
       return false;  // skip this screen
     got_action = false;
@@ -4895,26 +4947,28 @@ static bool oled_gps_updatefn (byte arg)  // oled_arg_t
   snprintf(tmp, OLED_ROW_CHARS, "GPS Sats: %02u/%02u", gps.satellites.value(), gps.satellitesInView());
   oled_set_row(0, tmp);
 
-  char colon = ':';
+  int32_t ilat, ilng;
   double lat, lng;
-  bool has_fix = gps_has_fix;
-  if (has_fix) {
-    lat = gps.location.lat();
-    lng = gps.location.lng();
-  } else if (gps_use_saved_location) {
-    lat = ((double)gps_saved_location_lat) / GPS_MULT_FACTOR;
-    lng = ((double)gps_saved_location_lng) / GPS_MULT_FACTOR;
-    colon = '?';
-    has_fix = true;
+  byte fix_type = gps_get_lat_lng(&ilat, &ilng);
+  if (fix_type == no_fix) {
+    lat = lng = 0;
+  } else {
+    lat = ilat / GPS_MULT_FACTOR;
+    lng = ilng / GPS_MULT_FACTOR;
   }
-  
-  if (has_fix)
+  char colon = ':';
+  if (fix_type == recent_fix)
+    colon = '-';
+  else if (fix_type == saved_fix)
+    colon = '?';
+
+  if (fix_type != no_fix)
     snprintf(tmp, OLED_ROW_CHARS, "Latitude%c  %c%9s", colon, ((lat < 0.0) ? 'S' : 'N'), String(fabs(lat), 5).c_str());
   else
     snprintf(tmp, OLED_ROW_CHARS, "Latitude:  ----.-----");
   oled_set_row(1, tmp);
 
-  if (has_fix)
+  if (fix_type != no_fix)
     snprintf(tmp, OLED_ROW_CHARS, "Longitude%c %c%9s", colon, ((lng < 0.0) ? 'W' : 'E'), String(fabs(lng), 5).c_str());
   else
     snprintf(tmp, OLED_ROW_CHARS, "Longitude: ----.-----");
@@ -4995,9 +5049,9 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
   if (musb_switch_timer)
     snprintf(tmp, OLED_ROW_CHARS, "%-5s Reset Pending..", hbg3_version);
   else if (connection[0] == 'N')
-    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s", hbg3_version, musb_selected ? "MUSB Selected" : "No Session");
+    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s", hbg3_version, musb_selected ? "MUSB Selected" : HBG3_NAME " Idle");
   else
-    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s Connected",    hbg3_version, connection);
+    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s %s", hbg3_version, connection, (connection[0] != 'B' || bt_active) ? "Connected" : "Session");
   oled_set_row(0, tmp);
   if (connection[0] == 'B') {
     snprintf(tmp, OLED_ROW_CHARS, "Mode: %s", (bt_mode == bt_mode_aux) ? "AUX protocol" : "USB handset");
@@ -5311,9 +5365,9 @@ static void oled_loop (void)
         oled_timer   = 0;
 #if EMULATE_GPS
         oled_gps_timer = 0;
-        if (gps_prevent_sleep) {
+        if (gps_prevent_sleep && gps_idle_timeout) {
           gps_prevent_sleep = false;
-          gps_start_timeout(GPS_IDLE_TIMEOUT);
+          gps_start_timeout(gps_idle_timeout);
         }
 #endif
         if (oled_turned_off) {
@@ -5663,9 +5717,9 @@ static inline void bt_restart (void)
 
 static inline bool bt_check_connection (void)
 {
-  bool connected = bt_enabled ? bt.connected(0) : false;
+  bool connected = bt_enabled ? bt.connected() : false;
   if (connected != bt_connected) {
-    SERIAL_PRINTF("BT: %s mode %u\r\n", connected ? "CONNECTED" : "DISCONNECTED", bt_mode);
+    SERIAL_PRINTF("BT: %sCONNECTED mode %u\r\n", connected ? "" : "DIS", bt_mode);
     bt_connected = connected;
     if (!connected)
       bt_restart();
@@ -5692,8 +5746,14 @@ static inline void bt_tx_aux (bool from_ssaa, byte *data, uint16_t count)
 static inline void bt_aux_rx (void)
 {
   if (bt_connected) {
-    while (bt.available())
-      (void)packet_decoder(&bt_rxbuf, bt.read());
+    if (bt.available()) {
+      bt_active = get_timeout(4000);
+      do {
+        (void)packet_decoder(&bt_rxbuf, bt.read());
+      } while (bt.available());
+    } else if (bt_active && time_after(millis(), bt_active)) {
+      bt_active = 0;
+    }
   }
 }
 
@@ -6275,7 +6335,7 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"emulate.ssag",
   (char *)"dew0.amps",
   (char *)"dew1.amps",
-  (char *)"disable.gps",
+  (char *)"gps.disable",
   (char *)"cordwrap.override",
   (char *)"dew0.aggression",
   (char *)"dew1.aggression",
@@ -6285,12 +6345,12 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"gps.location.lng",
   (char *)"dew0.manual.pwm",
   (char *)"dew1.manual.pwm",
-  (char *)"reserved7",
+  (char *)"gps.idle.timeout",
   (char *)"oled.type",
   (char *)"ota.version.path",
   (char *)"auxbus.stopbits",
   (char *)"musb.rfenable",
-  (char *)"reserved2",  // was ota.timestamp until v8.5
+  (char *)"gps.force.saved.location",  // was ota.timestamp until v8.5
   (char *)"ota.update.server",
   (char *)"ota.update.path",
   (char *)NULL
@@ -6319,7 +6379,7 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // emulate.ssag
   ""                // dew0.amps
   ""                // dew1.amps
-  ""                // disable.gps
+  ""                // gps.disable
   ""                // cordwrap.override
   ""                // dew0.aggression
   ""                // dew1.aggression
@@ -6329,12 +6389,12 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // rgps.location.lng
   ""                // dew0.manual.pwm
   ""                // dew1.manual.pwm
-  ""                // reserved7
+  ""                // gps.idle.timeout
   ""                // oled.type
   ""                // ota.version.path
   ""                // auxbus.stopbits
   ""                // musb.rfenable
-  ""                // reserved2  // was ota.timestamp until v8.5
+  ""                // gps.force.saved.location  // was ota.timestamp until v8.5
   ""                // ota.update.server
   ""                // ota.update.path
   ""                // NULL
@@ -6425,6 +6485,20 @@ static struct nvram_signature_s {
   uint16_t  vsize;
 } nvram_signature;
 
+static bool nvram_get_bool (const char *name)
+{
+  const char *val = nvram_get_val(name);
+  if (val && *val) {
+    if (0 == strcmp(val, "1") || 0 == strcmp(val, "true"))
+      return true;
+    if (0 == strcmp(val, "0") || 0 == strcmp(val, "false"))
+      return false;
+    *(char *)val = '\0';  // Fix bad value
+    nvram_delayed_save = get_timeout(nvram_save_val_delay);
+  }
+  return (0 == strcmp(name, "wlan.dhcp.enabled"));  // the only bool that defaults to "1"
+}
+
 static void nvram_restore ()
 {
   if (nvram_initialized)
@@ -6476,36 +6550,42 @@ static void nvram_restore ()
 #if OLED_ENABLED
   oled_get_type();
 #endif
-  musb_rfkill = !atoi(nvram_get_val("musb.rfenable"));
-  suppress_lowbattery = !!atoi(nvram_get_val("suppress.lowbattery"));
+  musb_rfkill = !nvram_get_bool("musb.rfenable");
+  suppress_lowbattery = nvram_get_bool("suppress.lowbattery");
   byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
   if (tmp == 1 || tmp == 2)
     auxbus_stopbits = tmp;
 #if EMULATE_FOCUS
-  focus_backlash_pos =   atoi(nvram_get_val("focus.backlash.pos"));
-  focus_backlash_neg =   atoi(nvram_get_val("focus.backlash.neg"));
-  focus_calibrated   = !!atoi(nvram_get_val("focus.calibrated"));
+  focus_backlash_pos = atoi(nvram_get_val("focus.backlash.pos"));
+  focus_backlash_neg = atoi(nvram_get_val("focus.backlash.neg"));
+  focus_calibrated   =     nvram_get_bool("focus.calibrated");
   char *flimits = (char *)nvram_get_val("focus.limits");
   ulong min = ~0ul, max=~0ul;
   sscanf(flimits, "%lu %lu", &min, &max);
   focus_set_save_limits(true, min, max);
 #endif /* EMULATE_FOCUS */
 #if EMULATE_SSAA
-  emulate_ssaa = !!atoi(nvram_get_val("emulate.ssaa"));
+  emulate_ssaa = nvram_get_bool("emulate.ssaa");
   if (emulate_ssaa)
     SERIAL_PRINTF("emulate.ssaa=%u\r\n", emulate_ssaa);
 #endif
 #if EMULATE_SSAG
-  emulate_ssag = !!atoi(nvram_get_val("emulate.ssag"));
+  emulate_ssag = nvram_get_bool("emulate.ssag");
   if (emulate_ssag)
     SERIAL_PRINTF("emulate.ssag=%u\r\n", emulate_ssag);
 #endif
 #if EMULATE_GPS
-  gps_disabled = !!atoi(nvram_get_val("disable.gps"));
+  const char *t = nvram_get_val("gps.idle.timeout");
+  if (t) {
+    if (*t >= '0' && *t <= '0')
+      gps_idle_timeout = atoi(t);
+  }
+  gps_disabled = nvram_get_bool("gps.disable");
   if (gps_disabled)
-    SERIAL_PRINTLN("disable.gps=1");
-  gps_saved_location_lat = atoi(nvram_get_val("gps.location.lat"));
-  gps_saved_location_lng = atoi(nvram_get_val("gps.location.lng"));
+    SERIAL_PRINTLN("gps.disable=1");
+  gps_saved_lat = atoi(nvram_get_val("gps.location.lat"));
+  gps_saved_lng = atoi(nvram_get_val("gps.location.lng"));
+  gps_force_saved_location = nvram_get_bool("gps.force.saved.location");
 #endif
   const char *cw = nvram_get_val("cordwrap.override");
   if (cw) {
@@ -6533,7 +6613,7 @@ static void nvram_restore ()
   nvram_get_nonblank_val("ota.update.path",   ota_update_path);
   nvram_get_nonblank_val("ota.version.path",  ota_version_path);
 #endif
-  mount_reversed_alt = !!atoi(nvram_get_val("mount.reversed.alt"));
+  mount_reversed_alt = nvram_get_bool("mount.reversed.alt");
   // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
   // Insert our MAC address and ADAPTER_VERSION string into the advertisement broadcast string:
   sprintf(advertisement, "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\n\"version\":\"" ADAPTER_VERSION "%s\"\n}",
@@ -6617,14 +6697,14 @@ static bool wifi_begin_client_mode()
   SERIAL_PRINTLN("wifi_begin_client_mode:");
   const char *ssid     = nvram_get_val("wlan.ssid");
   const char *passkey  = nvram_get_val("wlan.passkey");
-  const char *use_dhcp = nvram_get_val("wlan.dhcp.enabled");
+  bool        use_dhcp = nvram_get_bool("wlan.dhcp.enabled");
   if (!ssid[0]) {
     wifi_client_mode_override = true;
     SERIAL_PRINTLN("wifi_client_mode_override: wlan.ssid not set yet");
     return false;  /* cannot be a client unless we know which AP to connect to! */
   }
   WiFi.mode(WIFI_STA);
-  if (use_dhcp[0] != '1') {
+  if (!use_dhcp) {
     const char *ip     = nvram_get_val("wlan.static.ip");
     const char *nmask  = nvram_get_val("wlan.static.netmask");
     const char *gw     = nvram_get_val("wlan.static.gateway");
@@ -7264,10 +7344,10 @@ static void status_command (void (*writep)(const char *))
   if (musb_switch_timer) {
     strcat(tmp, "Reset Pending");
   } else if (connection[0] == 'N') {
-    strcat(tmp, musb_selected ? "MUSB Selected" : "No Session");
+    strcat(tmp, musb_selected ? "MUSB Selected" : HBG3_NAME " Idle");
   } else {
     strcat(tmp, connection);
-    strcat(tmp, "-Connected");
+    strcat(tmp, (connection[0] != 'B' || bt_active) ? "-Connected" : "-Session");
   }
   strcat(tmp, "; ");
   writep(tmp);
