@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.24"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-09"
+#define VERSION "v8.25"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-10"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,8 +37,10 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.25 2023-12-10
+ *  -- Fix Nunchuck to use appropriate speeds when talking to a Celestron Focus Motor vs a local stepper motor.
  * Version 8.24 2023-12-09
- *  -- Make bluetooth SSID always the same as the WiFi SSID, aka "softap.ssid".
+ *  -- Make Bluetooth SSID always the same as the WiFi SSID, aka "softap.ssid".
  *  -- OTA: Fix timeout bugs.
  *  -- OLED: Reduce button press timers by 0.5secs to match desired timeouts.
  * Version 8.23 2023-12-07
@@ -3593,13 +3595,6 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
 {
   static const uint8_t slew_speeds_slow [5] = {4, 4, 5, 5, 6};  // must be in range 1..9; 0 is STOP
   static const uint8_t slew_speeds_fast [5] = {4, 5, 6, 7, 9};  // must be in range 1..9; 0 is STOP
-#if EMULATE_FOCUS
-  static const uint8_t focus_speeds_slow[5] = {1, 2, 3, 4, 5};  // must be in range 1..9; 0 is STOP
-  static const uint8_t focus_speeds_fast[5] = {5, 6, 7, 8, 9};  // must be in range 1..9; 0 is STOP
-#else
-  static const uint8_t focus_speeds_slow[5] = {6, 6, 6, 7, 7};  // must be in range 1..9; 0 is STOP
-  static const uint8_t focus_speeds_fast[5] = {7, 7, 8, 8, 9};  // must be in range 1..9; 0 is STOP
-#endif
   uint8_t cmd = MC_MOVE_POS;
 
   if (speed) {
@@ -3607,11 +3602,22 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
       speed = -speed;
       cmd = MC_MOVE_NEG;
     }
-    speed--;
-    if (dev == DEV_FOCUS)
-      speed = fast_range ? focus_speeds_fast[speed] : focus_speeds_slow[speed];
-    else
+    speed--;  // make into array index from 0..N
+    if (dev != DEV_FOCUS) {
       speed = fast_range ? slew_speeds_fast[speed]  : slew_speeds_slow[speed];
+#if EMULATE_FOCUS
+    } else if (stepper_driver != STEPPER_DRIVER_NONE) {
+      // HomeBrew Focus Motor only uses the full speed range 1..9.
+      static const uint8_t focus_speeds_slow[5] = {1, 2, 3, 4, 5};  // must be in range 1..9; 0 is STOP
+      static const uint8_t focus_speeds_fast[5] = {5, 6, 7, 8, 9};  // must be in range 1..9; 0 is STOP
+      speed = fast_range ? focus_speeds_fast[speed] : focus_speeds_slow[speed];
+#endif
+    } else {
+      // Celestron Focus Motor only uses speeds 6,7,8,9. Lower speeds do nothing useful.
+      static const uint8_t focus_speeds_slow[5] = {6, 6, 6, 7, 7};  // must be in range 1..9; 0 is STOP
+      static const uint8_t focus_speeds_fast[5] = {7, 7, 8, 8, 9};  // must be in range 1..9; 0 is STOP
+      speed = fast_range ? focus_speeds_fast[speed] : focus_speeds_slow[speed];
+    }
     fm_last_approach_cmd = cmd;
   }
 
