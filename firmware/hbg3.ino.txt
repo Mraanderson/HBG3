@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.23"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-07"
+#define VERSION "v8.24"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-09"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,14 +37,18 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.24 2023-12-09
+ *  -- Make bluetooth SSID always the same as the WiFi SSID, aka "softap.ssid".
+ *  -- OTA: Fix timeout bugs.
+ *  -- OLED: Reduce button press timers by 0.5secs to match desired timeouts.
  * Version 8.23 2023-12-07
  *  -- GPS: New NVRAM variable gps.force.saved.location to always use saved lat/lng when no better fix available.
  *  -- GPS: Keep recent GPS Location data when sleeping the GPS, for replay on wake-up (still requires time/date fix).
- *  -- GPS: Increase gps_idle_timeout from 10 minutes to 20 minutes, and allow nvram override.
+ *  -- GPS: Increase gps_idle_timeout from 10 minutes to 20 minutes, and allow NVRAM override.
  *  -- GPS: Rename "disable.gps" to "gps.disable" for better consistency.
  *  -- OLED: Show "HBG3 Idle" instead of "No Session".
  *  -- OLED: Show "BT Session" instead of "BT Connected" when link is up but no activity.
- *  -- OLED: On OLED, show ':' after lat/lng for real Location, '?' for saved Location, and '-' for recent Location.
+ *  -- OLED: Show ':' after lat/lng for real Location, '?' for saved Location, and '-' for recent Location.
  * Version 8.22 2023-12-02
  *  -- AIO: Show Ethernet status on OLED connection status screen when WiFi is Off.
  *  -- AIO: Fix errors with p3000_debug_ethernet.
@@ -216,7 +220,6 @@ static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUX
 #include "BluetoothSerial.h"
 
 BluetoothSerial        bt;
-static char            bt_id[32];
 static long            bt_connected = 0;
 static long            bt_active = 0;
 
@@ -290,6 +293,7 @@ static bool emulate_ssag        = false;
 #ifndef HBG3_NAME
 #define HBG3_NAME                 "HBG3"
 #endif
+static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
 #define DEFAULT_SSID              "HomeBrew-"
 #define ADAPTER_VERSION           DEFAULT_SSID "AMW007-9.0.0.0, " VERSION_DATE "T12:00:00Z, " HBG3_NAME "-"
 // Celestron reports: "ZENTRI-AMW007-1.2.0.10, 2017-07-28T07:43:27Z, ZentriOS-WL-1.2.0.10, Board:N/A");
@@ -5056,7 +5060,7 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
   if (connection[0] == 'B') {
     snprintf(tmp, OLED_ROW_CHARS, "Mode: %s", (bt_mode == bt_mode_aux) ? "AUX protocol" : "USB handset");
     oled_set_row(1, tmp);
-    snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", bt_id);
+    snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", hbg3_ssid);
     oled_set_row(2, tmp);
     oled_clear(3);
   } else if (connection[0] == 'U') {
@@ -5090,7 +5094,7 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
   if (arg == oled_longpress) {
     oled_set_row(0, "Hold 5 secs to RESET");
     if (!oled_timer)
-      oled_timer = get_timeout(5000);
+      oled_timer = get_timeout(4500);
   } else if (arg == oled_timeout) {
     ESP.restart();
   }
@@ -5117,7 +5121,7 @@ static bool oled_ota_updatefn (byte arg)  // oled_arg_t
       fwupdate_possible = true;
     }
   } else if (arg == oled_longpress && !oled_timer && fwupdate_possible) {
-    oled_timer = get_timeout(3000);
+    oled_timer = get_timeout(2500);
   } else if (arg == oled_timeout) {
     ota_fetch_update();
   }
@@ -5213,7 +5217,7 @@ static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
       ESP.restart();
   } else if (arg == oled_longpress) {
     if (!oled_timer) {
-      oled_timer = get_timeout(10 * 1000);
+      oled_timer = get_timeout(9 * 1000 + 500);
       oled_set_row(0, HBG3_NAME " by Mark Lord");
       oled_set_row(1, "====================");
       oled_set_row(2, "Hold for 10 seconds");
@@ -5701,8 +5705,7 @@ static void bt_setup (void)
     bt_enabled = false;
   } else {
     bt_enabled = true;
-    sprintf(bt_id, "%s%02X%02X%02X", DEFAULT_SSID, wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
-    bt.begin(bt_id);
+    bt.begin(hbg3_ssid);
   }
 }
 
@@ -6466,14 +6469,18 @@ static void nchuck_save_preset (struct button_s *b)
 
 static bool nvram_initialized = false;
 
+static inline void default_ssid (char *dst)
+{
+  snprintf(dst, NVRAM_VALS_MAX_LEN, "%s%02X%02X%02X", DEFAULT_SSID, wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
+}
+
 static void nvram_load_defaults ()
 {
   SERIAL_PRINTLN(__func__);
   memcpy(nvram_vals, nvram_vals_defaults, sizeof(nvram_vals));
 
   // Set up a unique default SSID by appending last 6-digits of MAC:
-  char *ssid = (char *)nvram_get_val("softap.ssid");
-  sprintf(ssid, DEFAULT_SSID "%02X%02X%02X", wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
+  default_ssid(nvram_vals[nvram_find_val("softap.ssid")]);
   nvram_initialized = true;
 }
 
@@ -6550,6 +6557,11 @@ static void nvram_restore ()
 #if OLED_ENABLED
   oled_get_type();
 #endif
+  const char *ssid = nvram_get_val("softap.ssid");
+  if (ssid && ssid[0])
+    strcpy(hbg3_ssid, ssid);
+  else
+    default_ssid(hbg3_ssid);
   musb_rfkill = !nvram_get_bool("musb.rfenable");
   suppress_lowbattery = nvram_get_bool("suppress.lowbattery");
   byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
@@ -6660,21 +6672,15 @@ static bool IP_fromString(IPAddress ip, const char *s)
 static void wifi_begin_server_mode()
 {
   SERIAL_PRINTLN("wifi_begin_server_mode:");
-  const char *ssid, *passkey;
+  const char *passkey = nvram_get_val("softap.passkey");
   wifi_relay_mode = false;
-  ssid = nvram_get_val("softap.ssid");
-  if (!ssid[0]) {
-    nvram_load_defaults();
-    ssid = nvram_get_val("softap.ssid");
-  }
-  passkey = nvram_get_val("softap.passkey");
-  SERIAL_PRINTF("esp32_wifi ON, softAP, ssid=%s, passkey=%s\r\n", ssid, passkey);
+  SERIAL_PRINTF("esp32_wifi ON, softAP, ssid=%s, passkey=%s\r\n", hbg3_ssid, passkey);
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, passkey);
+  WiFi.softAP(hbg3_ssid, passkey);
   delay(100);  // This delay here is critical: wait for SYSTEM_EVENT_AP_START before setting IP config
   WiFi.softAPConfig(server_static_ip, server_static_ip, server_static_netmask);
 #if OLED_ENABLED
-  set_wifi_info(ssid, server_static_ip);
+  set_wifi_info(hbg3_ssid, server_static_ip);
 #endif
 }
 
@@ -6949,8 +6955,11 @@ static void ota_exit (const char *msg)
 
 static ulong ota_clength = 0;
 
-static void ota_wait_for_data (long timeout)
+#define OTA_TIMEOUT_MSECS (12 * 1000)  /* 12 second timeout for all OTA update remote fetches */
+
+static void ota_wait_for_data (void)
 {
+  long timeout = get_timeout(OTA_TIMEOUT_MSECS);
   while (!otaclient.available()) {
     if (time_after(millis(), timeout))
       ota_exit("Host timed-out");
@@ -6958,13 +6967,13 @@ static void ota_wait_for_data (long timeout)
   }
 }
 
-static void ota_fetch_file (long timeout, const char *server, const char *part1, const char *part2)
+static void ota_fetch_file (const char *server, const char *part1, const char *part2)
 {
   otaclient.stop();
   const char *qmark = part2[0] ? "?" : "";
   SERIAL_PRINTF("Connecting to http://%s%s%s%s%s\r\n", server, (part1[0] == '/') ? "" : "/", part1, qmark, part2);
   ota_clength = 0;
-  if (!otaclient.connect(server, 80, timeout))
+  if (!otaclient.connect(server, 80, OTA_TIMEOUT_MSECS))
     ota_exit("Connection failed");
   otaclient.printf( "GET %s%s%s HTTP/1.1\r\n"
                     "Host: %s\r\n"
@@ -6973,7 +6982,7 @@ static void ota_fetch_file (long timeout, const char *server, const char *part1,
                      part1, qmark, part2,
                      server );
   while (1) {
-    ota_wait_for_data(timeout);
+    ota_wait_for_data();
     String line = otaclient.readStringUntil('\n');
     line.trim();
     SERIAL_PRINTF("server: %s\r\n", line.c_str());
@@ -6990,14 +6999,13 @@ static void ota_fetch_file (long timeout, const char *server, const char *part1,
 
 static void ota_fetch_update (void)
 {
-  long timeout = get_timeout(10 * 1000);
   char version[20] = {0,};
 
   ota_show_progress(0, 0);  // Initialize the display
-  ota_fetch_file(timeout, ota_update_server, ota_version_path, ota_update_path);
+  ota_fetch_file(ota_update_server, ota_version_path, ota_update_path);
   // Note: server seems to respond with a bytecount line as well as the actual data..
   while (1) {
-    ota_wait_for_data(timeout);
+    ota_wait_for_data();
     String line = otaclient.readStringUntil('\n');
     const char *data = line.c_str();
     SERIAL_PRINTF("server: %s\r\n", data);
@@ -7019,8 +7027,7 @@ static void ota_fetch_update (void)
 #endif /* OLED_ENABLED */
 
   // Now do the actual firmware download/update:
-  timeout = get_timeout(15 * 1000);
-  ota_fetch_file(timeout, ota_update_server, ota_update_path, "");
+  ota_fetch_file(ota_update_server, ota_update_path, "");
   const char *msg;
   if (ota_clength <= 0)
     msg = "No data from server";
@@ -7352,7 +7359,7 @@ static void status_command (void (*writep)(const char *))
   strcat(tmp, "; ");
   writep(tmp);
   if (connection[0] == 'B') {
-    sprintf(tmp, "Mode: Bluetooth %s, SSID: %s; ", (bt_mode == bt_mode_aux) ? "AUX" : "USB", bt_id);
+    sprintf(tmp, "Mode: Bluetooth %s, SSID: %s; ", (bt_mode == bt_mode_aux) ? "AUX" : "USB", hbg3_ssid);
     writep(tmp);
   }
   if (connection[0] == 'U') {
