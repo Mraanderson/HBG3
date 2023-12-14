@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.25"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-10"
+#define VERSION "v8.26"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-14"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,13 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.26 2023-12-14
+ *  -- Bluetooth: Make debug easier: keep WiFi on when musb.rfenable is 1.
+ *  -- Bluetooth: New 'b' command to toggle Bluetooth debug on/off.
+ *  -- Bluetooth: Don't forward AUX packets to BT until handshake is completed.
+ *  -- Bluetooth: Show BT-Handshake state on OLED and status command.
+ *  -- Bluetooth: Add trickery for initial handshake needed by CPWI.
+ *  -- Disable both AUX buses and free up their RAM during OTA updates.
  * Version 8.25 2023-12-10
  *  -- Fix Nunchuck to use appropriate speeds when talking to a Celestron Focus Motor vs a local stepper motor.
  * Version 8.24 2023-12-09
@@ -74,35 +81,6 @@
  *  -- Fix minor bug in new Evo WiFi logic.
  *  -- New 'a' command for toggling whether w2000/bt/musb packets are shown when tracing.
  *  -- By default, show only AUX/Relay packets when tracing.
- * Version 8.18 2023-11-27
- *  -- Handle aborted AUX messages where 0x3b reappears within first 4-bytes.
- *  -- Don't forward incomplete (pkt_fail) packets.
- *  -- OTA:  Fix ota.version.path retrieval from NVRAM.
- *  -- OTA:  Improve version checking.
- *  -- SSAG: Fix decoding of MC replies to SSAG.
- *  -- DEW: Be much more aggressive in "Auto" mode.
- *  -- DEW: Make longpress on Dew-OLED cycle through manual PWM as well as Auto aggressions.
- *  -- DEW: Save "automode" and "manual PWM" settings in NVRAM.
- *  -- DEW: Enable use of manual PWM for channels without thermistors.
- * Version 8.17 2023-11-24
- *  -- Only do EVO WiFi commands if Evo mount detected, and retry if no ACK is received.
- * Version 8.16 2023-11-23
- *  -- Add NMEA_playback feature for debugging/fixing GPS NMEA decoding.
- *  -- Fix two bugs in the NMEA parsing, which were preventing a "fix" from being reported with some GPS modules.
- * Version 8.15 2023-11-21
- *  -- Try and fix garbage on Serial port at boot time.
- *  -- Improve the polling fix from 8.14.
- *  -- OLED: Add GPS Location Save/Restore options.
- *  -- OLED: Other improvements.
- * Version 8.14 2023-11-16
- *  -- AIO: mirror the BLUE LED onto both of the AIO LEDs, as the BLUE LED is normally hidden inside the case.
- *  -- Limit the polling frequency for detecting a Celestron Focus Motor.
- * Version 8.13 2023-10-20
- *  -- Fix OLED for non-default OLED types -- was broken in v8.12
- * Version 8.12 2023-10-19
- *  -- Turn OLED on before aio_setup(), for much earlier feedback after power-on.
- *  -- Show BT AUX/USB mode on OLED.
- *  -- Fix bugs and clean-up Bluetooth state management.
  *
  * Random note:
  *   For Camera shutter release triggering via RTS:
@@ -222,11 +200,16 @@ static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUX
 #include "BluetoothSerial.h"
 
 BluetoothSerial        bt;
-static long            bt_connected = 0;
-static long            bt_active = 0;
+enum                   {BT_IDLE, BT_BOOTLOADER, BT_WAITBAUD, BT_SETBAUD, BT_HSDONE};
+static byte            bt_auxstate  = BT_IDLE;  // state machine for CPWI initial handshake.
+static bool            bt_debug     = false;    // For debugging CPWI initial handshake.
+static bool            bt_connected = 0;        // BT Session established.
+static bool            bt_ready     = false;    // BT Session is ready for AUX protocol packets
+static long            bt_handshake = 0;        // timer for parts of CPWI initial handshake.
+static long            bt_active    = 0;        // BT Session has recent activity: an app is connected.
 
 /*
- * There is no serial "debug" port if (musb_selected && relay_detected).
+ * There is no serial "debug" port if (musb_selected && auxrelay_detected).
  * Too complex to attempt debug over SoftwareSerial for now.
  * But one can instead use port 3000 and the "debug" command there instead.
  */
@@ -347,6 +330,9 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
   if (SerialDebug) {SerialDebug->print(x);}                                              \
 } while (0)
 
+#ifdef Serial
+#error "The HBG3 does not yet work with version 3.x.x of the ESP32 board package. Install version 2.0.11 instead."
+#endif
 #define Serial      Serial_UNDEFINED  // Prevent using "Serial" by accident
 
 static long blue_led_timer = 0;
@@ -3607,11 +3593,11 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
       speed = fast_range ? slew_speeds_fast[speed]  : slew_speeds_slow[speed];
 #if EMULATE_FOCUS
     } else if (stepper_driver != STEPPER_DRIVER_NONE) {
-      // HomeBrew Focus Motor only uses the full speed range 1..9.
+      // HomeBrew Focus Motor uses the full speed range 1..9.
       static const uint8_t focus_speeds_slow[5] = {1, 2, 3, 4, 5};  // must be in range 1..9; 0 is STOP
       static const uint8_t focus_speeds_fast[5] = {5, 6, 7, 8, 9};  // must be in range 1..9; 0 is STOP
       speed = fast_range ? focus_speeds_fast[speed] : focus_speeds_slow[speed];
-#endif
+#endif  /* EMULATE_FOCUS */
     } else {
       // Celestron Focus Motor only uses speeds 6,7,8,9. Lower speeds do nothing useful.
       static const uint8_t focus_speeds_slow[5] = {6, 6, 6, 7, 7};  // must be in range 1..9; 0 is STOP
@@ -3624,7 +3610,7 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
   if (verbose || nchuck_debug
 #if EMULATE_FOCUS
     || (focus_debug && dev == DEV_FOCUS && stepper_driver != STEPPER_DRIVER_NONE)
-#endif
+#endif  /* EMULATE_FOCUS */
   )
     SERIAL_PRINTF("%s: dev=0x%02x cmd=0x%02x fast=%u speed=0x%02x\r\n", __func__, dev, cmd, fast_range, speed);
   send_mc_msg(dev, cmd, speed);
@@ -5061,7 +5047,8 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
   else if (connection[0] == 'N')
     snprintf(tmp, OLED_ROW_CHARS, "%-5s %s", hbg3_version, musb_selected ? "MUSB Selected" : HBG3_NAME " Idle");
   else
-    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s %s", hbg3_version, connection, (connection[0] != 'B' || bt_active) ? "Connected" : "Session");
+    snprintf(tmp, OLED_ROW_CHARS, "%-5s %s %s", hbg3_version, connection,
+      (connection[0] != 'B' || bt_active) ? (bt_handshake ? "Handshake" : "Connected") : "Session");
   oled_set_row(0, tmp);
   if (connection[0] == 'B') {
     snprintf(tmp, OLED_ROW_CHARS, "Mode: %s", (bt_mode == bt_mode_aux) ? "AUX protocol" : "USB handset");
@@ -5713,6 +5700,9 @@ static void bt_setup (void)
     bt_enabled = true;
     bt.begin(hbg3_ssid);
   }
+  if (bt_debug)
+    SERIAL_PRINTF("bt_enabled=%u\r\n", bt_enabled);
+
 }
 
 static inline void bt_restart (void)
@@ -5720,17 +5710,34 @@ static inline void bt_restart (void)
   if (bt_enabled) {
     bt_enabled = false;
     bt.end();
+    if (bt_debug)
+      SERIAL_PRINTLN("bt_enabled=0");
   }
   bt_setup();
 }
+
+static inline void _bt_set_state (byte state, const char *name)
+{
+  bt_auxstate = state;
+  if (bt_debug)
+    SERIAL_PRINTLN(name);
+}
+
+#define BT_SET_STATE(s) do { _bt_set_state(s, #s); } while (0)
 
 static inline bool bt_check_connection (void)
 {
   bool connected = bt_enabled ? bt.connected() : false;
   if (connected != bt_connected) {
-    SERIAL_PRINTF("BT: %sCONNECTED mode %u\r\n", connected ? "" : "DIS", bt_mode);
+    SERIAL_PRINTF("BT: %sCONNECTED mode %s\r\n", connected ? "" : "DIS", (bt_mode == bt_mode_aux) ? "AUX" : "HC");
     bt_connected = connected;
-    if (!connected)
+    bt_active    = 0;
+    bt_handshake = 0;
+    bt_ready     = false;
+    BT_SET_STATE(BT_IDLE);
+    if (connected)
+      bt_handshake = get_timeout(2000);
+    else
       bt_restart();
   }
   return connected;
@@ -5746,22 +5753,90 @@ static inline void bt_tx (bool from_ssaa, byte *data, uint16_t count)
   }
 }
 
-static inline void bt_tx_aux (bool from_ssaa, byte *data, uint16_t count)
+/*
+ * Bluetooth in v7.16 used to work most of the time with CPWI.
+ * But ever since the code was updated to use the bt.connected() function,
+ * it has been failing for (only) CPWI. Older code used bt.available() instead.
+ *
+ * MS-Windows though seems to behave better when we do use bt.connected(),
+ * but CPWI now fails unless we emulate the hand-controller handshake with it.
+ *
+ * So we have to partially emulate the initial handshake with a Celestron hand-controller
+ * to keep CPWI happy, without breaking anything else that uses AUX-protocol Bluetooth.
+ *
+ * The code for this is a bit of a mess. Ideally, it should eg. send a byte
+ * and return to the main loop() thread for the delay periods. But something in
+ * the ESP32 bluetooth stack requires an inline delay() instead, or the data is not
+ * sent/received in a timely fashion.  Dunno what/why.  But it means the handshake code
+ * has to use lengthy inline delay() calls to work with CPWI.  Ugh.  Triple UGH!!!
+ */
+
+#define BT_HS_TIMEOUT 220
+
+static inline void bt_tx_byte (byte b)
 {
-  if (bt_mode == bt_mode_aux)
-    bt_tx(from_ssaa, data, count);
+  bt_tx(false, &b, 1);
+  if (bt_debug && !verbose)
+    SERIAL_PRINTF("bt_tx %02x\r\n", b);
 }
 
-static inline void bt_aux_rx (void)
+static void bt_aux_rx (void)
 {
-  if (bt_connected) {
-    if (bt.available()) {
-      bt_active = get_timeout(4000);
+  static int len;
+  byte b = bt.read();
+  if (bt_handshake && bt_debug)
+    SERIAL_PRINTF("bt_RX %02x\r\n", b);
+  if (!bt_handshake || b == 0x3b) {
+    bt_handshake = 0;
+    bt_ready = true;
+    (void)packet_decoder(&bt_rxbuf, b);
+  } else if (bt_auxstate == BT_IDLE) {
+    if (b == 0x8a) {
+      BT_SET_STATE(BT_BOOTLOADER);
+      bt_handshake = get_timeout(1250);  // CPWI now ignores us for at least this long.
+    }
+  } else if ((bt_auxstate == BT_BOOTLOADER || bt_auxstate == BT_WAITBAUD) && b <= 16) {
+    len = b - 1;                               // Normally, "b" is 0x0a here, for a 10-byte "set baud 19200" command.
+    BT_SET_STATE(BT_SETBAUD);
+    bt_handshake = get_timeout(BT_HS_TIMEOUT); // Normally the rest of the bytes arrive here without delay.
+  } else if (bt_auxstate == BT_SETBAUD) {
+    bt_handshake = get_timeout(BT_HS_TIMEOUT);
+    if (--len == 0)
+      BT_SET_STATE(BT_HSDONE);
+  }
+}
+
+static inline void bt_aux_loop (void)
+{
+  if (bt.available()) {
+    do {
+      bt_aux_rx();
+    } while (bt.available());
+    bt_active = get_timeout(4000);
+    return;
+  }
+  if (!bt_check_connection())
+    return;
+  if (bt_active && time_after(millis(), bt_active))
+    bt_active = 0;
+  if (bt_handshake && time_after(millis(), bt_handshake)) {
+    bt_handshake = get_timeout(BT_HS_TIMEOUT);
+    if (bt_auxstate == BT_BOOTLOADER) {
+      byte failsafe = 0;
       do {
-        (void)packet_decoder(&bt_rxbuf, bt.read());
-      } while (bt.available());
-    } else if (bt_active && time_after(millis(), bt_active)) {
-      bt_active = 0;
+        bt_tx_byte(0xfa);
+        delay(200);  // MUST be an inline delay() or Bluetooth doesn't work.
+      } while (!bt.available() && ++failsafe < 5);
+      if (bt.available())
+        BT_SET_STATE(BT_WAITBAUD);
+    } else if (bt_auxstate == BT_HSDONE) {
+      byte failsafe = 0;
+      do {
+        bt_tx_byte(0x80);
+        delay(200);  // MUST be an inline delay() or Bluetooth doesn't work.
+      } while (!bt.available() && ++failsafe < 5);
+    } else if (bt_auxstate == BT_SETBAUD) {
+      BT_SET_STATE(BT_IDLE);  // timed-out
     }
   }
 }
@@ -5794,7 +5869,7 @@ static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
     else if (rxbuf == &w2000_rxbuf)
       w2000_tx(from_ssaa, data, len);
     else if (rxbuf == &bt_rxbuf)
-      bt_tx_aux(from_ssaa, data, len);
+      bt_tx(from_ssaa, data, len);
     else if (rxbuf == &musb_rxbuf)
       musb_tx(from_ssaa, data, len);
     else
@@ -6054,8 +6129,8 @@ static void forward_from_bus_to_outside (struct rxbuf_s *rxbuf, byte status, byt
     w2000_rxbuf.requestor = DEV_FF;
 
   // Echo packet to bt, unless it came from bt:
-  if (!regular_pkt || src != bt_rxbuf.requestor)
-    bt_tx_aux(from_ssaa, data, len);
+  if (bt_ready && (!regular_pkt || src != bt_rxbuf.requestor))
+    bt_tx(from_ssaa, data, len);
   if (regular_pkt && dst == bt_rxbuf.requestor)
     bt_rxbuf.requestor = DEV_FF;
 
@@ -6859,7 +6934,7 @@ static void manage_esp32_wifi (bool want_off)
 static void manage_wifi_onoff ()
 {
   // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
-  manage_esp32_wifi(bt_connected || (musb_selected && musb_rfkill));
+  manage_esp32_wifi(musb_rfkill && (bt_connected || musb_selected));
   manage_evo_wifi  (bt_connected || musb_connected || (!esp32_wifi_off && w2000.connected()));
 }
 
@@ -6956,7 +7031,7 @@ static void ota_exit (const char *msg)
 #endif
   SERIAL_PRINTLN(msg);
   delay(5000);
-  ESP.restart();
+  ESP.restart();  // Necessary, to re-enable AUX buses and WiFi etc.
 }
 
 static ulong ota_clength = 0;
@@ -7003,9 +7078,21 @@ static void ota_fetch_file (const char *server, const char *part1, const char *p
   }
 }
 
+static void bus_free (struct bus_s *bus)
+{
+  bus->txq->uart->end();
+  free(bus->txq);
+  free(bus->rxbuf);
+}
+
 static void ota_fetch_update (void)
 {
   char version[20] = {0,};
+
+  // Prevent AUX buses from interfering, and free up extra RAM in case it's needed:
+  if (auxrelay_detected)
+    bus_free(&auxrelay);
+  bus_free(&auxbus);
 
   ota_show_progress(0, 0);  // Initialize the display
   ota_fetch_file(ota_update_server, ota_version_path, ota_update_path);
@@ -7051,6 +7138,7 @@ static const char help_serial_commands[] =
   ";                 -- Comment, ignore/print this line\r\n"
   "#                 -- Comment, ignore/print this line\r\n"
   "a                 -- Toggle AUX-bus only mode for traces\r\n"
+  "b                 -- Toggle Bluetooth handshake debug on/off\r\n"
   "cls               -- Clear screen\r\n"
   "devs              -- List devnames usable with t1/t2 commands\r\n"
 #if EMULATE_DEW
@@ -7189,6 +7277,9 @@ static bool handle_serial_commands (char *cmd)
     SERIAL_PRINTLN("Sending auxtest");
     auxtest_remaining = 0;  // cancel the automatic tests
     auxtest_send_msg();
+  } else if (b == 'b') {
+    bt_debug = !bt_debug;
+    SERIAL_PRINTF("bt_debug=%u\r\n", bt_debug);
   } else if (b == 'v') {
     verbose = !verbose;
     SERIAL_PRINTF("verbose=%u\r\n", verbose);
@@ -7360,7 +7451,8 @@ static void status_command (void (*writep)(const char *))
     strcat(tmp, musb_selected ? "MUSB Selected" : HBG3_NAME " Idle");
   } else {
     strcat(tmp, connection);
-    strcat(tmp, (connection[0] != 'B' || bt_active) ? "-Connected" : "-Session");
+    strcat(tmp, "-");
+    strcat(tmp, (connection[0] != 'B' || bt_active) ? (bt_handshake ? "Handshake" : "Connected") : "Session");
   }
   strcat(tmp, "; ");
   writep(tmp);
@@ -7667,11 +7759,9 @@ static void non_wifi_loop (void)
   if (SerialDebug)
     serial_loop();
   auxtest_loop();
-  if (bt_check_connection()) {
-    if (bt_mode == bt_mode_aux)
-      bt_aux_rx();
-  }
   bus_loop(&auxbus);
+  if (bt_mode == bt_mode_aux)
+    bt_aux_loop();
   if (auxrelay_detected)
     bus_loop(&auxrelay);
   musb_loop();
