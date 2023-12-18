@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.26"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-14"
+#define VERSION "v8.27"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-17"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,8 +37,18 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.27 2023-12-17
+ *  -- Tighten up command parsing and also make it mostly case-independent, except for single-letter commands.
+ *  -- Add new "send" command.  Requires device and at least one (hex) command byte as args. Eg.  send ALT fe
+ *  -- Decode/display Evolution battery state when tracing.
+ *  -- New 'D' command to toggle discarding of MC ACK responses to SSAG: reduces traffic on Relay bus.
+ *  -- Reduce AUXBUS_TXQ_SIZE from 32 to 16; it rarely gets as high as 8; SSAG AutoGuiding may need more than 8.
+ *  -- Add routing table: keep track of which devices are on which bus.
+ *  -- p3000: Close connection before completing "reset" command.
+ *  -- Ethernet: Add Ethernet support to HBG3.  Uses same pins as Stepper Motor, so either/or for those two.
+ *  -- Ethernet: Enable more than one client at a time for myDHCP Server.
  * Version 8.26 2023-12-14
- *  -- Bluetooth: Make debug easier: keep WiFi on when musb.rfenable is 1.
+ *  -- Bluetooth: Make debug easier: always keep WiFi on when musb.rfenable is 1.
  *  -- Bluetooth: New 'b' command to toggle Bluetooth debug on/off.
  *  -- Bluetooth: Don't forward AUX packets to BT until handshake is completed.
  *  -- Bluetooth: Show BT-Handshake state on OLED and status command.
@@ -64,23 +74,6 @@
  *  -- AIO: Fix hangs when switching ethernet client/server modes.
  *  -- Ensure only char* is used with SERIAL_PRINTLN(), not Strings or QStrings.
  *  -- Implement Push-to-Reset on OLED connection status screen.
- * Version 8.21 2023-12-01
- *  -- Change "Not Connected" to "No Session"
- *  -- Change "W2 Connected" to "WiFi Connected"
- *  -- Change "W3 Connected" to "WiF3 Connected"
- *  -- Change "E2 Connected" to "Eth Connected"
- *  -- Change "E3 Connected" to "Eth3 Connected"
- * Version 8.20 2023-12-01
- *  -- Light up BLUE LED while calibrating a newly plugged-in Nunchuck after boot.
- *  -- New NVRAM variable for "focus.limits".
- *  -- New OLED interface for FOCUS status and setting of FOCUS limits.
- *  -- Don't show GPS on OLED unless detected.
- *  -- Fix factory reset function: wasn't working after v8.19.
- * Version 8.19 2023-11-29
- *  -- OLED: Revamp longpresses (major update).
- *  -- Fix minor bug in new Evo WiFi logic.
- *  -- New 'a' command for toggling whether w2000/bt/musb packets are shown when tracing.
- *  -- By default, show only AUX/Relay packets when tracing.
  *
  * Random note:
  *   For Camera shutter release triggering via RTS:
@@ -96,9 +89,9 @@
 #define EMULATE_SSAA              true  // When true, include code for StarSense AutoAlign  simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
-#define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor.
+#define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor. PIN conflict with Ethernet.
+#define ETHERNET_ENABLED          true  // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
 
-#define ETHERNET_ENABLED          false // Do not edit this line.  See "aio.h" instead.
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
 #define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
 
@@ -167,21 +160,16 @@ static byte thermistor_pins [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs
 static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUXRELAY pins.
 #endif
 
-// Temporary arrangement(?):  first include of this file defines PINs
-#ifdef __has_include
-  #if __has_include("aio.h")
-    #warning "Including aio.h"
-    #include "aio.h"
-  #endif
+// The first include of this file defines PINs.
+#if __has_include("aio.h")
+  #include "aio.h"
 #endif
 
 #if EMULATE_DEW
-  #define ADC_VREF_ENABLE       true    // When true, thermistor readings will use the factory-calibrated VREF value.
-  #ifdef __has_include
-    #if __has_include("ADC_LUT.h")
-      #warning "Including ADC_LUT.h"
-      #include "ADC_LUT.h"
-    #endif
+  #define ADC_VREF_ENABLE true    // When true, thermistor readings will use the factory-calibrated VREF value.
+  #if __has_include("ADC_LUT.h")
+    #warning "Including ADC_LUT.h"
+    #include "ADC_LUT.h"
   #endif
 #endif /* EMULATE_DEW */
 
@@ -199,6 +187,12 @@ static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUX
 #include <Wire.h>
 #include "BluetoothSerial.h"
 
+#define P2000_ACTIVITY_TIMEOUT   (4 * 1000)     // Close port 2000 connection when idle this long
+
+typedef unsigned long long  u64;
+typedef unsigned long       ulong;
+typedef unsigned int        uint;
+
 BluetoothSerial        bt;
 enum                   {BT_IDLE, BT_BOOTLOADER, BT_WAITBAUD, BT_SETBAUD, BT_HSDONE};
 static byte            bt_auxstate  = BT_IDLE;  // state machine for CPWI initial handshake.
@@ -207,6 +201,7 @@ static bool            bt_connected = 0;        // BT Session established.
 static bool            bt_ready     = false;    // BT Session is ready for AUX protocol packets
 static long            bt_handshake = 0;        // timer for parts of CPWI initial handshake.
 static long            bt_active    = 0;        // BT Session has recent activity: an app is connected.
+static long            esp32_reset_pending  = 0; // Timer for resets of the HBG3
 
 /*
  * There is no serial "debug" port if (musb_selected && auxrelay_detected).
@@ -220,6 +215,7 @@ HardwareSerial          auxbus_uart(2); // auxbus
 HardwareSerial         *SerialDebug = NULL; // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
 HardwareSerial         *musb_uart;      // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
 
+typedef unsigned long long u64;
 typedef unsigned long ulong;
 typedef unsigned int  uint;
 
@@ -248,7 +244,22 @@ static bool p3000_debug         = false;  // When true, serial debug commands/ou
 static long nvram_delayed_save   = 0;
 static long nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
 
-#if ETHERNET_ENABLED
+#if ETHERNET_ENABLED && !defined(AIO_H)
+  #if __has_include("eth.h")
+    #warning "Including support for Wiznet W5x00 Ethernet modules"
+  #else
+    #undef  ETHERNET_ENABLED
+    #define ETHERNET_ENABLED false
+  #endif
+#endif /* ETHERNET_ENABLED && !defined(AIO_H) */
+
+#if ETHERNET_ENABLED  /* do NOT combine this with the #if above!! */
+  #ifndef AIO_H
+    #define ETHERNET_SS_PIN 5  // AIO has a different SS_PIN for Ethernet.
+    static inline bool read_ethernet_client_mode_switch (void) { return (READ_WIFI_MODE_PIN() == LOW); }
+  #endif
+  #include "eth.h"
+  static bool ethernet_detected = false;
   static char p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
   #define E3000_ENDLINE() do { e3000.write("\r\n"); e3000.flush(); } while (0)
 #else
@@ -283,7 +294,7 @@ static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
 #define ADAPTER_VERSION           DEFAULT_SSID "AMW007-9.0.0.0, " VERSION_DATE "T12:00:00Z, " HBG3_NAME "-"
 // Celestron reports: "ZENTRI-AMW007-1.2.0.10, 2017-07-28T07:43:27Z, ZentriOS-WL-1.2.0.10, Board:N/A");
 
-#define AUXBUS_TXQ_SIZE           32  // Large (32) seems to be needed for reliable Bluetooth.
+#define AUXBUS_TXQ_SIZE           16  // Was 32, but much lower seems to be enough now.
 #define AUXBUS_PKT_MAX            16  // Max length of a regular 0x3b style auxbus packet.
 #define AUXBUS_SSAA_PKT_MAX       848 // Theoretically up to 2470 bytes.  In practice, nothing is ever larger than about 832 bytes.
 
@@ -431,15 +442,6 @@ static const struct devnames_s {
 };
 #define N_DEVNAMES (sizeof(devnames) / sizeof(struct devnames_s))
 
-static byte name_to_dev (const char *name)
-{
-  for (byte i = 0; i < N_DEVNAMES; ++i) {
-    if (0 == strcasecmp(name, devnames[i].name))
-      return devnames[i].dev;
-  }
-  return DEV_FF;
-}
-
 static const char *dev_to_name (byte dev, bool full_name)
 {
   static const struct devnames_s *prev = devnames;
@@ -467,6 +469,7 @@ struct auxdev_op_s {
 #define DEV_GET_VERSION                0xfe
 #define DEV_GET_MODEL                  0x05
 #define DEV_PROGRAM_ENA                0x8a
+#define DEV_BAD_OP                     0xf0  // Devices return 'f0 xx' when 'xx' is an unsupported opcode
 
 // Motor Controller ops:
 #define MC_GET_POS                     0x01
@@ -700,7 +703,6 @@ static const struct auxdev_op_s aux_ssaa_ops[] = {
 #define SSAG_GET_PLATE_STATUS          0x02  // 9-bytes in: 00..=inProgress;  otherwise 01.. :  PlateSolveResult(SOLVED, RaDec(155.184971527816 degs, 69.1558292709192 degs)) 01-40-2D-57-E1-3F-9A-7E-E0
 #define SSAG_START_CALIBRATE           0x03  // 8-bytes out, ack: RaDec(213.908604168867 degs, 19.1693596951982 degs) 40-6E-F0-2E-3E-AB-4C-8E
 #define SSAG_GET_CALIBRATE_STATUS      0x04  // 5-bytes in:  00..=inProgress; otherwise 01/ff xx.. :  CenterCalibrationStatus(SOLVED, x=65134, y=64192) 01-FE-6E-FA-C0
-#define SSAG_06                        0x06  // 10-bytes out, 8-bytes in
 #define SSAG_07                        0x07  // 1-byte in (00,01)
 #define SSAG_SET_GUIDING               0x20  // 1-byte out, ack;  00=disabled; 69: west=True altaz=True
 #define SSAG_GET_GUIDING_DATA          0x23  // 10-bytes in:  Error(0, 0) Correction(0, 0) MoveRa = False MoveDec = False StopAll = TrueGuideStars = 0Quality = 0 00-00-00-00-91-00-00-00-00-00
@@ -714,9 +716,6 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   AUX_DEV_OP(SSAG_GET_PLATE_STATUS),
   AUX_DEV_OP(SSAG_START_CALIBRATE),
   AUX_DEV_OP(SSAG_GET_CALIBRATE_STATUS),
-  AUX_DEV_OP(SSAG_06),  // FIXME: does this really exist?
-                        // auxbus_rx: 3b 0d 0d b9 06 40 09 49 2d 3f c4 7c 2e 3e 1f 5e    [HC5    -> SSAG  ]
-                        // auxbus_rx: 3b 0b b9 0d 06 40 11 d2 9e 3f c6 3f e0 44          [SSAG   -> HC5   ]
   AUX_DEV_OP(SSAG_07),
   AUX_DEV_OP(SSAG_SET_GUIDING),
   AUX_DEV_OP(SSAG_GET_GUIDING_DATA),
@@ -727,22 +726,24 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   {0xff, NULL}
 };
 
-#define SET_EVO_WIFI   0x10
-#define UART_SET_BAUD  0x51
+#define SET_EVO_WIFI        0x10
+#define BATT_GET_VOLTAGE    0x10
+#define BATT_MAX_CURRENT    0x18
+#define LEDS_GET_LEVEL      0x10
+#define PWRCHG_GET_MODE     0x10
+#define UART_SET_BAUD       0x51
 
 // Oddball ops:
 static const struct auxdev_oddball_s {
   byte dev;
-  byte op;
-  const char *name;
+  struct auxdev_op_s op_name;
 } aux_oddball_ops[] = {
-  {DEV_BATT,   0x10, "BATT_GET_VOLTAGE"},
-  {DEV_BATT,   0x18, "BATT_GET CURRENT"},
-  {DEV_PWRCHG, 0x10, "BATT_GET_MODE"},
-  {DEV_BATT,   0x10, "BATT_GET_VOLTAGE"},
-  {DEV_LEDS,   0x10, "LEDS_GET_LEVEL"},
-  {DEV_UART,   UART_SET_BAUD, "SET_BAUD"},
-  {DEV_EVWIFI, SET_EVO_WIFI, "SET_EVO_WIFI"},
+  {DEV_BATT,   AUX_DEV_OP(BATT_GET_VOLTAGE)},
+  {DEV_BATT,   AUX_DEV_OP(BATT_MAX_CURRENT)},
+  {DEV_LEDS,   AUX_DEV_OP(LEDS_GET_LEVEL)},
+  {DEV_PWRCHG, AUX_DEV_OP(PWRCHG_GET_MODE)},
+  {DEV_UART,   AUX_DEV_OP(UART_SET_BAUD)},
+  {DEV_EVWIFI, AUX_DEV_OP(SET_EVO_WIFI)},
   {0xff, 0xff, NULL}
 };
 
@@ -902,6 +903,10 @@ static const char *op_decoder (byte *data)
       return get_model_decoder(data);
     return "GET_MODEL";
   }
+  if (op == DEV_BAD_OP) {
+    SERIAL_PRINTF("BAD_OP 0x%02x", data[5]);
+    return NULL;
+  }
   if (ENABLE_SHOW_POS_DEGREES) {
     if (src == DEV_AZM || src == DEV_ALT) {
       if (op == MC_GET_POS) {
@@ -947,9 +952,26 @@ static const char *op_decoder (byte *data)
         return op_lookup(op, aux_mc_ops);
       return op_lookup(op, aux_ssag_ops);
   }
-  for (const struct auxdev_oddball_s *d = aux_oddball_ops; d->name; ++d) {
-      if (dst == d->dev && op == d->op)
-        return d->name;
+  if (src == DEV_BATT && op == BATT_MAX_CURRENT) {
+    uint bc = ((uint)data[5] << 8) | data[6];
+    SERIAL_PRINTF(" BATT_MAX_CURRENT %u.%03uA", bc / 1000, bc % 1000);
+    return NULL;
+  }
+  if (src == DEV_BATT && op == BATT_GET_VOLTAGE) {
+    const char *state;
+    ulong bv = (((ulong)data[7] << 24) | ((ulong)data[8] << 16) | ((ulong)data[9] << 8) | data[10]) / 1000;
+    switch (data[5] & 3) {
+      case 00: state = "Discharging"; break;
+      case 01: state = "Charging";    break;
+      case 02: state = "Charged";     break;
+      default: state = "ChargeFault"; break;
+    }
+    SERIAL_PRINTF(" BATT_GET_VOLTAGE %s %u.%02uV", state, bv / 1000, bv % 1000);
+    return NULL;
+  }
+  for (const struct auxdev_oddball_s *d = aux_oddball_ops; d->op_name.name; ++d) {
+      if (dst == d->dev && op == d->op_name.op)
+        return d->op_name.name;
   }
   if (op == MC_SEND_WARNING || op == MC_SEND_ERROR) {
     if (src == DEV_AZM || src == DEV_ALT) {
@@ -1008,14 +1030,15 @@ static struct rxbuf_s {
 } w2000_rxbuf, bt_rxbuf;
 
 #if ETHERNET_ENABLED
-static struct rxbuf_s e2000_rxbuf;
-static void e2000_tx (byte *data, uint16_t len);
+  static struct rxbuf_s e2000_rxbuf;
+  static void e2000_tx (bool from_ssaa, byte *data, uint16_t count);
 #endif
 
 static void init_rxbuf (struct rxbuf_s *rxbuf, const char *name)
 {
   memset(rxbuf, 0, sizeof(*rxbuf));
   strcpy(rxbuf->name, name);
+  routing_remove_sofware_devs();
 }
 
 enum {pkt_fail, pkt_ssinprogress, pkt_inprogress, pkt_complete, pkt_sscomplete};
@@ -1051,9 +1074,14 @@ struct txq_s {
   uint16_t        last_tx_len;
   byte            last_tx[AUXBUS_SSAA_PKT_MAX];
   ulong           pending_baud;
+#define TXQ_MONITOR_SIZE true
+#if TXQ_MONITOR_SIZE
+  byte            pkts_in_use;
+  byte            pkts_max;
+#endif
 };
 
-static void txq_advance_tail (struct txq_s *txq)
+static inline void txq_advance_tail (struct txq_s *txq)
 {
   txq->tail++;
   if (txq->tail >= AUXBUS_TXQ_SIZE)
@@ -1063,6 +1091,9 @@ static void txq_advance_tail (struct txq_s *txq)
 
 static void txq_free_pkt (struct txq_s *txq, struct pkt_s *p)
 {
+#if TXQ_MONITOR_SIZE
+  txq->pkts_in_use--;
+#endif
   if (p->indirect_data) {
     p->indirect_data = false;
     byte *pdata = *(byte **)p->data;
@@ -1215,6 +1246,76 @@ static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *name
   return true;
 }
 
+/*
+ * Keep track of which connection various devices has been seen on,
+ * and don't send packets destined for it to anywhere else.
+ */
+#define MAX_ROUTES 20
+static struct dev_route_s {
+  byte             dev;
+  struct rxbuf_s  *route;
+} routing_table[MAX_ROUTES] = {{0,NULL},};  // one extra for zero-termination
+
+static byte num_routes = 0;
+
+static bool routing_check_dev (byte dev, struct rxbuf_s *route)
+{
+  for (byte i = 0; i < num_routes; ++i) {
+    struct dev_route_s *db = routing_table + i;
+    if (db->dev == dev)
+      return (db->route && db->route == route);
+  }
+  return true;
+}
+
+static void routing_add_dev (byte dev, struct rxbuf_s *route)
+{
+  byte i, empty_slot = (MAX_ROUTES - 1);
+  for (i = 0; i < num_routes; ++i) {
+    struct dev_route_s *db = &routing_table[i];
+    if (db->dev == dev)
+      return;  // don't check or update the route: it cannot change, and echo-backs could confuse us!
+    if (!db->dev && i < empty_slot)
+      empty_slot = i;
+  }
+add_route:
+  if (empty_slot < num_routes) {
+    i = empty_slot;
+  } else {
+    if (num_routes < MAX_ROUTES)
+      num_routes++;
+    i = num_routes - 1;  // Re-uses final slot when table is full.
+  }
+  struct dev_route_s *db = &routing_table[i];
+  db->dev   = dev;
+  db->route = route;
+  SERIAL_PRINTF("routing[%u]: %s (%02x) on %s\r\n", i, dev_to_name(dev, false), dev, route ? route->name : "NULL");
+}
+
+static void routing_remove_dev (byte dev)
+{
+  for (byte i = 0; i < num_routes; ++i) {
+    struct dev_route_s *db = &routing_table[i];
+    if (db->dev == dev) {
+       struct rxbuf_s *route = db->route;
+       db->dev = 0;
+       db->route = NULL;
+       if (i == (num_routes - 1))
+         --num_routes;
+       SERIAL_PRINTF("routing[%u]: %s (%02x) removed from %s\r\n", i, dev_to_name(dev, false), dev, route ? route->name : "NULL");
+       return;
+    }
+  }
+}
+
+static void routing_remove_sofware_devs (void)
+{
+  // The various "software" devices can move around when the connection method changes.
+  // So remove all them when closing a connection. The known ones use 0x2x device numbers:
+  for (byte dev = 0x20; dev <= 0x2f; ++dev)
+    routing_remove_dev(dev);
+}
+
 static inline void auxbus_raw_break (void)
 {
   if (auxbus_raw_count) {
@@ -1232,7 +1333,13 @@ static void print_packet (const char *prefix1, const char *prefix2, byte *data, 
   const char *opname = NULL;
 
   if (aux_only_tracing) {
-    if (0 == strncmp(prefix1, "w2000_", 6) || 0 == strncmp(prefix1, "musb_", 5) || 0 == strncmp(prefix1, "bt_", 3))
+    char c = *prefix1;
+    if ((c == 'w' && 0 == strncmp(prefix1, "w2000_", 6))
+     || (c == 'b' && 0 == strncmp(prefix1, "bt_",    3))
+#if ETHERNET_ENABLED
+     || (c == 'e' && 0 == strncmp(prefix1, "e2000_", 6))
+#endif
+     || (c == 'm' && 0 == strncmp(prefix1, "musb_",  5)))
       return;
   }
   if (prefix2 == TIMED_OUT) {
@@ -1283,8 +1390,15 @@ static void update_checksum (byte *data)
 
 static void tx_enq (struct rxbuf_s *from_rxbuf, struct bus_s *bus, byte forward, bool regular_pkt, const byte *data, uint16_t len)
 {
-  if (bus == &auxrelay && !auxrelay_detected)
-    return;
+  if (!auxrelay_detected) {
+    if (bus == &auxrelay)
+      return;
+  } else if (regular_pkt) {
+    byte dst = data[3];
+    if (!routing_check_dev(dst, bus->rxbuf))  // Destination is "bus->rxbuf", not "from_rxbuf"
+      return;
+  }
+
   struct txq_s *txq = bus->txq;
   struct pkt_s *p = &txq->pkts[txq->head];
   if (p->len != 0) {
@@ -1293,6 +1407,13 @@ static void tx_enq (struct rxbuf_s *from_rxbuf, struct bus_s *bus, byte forward,
     bus->rxbuf->discard_len = 0;
     return;
   }
+#if TXQ_MONITOR_SIZE
+  txq->pkts_in_use++;
+  if (txq->pkts_in_use > txq->pkts_max) {
+    txq->pkts_max = txq->pkts_in_use;
+    SERIAL_PRINTF("%s: pkts_max=%u\r\n", txq->name, txq->pkts_max);
+  }
+#endif
   p->regular_pkt = regular_pkt;
   p->from_rxbuf = from_rxbuf;  // needed for internally handled requests (eg. GPS)
   p->forward = forward;
@@ -1331,11 +1452,8 @@ static void auxbus_send_msg (byte *data, uint16_t len)
     update_checksum(data);
   }
   tx_enq(NULL, &auxbus, forward_yes, regular_pkt, data, len);
-  if (auxrelay_detected) {
-    byte dst = data[3];
-    if (dst != DEV_ALT && dst != DEV_AZM && dst != DEV_ESP32 && dst != DEV_DUMMY)
-      tx_enq(NULL, &auxrelay, forward_no, regular_pkt, data, len);  // Needed for Nunchuck controlling Focus Motor, and SSAA tests
-  }
+  if (auxrelay_detected)
+    tx_enq(NULL, &auxrelay, forward_no, regular_pkt, data, len);  // Needed for Nunchuck controlling Focus Motor, and SSAA tests
 }
 
 #define AUXBUS_SEND_MSG(...) do { byte _msg[] = {0x3b, 0x00, __VA_ARGS__, 0x00}; auxbus_send_msg(_msg, sizeof(_msg)); } while (0)
@@ -1364,8 +1482,8 @@ static void monitor_musb_switch (void)
     SERIAL_PRINTF("MUSB switch changed to %s\r\n", musb_switch_is_on ? "LOW" : "HIGH");
   } else if (musb_switch_timer && time_after(millis(), musb_switch_timer)) {
     SERIAL_PRINTLN("MUSB switch reset triggered");
-    delay(50);
-    ESP.restart();
+    musb_switch_timer = 0;
+    esp32_reset_pending = get_timeout(50);
   }
 }
 
@@ -2148,6 +2266,7 @@ static inline byte gps_get_lat_lng (int32_t *lat, int32_t *lng)
     *lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
     return true_fix;
   }
+  //FIXME Get Time/Date from internet if possible (access point mode) for quicker "Restore"
   if (gps_has_date_time) {
     if (gps_has_recent_location) {
       *lat = gps_recent_lat * GPS_MULT_FACTOR;
@@ -2409,7 +2528,7 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
         reply[len++] = 0x00;
       } else {
         cmd_timer = 0;
-        reply[len++] = 0x01;  // FIXME: this should be different for each of three runs
+        reply[len++] = 0x01;  // Ideally this should be different for each of three runs
         reply[len++] = 0x40;
         reply[len++] = 0xa5;
         reply[len++] = 0x88;
@@ -2442,19 +2561,8 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
       }
       break;
     }
-    case OP(SSAG_06,13): {                   // 10-bytes out, 8-bytes in
-      reply[len++] = 0x40;
-      reply[len++] = 0x11;
-      reply[len++] = 0xd2;
-      reply[len++] = 0x9e;
-      reply[len++] = 0x3f;
-      reply[len++] = 0xc6;
-      reply[len++] = 0x3f;
-      reply[len++] = 0xe0;
-      break;
-    }
     case OP(SSAG_07,3): {                    // 1-byte in (00,01)
-      reply[len++] = 0x00;
+      reply[len++] = 0x01;
       break;
     }
     case OP(SSAG_SET_GUIDING,4): {           // 1-byte out:  00=disabled; 69: west=True altaz=True
@@ -2859,10 +2967,10 @@ static byte        stepper_driver         = STEPPER_DRIVER_NONE;  // Do not edit
 
 // These are the four pins used for either type of stepper motor:
 enum {
-  STEPPER_PIN_A = 23,
-  STEPPER_PIN_B = 19,
-  STEPPER_PIN_C = 18,
-  STEPPER_PIN_D =  5
+  STEPPER_PIN_A = 23,  // (potential conflict with [Ethernet] SPI MOSI)
+  STEPPER_PIN_B = 19,  // (potential conflict with [Ethernet] SPI MISO)
+  STEPPER_PIN_C = 18,  // (potential conflict with [Ethernet] SPI SCLK)
+  STEPPER_PIN_D =  5   // (potential conflict with [Ethernet] SPI SS/CS)
 };
 
 // STEP/DIR driver chips use the pins like this:
@@ -2907,9 +3015,9 @@ static void stepper_autodetect (void)
   }
   stepper_disable_pins();
   if (stepper_driver == STEPPER_DRIVER_NONE)
-    SERIAL_PRINTF("%s: stepper not detected, Focus Motor emulation disabled.\r\n", __func__);
+    SERIAL_PRINTF("Stepper driver not detected, Focus Motor emulation disabled.\r\n", __func__);
   else
-    SERIAL_PRINTF("%s: detected %s stepper driver, Focus Motor emulation enabled.\r\n", __func__, STEPPER_DRIVER_NAMES[stepper_driver]);
+    SERIAL_PRINTF("Detected %s stepper driver, Focus Motor emulation enabled.\r\n", __func__, STEPPER_DRIVER_NAMES[stepper_driver]);
 }
 
 // STEP/DIR drivers use the FastAccelStepper library:
@@ -5066,13 +5174,14 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
   } else if (esp32_wifi_off) {
     oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : "WiFi is off");
 #if ETHERNET_ENABLED
-    snprintf(tmp, OLED_ROW_CHARS,   "Eth DHCP %s", ethernet_client_mode ? "Client" : "Server");
-    oled_set_row(2, tmp);
-    snprintf(tmp, OLED_ROW_CHARS,   "Eth %s", Ethernet.localIP().toString().c_str());
-    oled_set_row(3, tmp);
-#else
-    oled_clear(2);
+    if (ethernet_detected) {
+      snprintf(tmp, OLED_ROW_CHARS,   "Eth DHCP %s", ethernet_client_mode ? "Client" : "Server");
+      oled_set_row(2, tmp);
+      snprintf(tmp, OLED_ROW_CHARS,   "Eth %s", Ethernet.localIP().toString().c_str());
+      oled_set_row(3, tmp);
+    } else
 #endif /* ETHERNET_ENABLED */
+     oled_clear(2);
   } else {
     const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
     if (WIFIRELAY_ENABLED && wifi_relay_mode)
@@ -5089,7 +5198,7 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
     if (!oled_timer)
       oled_timer = get_timeout(4500);
   } else if (arg == oled_timeout) {
-    ESP.restart();
+    esp32_reset_pending = get_timeout(50);
   }
   return true;
 }
@@ -5201,13 +5310,9 @@ static void oled_send_image (byte *image, unsigned int image_size)
 static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
 {
   static bool need_redraw = false;
-  static long doing_reset = 0;
 
   if (arg == oled_firstcall) {
     need_redraw = true;
-  } else if (doing_reset) {
-    if (time_after(millis(), doing_reset))
-      ESP.restart();
   } else if (arg == oled_longpress) {
     if (!oled_timer) {
       oled_timer = get_timeout(9 * 1000 + 500);
@@ -5219,17 +5324,16 @@ static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
     need_redraw = true; // In case button is not held long enough to begin the reset
     return true;
   } else if (arg == oled_timeout) {
-    doing_reset = get_timeout(2000);
     SERIAL_PRINTLN("Factory Reset");
     oled_set_row(2, "");
     oled_set_row(3, "Doing FACTORY RESET");
     nvram_load_defaults();
     nvram_save();
     need_redraw = false;
+    esp32_reset_pending = get_timeout(2000);
   }
   if (need_redraw) {
     need_redraw = false;
-    doing_reset = 0;
     if (oled_type == &Adafruit128x64) {
       oled_send_image(QRcode_image, sizeof(QRcode_image));
     } else {
@@ -5339,7 +5443,6 @@ static void oled_loop (void)
       } else if (time_after(millis(), modepin_low)) {
         if (oled_timer && time_after(millis(), oled_timer))
           arg = oled_timeout;
-        //if (arg != oled_longpress)
         else
           arg = oled_longpress;
       }
@@ -5605,6 +5708,8 @@ static byte decode_starsense (struct rxbuf_s *rxbuf, byte b)
   return packet_reset(rxbuf, ret);
 }
 
+static bool ssag_discard_mc_acks = false;
+
 static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
 {
 restart:
@@ -5622,14 +5727,13 @@ restart:
     }
     return packet_reset(rxbuf, pkt_fail);
   }
-#if 1  // SSAG on relay observed to send 0x3b 0x06, then repeat them with the rest of the packet..
   if ((b == 0x3b || b == 0x3c) && rxbuf->len <= 4) {  // Okay, because no devices use 0x3b/0x3c as DEV_id
+    // SSAG on relay observed to send 0x3b 0x06, then repeat them with the rest of the packet..
+    print_packet(rxbuf->name, "Collsion", rxbuf->data, rxbuf->len);
     packet_reset(rxbuf, pkt_fail);
     rxbuf->len = 0;
-    SERIAL_PRINTF("RS_%02x\r\n", b);
     goto restart;
   }
-#endif
   rxbuf->csum += b;
   if (rxbuf->len == 2) {
     //if (b < 3 || b > (sizeof(rxbuf->data) - 3)) {
@@ -5657,22 +5761,40 @@ restart:
     return packet_reset(rxbuf, pkt_fail);
   }
 
-  // Suppress echo-back of most recently transmitted command:
+  // Handle a fully completed packet:
+
   struct bus_s *bus = rxbuf->bus;
   if (bus && rxbuf->len == bus->txq->last_tx_len) {
     if (0 == memcmp(rxbuf->data, bus->txq->last_tx, rxbuf->len)) {
-      rxbuf->len = 0;  // eat it
+      rxbuf->len = 0;  // Suppress echo-back of most recently transmitted command:
       return packet_reset(rxbuf, pkt_fail);
     }
   }
 
-  // Handle a fully completed packet:
+  byte src = rxbuf->data[2];
+  byte dst = rxbuf->data[3];
+
+  if (!routing_check_dev(src, rxbuf)) {  // Drop echo-backs for devices we know are NOT on this link
+    // This is where routing gets used even if no auxrelay_detected: keeping local traffic off of WiFi/BT/MUSB/ETH
+    rxbuf->len = 0;  // eat it
+    return packet_reset(rxbuf, pkt_fail);
+  }
+  rxbuf->requestor = src;  // Used to select packets for forwarding over WiFi/BT/MUSB/ETH
+  routing_add_dev(src, rxbuf);
+
   if (TVERBOSE(rxbuf->data))
       print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
 
-  byte src = rxbuf->data[2];
-  byte dst = rxbuf->data[3];
-  rxbuf->requestor = src;  // Used to prevent forwarding this packet back to originator
+#if 1 //FIXME ?
+  if (ssag_discard_mc_acks) {
+    // SSAG doesn't need acks back from the motor controllers, so discard those:
+    if (dst == DEV_SSAG && (src == DEV_ALT || src == DEV_AZM) && rxbuf->data[1] == 0x03) {
+      rxbuf->len = 0;  // eat it
+      return packet_reset(rxbuf, pkt_fail);
+    }
+  }
+#endif
+
   bus_autodetect_ssforward(bus, src, dst);
   byte op = rxbuf->data[4];
 
@@ -5702,7 +5824,6 @@ static void bt_setup (void)
   }
   if (bt_debug)
     SERIAL_PRINTF("bt_enabled=%u\r\n", bt_enabled);
-
 }
 
 static inline void bt_restart (void)
@@ -5812,7 +5933,7 @@ static inline void bt_aux_loop (void)
     do {
       bt_aux_rx();
     } while (bt.available());
-    bt_active = get_timeout(4000);
+    bt_active = get_timeout(P2000_ACTIVITY_TIMEOUT);
     return;
   }
   if (!bt_check_connection())
@@ -5863,13 +5984,22 @@ static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
   if (!rxbuf) {
     tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
   } else {
-    rxbuf->requestor = DEV_FF;
+    if (!rxbuf->bus && aux_only_tracing && TVERBOSE2(from_ssaa, data)) {
+      // This ensures we always see emulated device transactions in full:
+      aux_only_tracing = false;
+      print_packet(rxbuf->name, NULL, data, len);
+      aux_only_tracing = true;
+    }
     if (rxbuf->bus)
       tx_enq(NULL, rxbuf->bus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
     else if (rxbuf == &w2000_rxbuf)
       w2000_tx(from_ssaa, data, len);
     else if (rxbuf == &bt_rxbuf)
       bt_tx(from_ssaa, data, len);
+#if ETHERNET_ENABLED
+    else if (ethernet_detected && rxbuf == &e2000_rxbuf)
+      e2000_tx(from_ssaa, data, len);
+#endif /* ETHERNET_ENABLED */
     else if (rxbuf == &musb_rxbuf)
       musb_tx(from_ssaa, data, len);
     else
@@ -6125,29 +6255,23 @@ static void forward_from_bus_to_outside (struct rxbuf_s *rxbuf, byte status, byt
   // Echo packet to w2000 (wifi), unless it came from w2000:
   if (!regular_pkt || src != w2000_rxbuf.requestor)
     w2000_tx(from_ssaa, data, len);
-  if (regular_pkt && dst == w2000_rxbuf.requestor)
-    w2000_rxbuf.requestor = DEV_FF;
 
   // Echo packet to bt, unless it came from bt:
   if (bt_ready && (!regular_pkt || src != bt_rxbuf.requestor))
     bt_tx(from_ssaa, data, len);
-  if (regular_pkt && dst == bt_rxbuf.requestor)
-    bt_rxbuf.requestor = DEV_FF;
 
 #if ETHERNET_ENABLED
-  // Echo packet to e2000 (ethernet), unless it came from e2000:
-  if (!regular_pkt || src != e2000_rxbuf.requestor)
-    e2000_tx(data, len);
-  if (regular_pkt && dst == e2000_rxbuf.requestor)
-    e2000_rxbuf.requestor = 0;
+  if (ethernet_detected) {
+    // Echo packet to e2000 (ethernet), unless it came from e2000:
+    if (!regular_pkt || src != e2000_rxbuf.requestor)
+      e2000_tx(from_ssaa, data, len);
+  }
 #endif /* ETHERNET_ENABLED */
 
   if (musb_selected) {
     // Echo packet to Mount-USB, unless it came from there:
     if (!regular_pkt || src != musb_rxbuf.requestor)
       musb_tx(from_ssaa, data, len);
-    if (regular_pkt && dst == musb_rxbuf.requestor)
-      musb_rxbuf.requestor = DEV_FF;
   }
 }
 
@@ -6577,9 +6701,9 @@ static bool nvram_get_bool (const char *name)
 {
   const char *val = nvram_get_val(name);
   if (val && *val) {
-    if (0 == strcmp(val, "1") || 0 == strcmp(val, "true"))
+    if (0 == strcmp(val, "1") || 0 == strcasecmp(val, "true"))
       return true;
-    if (0 == strcmp(val, "0") || 0 == strcmp(val, "false"))
+    if (0 == strcmp(val, "0") || 0 == strcasecmp(val, "false"))
       return false;
     *(char *)val = '\0';  // Fix bad value
     nvram_delayed_save = get_timeout(nvram_save_val_delay);
@@ -6693,13 +6817,17 @@ static void nvram_restore ()
   dew_max_amperage[0] = dew_nvram_restore_amperage(0);
   dew_max_amperage[1] = dew_nvram_restore_amperage(1);
   tmp = atoi(nvram_get_val("dew0.aggression"));
-  if (tmp >= 0 && tmp <= 10) dew_aggression[0] = tmp;
+  if (tmp >= 0 && tmp <= 10)
+    dew_aggression[0] = tmp;
   tmp = atoi(nvram_get_val("dew1.aggression"));
-  if (tmp >= 0 && tmp <= 10) dew_aggression[1] = tmp;
+  if (tmp >= 0 && tmp <= 10)
+    dew_aggression[1] = tmp;
   tmp = atoi(nvram_get_val("dew0.manual.pwm"));
-  if (tmp >= 0 && tmp <= 100) dew_manual_pwm[0] = tmp;
+  if (tmp >= 0 && tmp <= 100)
+    dew_manual_pwm[0] = tmp;
   tmp = atoi(nvram_get_val("dew1.manual.pwm"));
-  if (tmp >= 0 && tmp <= 100) dew_manual_pwm[1] = tmp;
+  if (tmp >= 0 && tmp <= 100)
+    dew_manual_pwm[1] = tmp;
 #endif
 #if OTA_ENABLED
   nvram_get_nonblank_val("ota.update.server", ota_update_server);
@@ -6934,8 +7062,13 @@ static void manage_esp32_wifi (bool want_off)
 static void manage_wifi_onoff ()
 {
   // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
-  manage_esp32_wifi(musb_rfkill && (bt_connected || musb_selected));
-  manage_evo_wifi  (bt_connected || musb_connected || (!esp32_wifi_off && w2000.connected()));
+  bool others_active = (bt_connected || musb_selected);
+#if ETHERNET_ENABLED
+  others_active |= ethernet_detected && e2000.connected();
+#endif
+  manage_esp32_wifi(others_active && musb_rfkill);
+  others_active |= (!esp32_wifi_off && w2000.connected());
+  manage_evo_wifi(others_active);
 }
 
 // **** Begin OTA Firmware Update **************************************************************************************
@@ -7029,9 +7162,15 @@ static void ota_exit (const char *msg)
     oled_write_row(3);
   }
 #endif
+  // A full reset is necessary regardless of the outcome, to re-enable AUX buses, WiFi, etc..
   SERIAL_PRINTLN(msg);
   delay(5000);
-  ESP.restart();  // Necessary, to re-enable AUX buses and WiFi etc.
+  w3000.stop();   // Close w3000 connection, if any
+#if ETHERNET_ENABLED
+  e3000.stop();   // Close e3000 connection, if any
+#endif
+  delay(100);
+  ESP.restart();
 }
 
 static ulong ota_clength = 0;
@@ -7144,6 +7283,7 @@ static const char help_serial_commands[] =
 #if EMULATE_DEW
   "d                 -- Toggle Dew-Controller debug on/off\r\n"
 #endif
+  "D                 -- Toggle discard of MC ACKs to SSAG on/off\r\n"
 #if EMULATE_FOCUS
   "f                 -- Toggle Focus-Motor debug on/off\r\n"
 #endif
@@ -7172,40 +7312,133 @@ static const char help_serial_commands[] =
   "ssaa_recentre N   -- Reset SSAA Camera centre point to 640,480 for Profile slot N: 0-2\r\n"
   ;
 
+static int get_hex_digit (char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+static int get_hex_byte_val (char **cmd_p)
+{
+  char *cmd = *cmd_p;
+  int x1, x2;
+
+  while (*cmd == ' ')
+    ++cmd;
+  if (cmd[0] == '0' && cmd[1] == 'x')
+    cmd += 2;
+  x1 = get_hex_digit(*cmd);
+  if (x1 == -1)
+    goto Huh;
+  x2 = get_hex_digit(*++cmd);
+  if (x2 == -1)
+    goto Huh;
+  if (*++cmd && *cmd != ' ')
+    goto Huh;
+  while (*cmd == ' ')
+    ++cmd;
+  *cmd_p = cmd;
+  return (x1 << 4) | x2;
+Huh:
+  SERIAL_PRINTF("Huh? \"%s\"\r\n", cmd);
+  return -1;
+}
+
+static bool match_word (const char *word, char **cmd_p, bool noargs)
+{
+  char *cmd = *cmd_p;
+  if (0 == strncasecmp(word, cmd, strlen(word))) {
+    cmd += strlen(word);
+    if (!*cmd || (!noargs && *cmd == ' ')) {
+      while (*cmd == ' ')
+        ++cmd;
+      *cmd_p = cmd;
+      return true;
+    }
+  }
+  return false;
+}
+
+static int get_dev_name (char **cmd_p)
+{
+  char *cmd = *cmd_p;
+  while (*cmd == ' ')
+    ++cmd;
+  if (!*cmd)
+    return -1;
+  for (byte i = 0; i < N_DEVNAMES; ++i) {
+    const char *devname = devnames[i].name;
+    if (match_word(devname, &cmd, false)) {
+      *cmd_p = cmd;
+      return devnames[i].dev;
+    }
+  }
+  return get_hex_byte_val(cmd_p);
+}
+
+static void handle_send_cmd (char *cmd)
+{
+  byte msg[AUXBUS_PKT_MAX], len = 0;
+  int val;
+
+  msg[len++] = 0x3b;
+  msg[len++] = 0;  // len, to be filled in after
+  msg[len++] = DEV_ESP32;
+
+  val = get_dev_name(&cmd);
+  if (val == -1)
+    return;
+  msg[len++] = val;
+  do {
+    val = get_hex_byte_val(&cmd);
+    if (val == -1)
+      return;
+    msg[len++] = val;
+  } while (*cmd && len < (AUXBUS_PKT_MAX - 1));
+  if (len < 5)
+    SERIAL_PRINTLN("Huh? missing opcode");
+  else
+    auxbus_send_msg(msg, ++len);
+}
+
+// These are used to restore settings to what they were before a p3000 connection changed them:
+static int p3000_orig_verbose   = -1;
+static int p3000_orig_trace_dev = -1;
+ 
 static bool handle_serial_commands (char *cmd)
 {
-  static const char trace[]         = "trace";
   static const char ssaa_recentre[] = "ssaa_recentre ";
   byte b = *cmd;
   if (b == ';' || b == '#') {
     auxbus_raw_timeout = auxbus_raw_count = 0;
-  } else if (0 == strcmp(cmd, "cls")) {
+  } else if (match_word("cls", &cmd, true)) {
     SERIAL_PRINT("\033c");
-  } else if (0 == strcmp(cmd, "free")) {
-    SERIAL_PRINTF("free_heap=%lu, min_free=%lu, largest_free=%lu\r\n", esp_get_free_heap_size(), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
-  } else if (0 == strcmp(cmd, "devs")) {
+  } else if (match_word("send", &cmd, false)) {
+    handle_send_cmd(cmd);
+  } else if (match_word("free", &cmd, true)) {
+    SERIAL_PRINTF("free_heap=%lu, min_free=%lu, largest_free=%lu\r\n", esp_get_free_heap_size(),
+      heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+  } else if (match_word("devs", &cmd, true)) {
      SERIAL_PRINTF("%4s  %-6s   %s\r\n", "Addr", "Name  ", "Description");
      SERIAL_PRINTF("%4s  %-6s   %s\r\n", "====", "======", "====================");
     for (byte i = 0; i < N_DEVNAMES; ++i)
       SERIAL_PRINTF("0x%02x  %-6s   %s\r\n", devnames[i].dev, devnames[i].name, devnames[i].desc);
-  } else if (0 == strncmp(cmd, trace, strlen(trace))) {
-    ulong dev = DEV_FF;
-    cmd += strlen(trace);
-    if (*cmd++ == ' ') {
-      char *endp = NULL;
-      if (*cmd >= '0' && *cmd <= '9') {
-        dev = strtoul(cmd, &endp, 0);
-        if (dev > 0xff || *endp)
-          dev = DEV_FF;
-      } else {
-        dev = name_to_dev(cmd);
-      }
-    }
-    if (dev <= DEV_FF)
+  } else if (match_word("trace", &cmd, false)) {
+    int dev = -1;
+    if (*cmd)
+      dev = get_dev_name(&cmd);
+    if (dev <= DEV_FF) {
+      if (p3000_debug & p3000_orig_trace_dev == -1)
+        p3000_orig_trace_dev = trace_dev;
       trace_dev = dev;
+    }
     SERIAL_PRINTF("Tracing %s (0x%02x) %s\r\n", dev_to_name(trace_dev, false), trace_dev, dev_to_name(trace_dev, true));
-  } else if (0 == strncmp(cmd, ssaa_recentre, strlen(ssaa_recentre))) {
-    cmd += strlen(ssaa_recentre);
+  } else if (match_word("ssaa_recentre", &cmd, false)) {
     char *endp = NULL;
     ulong profile = strtoul(cmd, &endp, 10);
     if (profile > 2 || (*cmd && *endp)) {
@@ -7224,6 +7457,9 @@ static bool handle_serial_commands (char *cmd)
     dew_debug = !dew_debug;
     SERIAL_PRINTF("dew_debug=%u\r\n", dew_debug);
 #endif
+  } else if (b == 'D') {
+    ssag_discard_mc_acks = !ssag_discard_mc_acks;
+    SERIAL_PRINTF("ssag_discard_mc_acks=%u\r\n", ssag_discard_mc_acks);
 #if EMULATE_FOCUS
   } else if (b == 'f') {
     focus_debug = !focus_debug;
@@ -7281,6 +7517,8 @@ static bool handle_serial_commands (char *cmd)
     bt_debug = !bt_debug;
     SERIAL_PRINTF("bt_debug=%u\r\n", bt_debug);
   } else if (b == 'v') {
+    if (p3000_debug & p3000_orig_verbose == -1)
+      p3000_orig_verbose = verbose;
     verbose = !verbose;
     SERIAL_PRINTF("verbose=%u\r\n", verbose);
   } else {
@@ -7360,7 +7598,8 @@ static void serial_loop (void)
       }
       if (aux_ascii_passthru) {
         send_ascii_passthru(cmd);
-        if (0 == strcmp(cmd, "exit"))
+        char *cmdp = cmd;
+        if (match_word("exit", &cmdp, true))
           ascii_passthru_timeout = get_timeout(200);  // delay off, to allow for "exit" responses to arrive
       } else if (0 == strcmp(cmd, "$$$")) {
         ascii_passthru_timeout = 0;
@@ -7388,8 +7627,19 @@ static void set_p3000_debug (bool on_off, bool debug_ethernet)
     const char *d = debug_ethernet ? "Ethernet" : "WiFi";
     SERIAL_PRINTF("p3000_debug=%s (%s)\r\n", s, d);  // Once for the current debug destination
     p3000_debug = on_off;
+    if (!p3000_debug) {
+      // Restore verbose and trace_dev to their pre-p3000 values:
+      if (p3000_orig_verbose != -1) {
+        verbose = p3000_orig_verbose;
+        p3000_orig_verbose = false;
+      }
+      if (p3000_orig_trace_dev != -1) {
+        trace_dev = p3000_orig_trace_dev;
+        p3000_orig_trace_dev = false;
+      }
+    }
 #if ETHERNET_ENABLED
-    p3000_debug_ethernet = debug_ethernet;
+    p3000_debug_ethernet = ethernet_detected && debug_ethernet;
 #endif
     SERIAL_PRINTF("p3000_debug=%s (%s)\r\n", s, d);  // Again for the new debug destination
   }
@@ -7402,11 +7652,13 @@ static const char *get_connection_type (void)
   else if (musb_connected)    connection = "USB";
   else if (w2000.connected()) connection = "WiFi";
 #if ETHERNET_ENABLED
-  else if (e2000.connected()) connection = "Eth";
+  else if (ethernet_detected && e2000.connected())
+                              connection = "Eth";
 #endif
   else if (w3000.connected()) connection = "WiF3";
 #if ETHERNET_ENABLED
-  else if (w3000.connected()) connection = "Eth3";
+  else if (ethernet_detected && e3000.connected())
+                              connection = "Eth3";
 #endif
   else                        connection = "Not";
   return connection;
@@ -7473,6 +7725,14 @@ static void status_command (void (*writep)(const char *))
     sprintf(tmp, "WiFi=%s%s, SSID=%s, IP=%s\r\n", mode, wifi_client_mode_override ? "*" : "", current_ssid, current_ipaddr);
     writep(tmp);
   }
+#if TXQ_MONITOR_SIZE
+  sprintf(tmp, "%s: pkts_in_use=%u pkts_max=%u/%u\r\n", auxbus.txq->name, auxbus.txq->pkts_in_use, auxbus.txq->pkts_max, AUXBUS_TXQ_SIZE);
+  writep(tmp);
+  if (auxrelay_detected) {
+    sprintf(tmp, "%s: pkts_in_use=%u pkts_max=%u/%u\r\n", auxrelay.txq->name, auxrelay.txq->pkts_in_use, auxrelay.txq->pkts_max, AUXBUS_TXQ_SIZE);
+    writep(tmp);
+  }
+#endif  /* TXQ_MONITOR_SIZE */
 }
 
 static char help_p3000_commands[] =
@@ -7501,46 +7761,50 @@ static char help_p3000_commands[] =
  */
 static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
 {
+  static bool wlan_ssid_passkey_updated = false;
   if (!p3000_debug && writep != SERIAL_WRITE)
     SERIAL_PRINTF("p3000: %s\r\n", cmd);
   if (!*cmd) {
     /* empty command: ignore it */
-  } else if (0 == strcmp(cmd, "help")) {
+  } else if (match_word("help", &cmd, false)) {
     *index(help_p3000_commands, 'v') = hbg3_version[0];  // hack for 'v'/'r
     writep(help_p3000_commands);
     if (p3000_debug || writep == SERIAL_WRITE)
       writep(help_serial_commands);
-  } else if (0 == strcmp(cmd, "version")) {
+  } else if (match_word("version", &cmd, true)) {
     writep(ADAPTER_VERSION);
     writep(hbg3_version);
-  } else if (0 == strcmp(cmd, "debug")) {
+  } else if (match_word("debug", &cmd, true)) {
     set_p3000_debug(!p3000_debug, (writep != w3000_write));
-  } else if (0 == strcmp(cmd, "reset")) {
-    delay(100);
-    ESP.restart();
-  } else if (0 == strcmp(cmd, "load defaults")) {
+  } else if (match_word("reset", &cmd, true)) {
+    esp32_reset_pending = get_timeout(200);
+  } else if (match_word("load defaults", &cmd, true)) {
     nvram_load_defaults();
     writep("Loaded defaults");
+    wlan_ssid_passkey_updated = false;
 #if OTA_ENABLED
-  } else if (0 == strcmp(cmd, "ota_update")) {
+  } else if (match_word("ota_update", &cmd, true)) {
     if (ota_partition_size_okay)
       ota_fetch_update();
     else
       writep("Wrong Parition Size for OTA");
 #endif /* OTA_ENABLED */
-  } else if (0 == strcmp(cmd, "save")) {
+  } else if (match_word("save", &cmd, true)) {
     nvram_save();
     writep("Success");
-    wifi_client_mode_override = false;
-  } else if (0 == strcmp(cmd, "status")) {  // Show similar information to what OLED shows.
+    if (wlan_ssid_passkey_updated) {
+      wlan_ssid_passkey_updated = false;
+      wifi_client_mode_override = false;  // enable WiFi to connect with new parameters
+    }
+  } else if (match_word("status", &cmd, true)) { // Show similar information to what OLED shows.
     status_command(writep);
     return true;
-  } else if (0 == strcmp(cmd, "test_auxbus")) {
+  } else if (match_word("test_auxbus", &cmd, true)) {
     auxtest_remaining = 0;  // cancel the automatic tests
     bus_test(&auxbus);
     if (auxrelay.txq)
       bus_test(&auxrelay);
-  } else if (0 == strcmp(cmd, "get all")) {
+  } else if (match_word("get all", &cmd, true)) {
     nvram_get_all(writep);
     return true;
   } else if ((cmd[0] == 'g' || cmd[0] == 's') && cmd[1] == 'e' && cmd[2] == 't' && cmd[3] == ' '  && cmd[4]) {
@@ -7567,14 +7831,11 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
     if (x >= 0) {
       if (cmd[0] == 'g') {  // "get"
         writep(nvram_vals[x]);
-      } else {  // "set"
+      } else {              // "set"
         c += strlen(nvram_vars[x]);
         if (*c)
           ++c;
-#if EMULATE_FOCUS
-        if (0 == strcmp(nvram_vars[x], "focus.microsteps"))
-          stepdir_set_microsteps(atoi(c));
-#endif /* EMULATE_FOCUS */
+        const char *var = nvram_vars[x];
         byte quoted = (*c == '"');
         c += quoted;
         if (strlen(c) < NVRAM_VALS_MAX_LEN) {
@@ -7584,6 +7845,12 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
             *v++ = *c++;
           *v = '\0';
           writep("Set OK");
+          if (0 == strcmp(var, "wlan.ssid") || 0 == strcmp(var, "wlan.passkey"))
+            wlan_ssid_passkey_updated = true;
+#if EMULATE_FOCUS
+          else if (0 == strcmp(var, "focus.microsteps"))
+            stepdir_set_microsteps(atoi(c));
+#endif /* EMULATE_FOCUS */
         }
       }
     }
@@ -7596,7 +7863,7 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
 
 static bool p3000_decoder (char b,  void (*writep)(const char *), void (*flushp)(void))
 {
-  static char cmd[64];
+  static char cmd[64], *cmdp = cmd;
   static byte cx = 0;
   if (writep == NULL || flushp == NULL) {
     cx = 0;
@@ -7609,10 +7876,12 @@ static bool p3000_decoder (char b,  void (*writep)(const char *), void (*flushp)
   if (b != '\n')
     return false;
   cx = 0;
-  if (0 == strcmp(cmd, "exit"))
+  if (match_word("exit", &cmdp, true))
     return true;  // close connection
   if (!handle_p3000_commands(cmd, writep) && !(p3000_debug && handle_serial_commands(cmd)))
     writep("Unknown command\r\n");
+  else if (esp32_reset_pending)
+    return true;
   writep("> ");
   flushp();
   return false;
@@ -7631,6 +7900,7 @@ static bool wifi_port_is_connected (WiFiClient client, bool *connected, void (*p
   } else {
     if (*connected) {
       *connected = false;
+      init_rxbuf(&w2000_rxbuf, "w2000_rx");
       SERIAL_PRINTF("%09lu %s Disconnected\r\n", millis(), name);
     }
     poll_for_connection();
@@ -7682,7 +7952,7 @@ static void poll_for_new_w2000_connection()
     next_bcast = next_msg = 0;
   } else if (bt_connected) {
     next_bcast = next_msg = 0;
-  } else if (!w3000.connected()) {
+  } else {
     // SkyPortal app looks for these advertisement broadcasts:
     if (!next_bcast || time_after(millis(), next_bcast)) {
       next_bcast = get_timeout(1000);
@@ -7709,12 +7979,13 @@ static void w2000_loop()
   if (!wifi_port_is_connected(w2000, &connected, poll_for_new_w2000_connection, "w2000")) {
     w2000_timeout = 0;
   } else {
-    while (w2000.available()) {
-      (void)packet_decoder(&w2000_rxbuf, w2000.read());
+    if (w2000.available()) {
+      do {
+        (void)packet_decoder(&w2000_rxbuf, w2000.read());
+      } while (w2000.available());
       w2000_timeout = 0;
-    }
-    if (!w2000_timeout) {
-      w2000_timeout = get_timeout(wifi_relay_mode ? 5000 : 15000);
+    } else if (!w2000_timeout) {
+      w2000_timeout = get_timeout(wifi_relay_mode ? 5000 : P2000_ACTIVITY_TIMEOUT);
     } else if (time_after(millis(), w2000_timeout)) {
       w2000_timeout = 0;
       if (WIFIRELAY_ENABLED && wifi_relay_mode) { /* dummy keep-alive message */
@@ -7743,11 +8014,11 @@ static void auxtest_loop ()
   }
 }
 
-// Temporary arrangement(?):  second include of same file defines functions etc..
-#ifdef __has_include
-  #if __has_include("aio.h")
-    #include "aio.h"
-  #endif
+#if defined(AIO_H)
+  #include "aio.h"
+#endif
+#if defined(ETH_H)
+  #include "eth.h"
 #endif
 
 static void non_wifi_loop (void)
@@ -7781,10 +8052,16 @@ static void non_wifi_loop (void)
 #if NCHUCK_ENABLED
   nchuck_loop();
 #endif
-#ifdef AIO_H
-  aio_loop();
+#ifdef BT_USB_H
+  bt_usb_loop();
+#endif
+#if ETHERNET_ENABLED
+  if (ethernet_detected)
+    ethernet_loop();
 #endif
   monitor_musb_switch();
+  if (esp32_reset_pending && time_after(millis(), esp32_reset_pending))
+    ESP.restart();
 }
 
 void loop (void)
@@ -7868,15 +8145,27 @@ void setup (void)
 #endif /* EMULATE_GPS */
   SERIAL_PRINTF("OLED %sdetected\r\n", oled_detected ? "" : "not ");
 
+  routing_add_dev(DEV_AZM, auxbus.rxbuf);
+  routing_add_dev(DEV_ALT, auxbus.rxbuf);
+  routing_add_dev(DEV_ESP32, auxbus.rxbuf);
+  routing_add_dev(DEV_DUMMY, auxbus.rxbuf);
+
 #if NCHUCK_ENABLED
   nchuck_detect(false);  // Do this part earlier than the rest so user can touch thumbstick sooner
 #endif
 #if EMULATE_DEW
   dew_setup();
 #endif
-#ifdef AIO_H
-  aio_setup();
+#if EMULATE_FOCUS
+  stepper_init();
 #endif
+#if ETHERNET_ENABLED
+  #if EMULATE_FOCUS
+    if (stepper_driver == STEPPER_DRIVER_NONE)
+  #endif
+  ethernet_setup();
+  SERIAL_PRINTF("Ethernet %sdetected\r\n", ethernet_detected ? "" : "not ");
+#endif  /* ETHERNET_ENABLED */
   bt_setup();
   if (is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
@@ -7885,9 +8174,6 @@ void setup (void)
     esp32_wifi_off = false;
     set_esp32_wifi_off(true);
   }
-#if EMULATE_FOCUS
-  stepper_init();
-#endif
 #if NCHUCK_ENABLED
   nchuck_focus_only = ('1' == *nvram_get_val("focus.only"));
   if (nchuck_focus_only)
