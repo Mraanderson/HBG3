@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.27"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-17"
+#define VERSION "v8.28"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-19"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -25,7 +25,7 @@
  *  -- For EMULATE_FOCUS=true, use Tools-->Manage-Libraries to install FastAccelStepper library.
  *  -- For OLED_ENABLED=true, install SSD1306AsciiWire library from https://github.com/greiman/SSD1306Ascii/
  *
- * Tools-->Board-->Boards_Manager: ensure the esp32 support is 2.1.x or higher.
+ * Tools-->Board-->Boards_Manager: ensure the esp32 support is 2.1.x or higher, but not 3.x.x.
  *
  * For Mount-USB and Arduino IDE:
  * >>> MS-Windows Driver installation is required for the onboard CP210x USB-25rial chip:
@@ -37,6 +37,14 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.28 2023-12-19
+ *  -- New "simple_mode" of operation: wire 50K pull-down and 100K pull-up to ESP32_WIFI_MODE_PIN.
+ *  -- Improve I2C device detection for FRAM modules.
+ *  -- Use original floating point lat/lng values for gps.location.lat and gps.location.lng values.
+ *  -- Add new "fakegps" command to emulate a GPS receiver:  fakegps dd.dddddd -dd.dddddd
+ *  -- Add missing "help" info for the new "send" command.
+ *  -- Add new "baud" command to enable setting faster baudrates on the SerialDebug port.
+ *  -- Add support for NTP date/time use while GPS waits for date/time fix.
  * Version 8.27 2023-12-17
  *  -- Tighten up command parsing and also make it mostly case-independent, except for single-letter commands.
  *  -- Add new "send" command.  Requires device and at least one (hex) command byte as args. Eg.  send ALT fe
@@ -85,12 +93,14 @@
 #define NCHUCK_ENABLED            true  // Enables use of a Nunchuck game controller on I2C for slew/focus.
 #define OLED_ENABLED              true  // When true, OLED support is included. Requires library: https://github.com/greiman/SSD1306Ascii/
 #define OTA_ENABLED               true  // When true, support is included for Over-The-Air (OTA) Firmware Updates
+#define NTP_ENABLED               true  // When true, use Network Time Protocol until GPS Date/Time are available.
 #define EMULATE_GPS               true  // When true and GPS is attached, pretend to be a Celestron SkySync GPS receiver.
 #define EMULATE_SSAA              true  // When true, include code for StarSense AutoAlign  simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor. PIN conflict with Ethernet.
 #define ETHERNET_ENABLED          true  // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
+#define SSAG_DISCARD_MC_ACKS      true  // Don't forward MC ACKS to SSAG between Relay buses
 
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
 #define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
@@ -189,6 +199,8 @@ static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUX
 
 #define P2000_ACTIVITY_TIMEOUT   (4 * 1000)     // Close port 2000 connection when idle this long
 
+static  bool simple_mode = false;  // In "simple_mode", no auxtest, no WiFi, no BT.
+
 typedef unsigned long long  u64;
 typedef unsigned long       ulong;
 typedef unsigned int        uint;
@@ -240,9 +252,9 @@ static bool auxrelay_ssforward  = false;  // When true, AUXRELAY will forward St
 static bool suppress_lowbattery = false;  // For low-battery warnings spewed from the Evolution mount.
 static bool p3000_debug         = false;  // When true, serial debug commands/output will be redirected to the port 3000 connection.
 
-#define NVRAM_SAVE_VAL_DELAY ((long)1000)
+#define NVRAM_SAVE_DELAY ((long)1000)
 static long nvram_delayed_save   = 0;
-static long nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
+static long nvram_save_delay = NVRAM_SAVE_DELAY;
 
 #if ETHERNET_ENABLED && !defined(AIO_H)
   #if __has_include("eth.h")
@@ -268,8 +280,13 @@ static long nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
   #define e3000 w3000
 #endif /* ETHERNET_ENABLED */
 
-static const char *nvram_get_val  (const char *name);
-static void        nvram_save_val (const char *name, int val);
+#define BAD_FLOAT_VAL  999999.0
+static void        nvram_save_float (const char *name, float val);
+static float       nvram_get_float  (const char *name);
+static const char *nvram_get_val    (const char *name);
+static int         nvram_get_int    (const char *name);
+static void        nvram_save_int   (const char *name, int val);
+static void        nvram_erase_val  (const char *name);
 
 #if EMULATE_SSAA
 static bool emulate_ssaa        = false;
@@ -294,7 +311,7 @@ static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
 #define ADAPTER_VERSION           DEFAULT_SSID "AMW007-9.0.0.0, " VERSION_DATE "T12:00:00Z, " HBG3_NAME "-"
 // Celestron reports: "ZENTRI-AMW007-1.2.0.10, 2017-07-28T07:43:27Z, ZentriOS-WL-1.2.0.10, Board:N/A");
 
-#define AUXBUS_TXQ_SIZE           16  // Was 32, but much lower seems to be enough now.
+#define AUXBUS_TXQ_SIZE           24  // Was 32, hit 15/16 during SSAG auto-guiding.
 #define AUXBUS_PKT_MAX            16  // Max length of a regular 0x3b style auxbus packet.
 #define AUXBUS_SSAA_PKT_MAX       848 // Theoretically up to 2470 bytes.  In practice, nothing is ever larger than about 832 bytes.
 
@@ -993,7 +1010,6 @@ static byte trace_dev  = 0;
 // auxbus_rx: 3b 03 0d 10 50 90       // HC replying to AZM
 
 static bool         esp32_wifi_off = true;
-static AsyncUDP     udp;
 static char         advertisement[128];
 static WiFiServer   W2000(2000);  /* Listen on port 2000 for SkyPortal connections */
 static WiFiServer   W3000(3000);  /* Listen on port 3000 management commands */
@@ -1411,7 +1427,8 @@ static void tx_enq (struct rxbuf_s *from_rxbuf, struct bus_s *bus, byte forward,
   txq->pkts_in_use++;
   if (txq->pkts_in_use > txq->pkts_max) {
     txq->pkts_max = txq->pkts_in_use;
-    SERIAL_PRINTF("%s: pkts_max=%u\r\n", txq->name, txq->pkts_max);
+    if (verbose)
+      SERIAL_PRINTF("%s: pkts_max=%u\r\n", txq->name, txq->pkts_max);
   }
 #endif
   p->regular_pkt = regular_pkt;
@@ -1585,7 +1602,7 @@ static inline byte emulate_begin (const char *devname, byte *data, byte *reply)
   return reply[1] + 2; // overall length, not including the checksum byte
 }
 
-static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len);
+static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte *data, uint16_t len);
 
 static byte long_to_4bytes (byte *dest, ulong v)
 {
@@ -1599,8 +1616,130 @@ static byte long_to_4bytes (byte *dest, ulong v)
 
 #if EMULATE_GPS
 
-static bool     gps_debug = false;  // GPS info. Can be toggled at run-time (hit 'g' on serial monitor)
-static bool     GPS_debug = false;  // GPS NMEA sentences. Can be toggled at run-time (hit 'G' on serial monitor)
+#if !NTP_ENABLED
+  #define ntp_time_is_valid 0
+#else
+static long ntp_time_is_valid    = 0;  // Timestamp of most recent NTP update.
+static byte ntp_fast_update_secs = 0;  // Interval in seconds for next NTP update, when requested.
+
+/* Date calculation based on __secs_to_tm() from http://git.musl-libc.org/cgit/musl/tree/src/time/__secs_to_tm.c */
+
+#define LEAPOCH       (946684800ull + 86400 * (31 + 29))  /* 2000-03-01 (mod 400 year, immediately after feb29 */
+#define DAYS_PER_400Y (365 * 400 + 97)
+#define DAYS_PER_100Y (365 * 100 + 24)
+#define DAYS_PER_4Y   (365 *   4 + 1)
+
+static struct ntp_time_s {
+  uint16_t  year;
+  uint8_t   month;
+  uint8_t   day;
+  uint8_t   hh;
+  uint8_t   mm;
+  uint8_t   ss;
+} ntp_time;
+
+static inline void timesecs_to_utc (long long secsSince1900)
+{
+  const ulong seventyYears = 2208988800UL;
+        ulong seconds      = secsSince1900 - seventyYears;
+  long long days, secs;
+  long remdays, remsecs, remyears, years, leap, qc_cycles, c_cycles, q_cycles;
+  byte months, wday;
+  static const char days_in_month[] = {31,30,31,30,31,31,30,31,30,31,31,29};
+
+  secs = seconds - LEAPOCH;
+  days = secs / 86400;
+  remsecs = secs % 86400;
+  if (remsecs < 0) {
+    remsecs += 86400;
+    days--;
+  }
+  qc_cycles = days / DAYS_PER_400Y;
+  remdays = days % DAYS_PER_400Y;
+  if (remdays < 0) {
+    remdays += DAYS_PER_400Y;
+    qc_cycles--;
+  }
+  c_cycles = remdays / DAYS_PER_100Y;
+  if (c_cycles == 4) c_cycles--;
+  remdays -= c_cycles * DAYS_PER_100Y;
+  q_cycles = remdays / DAYS_PER_4Y;
+  if (q_cycles == 25) q_cycles--;
+  remdays -= q_cycles * DAYS_PER_4Y;
+  remyears = remdays / 365;
+  if (remyears == 4) remyears--;
+  remdays -= remyears * 365;
+  leap     = !remyears && (q_cycles || !c_cycles);
+  years    =  remyears + 4*q_cycles + 100*c_cycles + 400ll*qc_cycles;
+
+  for (months=0; days_in_month[months] <= remdays; months++)
+    remdays -= days_in_month[months];
+  if (months > 10) {
+    months -= 12;
+    years++;
+  }
+  ntp_time.year  = years   + 2000;
+  ntp_time.month = months  + 2 + 1;   // Month as 01..12 !!
+  ntp_time.day   = remdays + 1;
+  ntp_time.hh    = remsecs / 3600;
+  ntp_time.mm    = remsecs / 60 % 60;
+  ntp_time.ss    = remsecs % 60;
+}
+
+#include <WiFiUdp.h>
+static WiFiUDP udp_ntp;
+
+void ntp_loop (void)
+{
+  static bool ntp_initialized = false;
+  if (!ntp_initialized) {
+    ntp_initialized = true;
+    udp_ntp.begin(8888);  // Local port used for receiving NTP responses; could be anything.
+  }
+  static long fast_update_time = 0;
+  static long ntp_nexttime     = 0;
+  long        now              = millis();
+  byte        pkt[48];
+
+  if (ntp_fast_update_secs) {
+    if (fast_update_time && time_after(now, fast_update_time)) {
+      fast_update_time = 0;
+      ntp_nexttime     = 0;
+    }
+    if (!fast_update_time) {
+      fast_update_time = get_timeout(ntp_fast_update_secs * 1000);
+      ntp_fast_update_secs = 0;
+    }
+  }
+  if (!ntp_nexttime || time_after(now, ntp_nexttime)) {
+    memset(pkt, 0, sizeof(pkt));
+    pkt[ 0] = 0b11100011;   // LI, Version, Mode
+    pkt[ 1] = 0;            // Stratum, or type of clock
+    pkt[ 2] = 6;            // Polling Interval
+    pkt[ 3] = 0xec;         // Peer Clock Precision
+    pkt[12] = 49;
+    pkt[13] = 0x4e;
+    pkt[14] = 49;
+    pkt[15] = 52;
+    udp_ntp.beginPacket("pool.ntp.org", 123); // Destination port 123 (NTP)
+    udp_ntp.write(pkt, sizeof(pkt));
+    udp_ntp.endPacket();
+    ntp_nexttime = get_timeout(4 * 60 * 1000);
+    return;
+  }
+  if (!udp_ntp.parsePacket())
+    return;
+  ntp_time_is_valid = millis();
+  udp_ntp.read(pkt, sizeof(pkt)); // read the packet into the buffer
+  ulong secsSince1900 = ((ulong)pkt[40] << 24) | ((ulong)pkt[41] << 16) | ((ulong)pkt[42] << 8) | pkt[43];
+  timesecs_to_utc(secsSince1900);
+  if (verbose)
+    SERIAL_PRINTF("ntp_time: %02u/%02u/%04u UTC %02u:%02u:%02u\r\n", ntp_time.day, ntp_time.month, ntp_time.year, ntp_time.hh, ntp_time.mm, ntp_time.ss);
+}
+#endif /* NTP_ENABLED */
+
+static bool gps_debug = false;  // GPS info. Can be toggled at run-time (hit 'g' on serial monitor)
+static bool GPS_debug = false;  // GPS NMEA sentences. Can be toggled at run-time (hit 'G' on serial monitor)
 
 //#include "NMEA_playback.h" // For debugging GPS NMEA decoding.
 
@@ -2049,19 +2188,33 @@ void GPSTime::commit()
 
 bool GPSTime::getHMS (byte dest[3])
 {
-  if (!is_valid()) {
+  byte h, m, s;
+  ulong adjust;
+
+  if (is_valid()) {
+    h = hour();
+    m = minute();
+    s = second();
+    adjust = (((ulong)(1 + millis())) - (validTimeout - GPS_TIMEOUT)) / 1000lu;
+#if NTP_ENABLED
+  } else if (ntp_time_is_valid) {
+    h = ntp_time.hh;
+    m = ntp_time.mm;
+    s = ntp_time.ss;
+    adjust = (((ulong)(1 + millis())) - ntp_time_is_valid) / 1000lu;
+#endif /* NTP_ENABLED */
+  } else {
     dest[2] = dest[1] = dest[0] = 0;
     return false;
   }
-  // It could be several seconds since last non-corrupted GPS time update.
+  // It could be several seconds since last non-corrupted GPS/NTP time update.
   // So if feasible, adjust the returned time for better accuracy:
-  byte h = hour();
-  byte m = minute();
-  byte s = second();
-  ulong adjust = (((ulong)(1 + millis())) - (validTimeout - GPS_TIMEOUT)) / 1000lu;
   s += adjust;
   if (h == 23 && m == 59 && s >= 60) {
     s = 59;  // Don't even attempt to handle date changes when crossing midnight: too complex.
+#if NTP_ENABLED
+    ntp_fast_update_secs = 1;
+#endif /* NTP_ENABLED */
   } else if (s >= 60) {
     s -= 60;
     m += 1;
@@ -2236,12 +2389,15 @@ void gps_turn_on (bool force, bool quietly)
 static bool    gps_has_recent_location = false;
 static double  gps_recent_lat = 0;
 static double  gps_recent_lng = 0;
-static int32_t gps_saved_lat  = 0;
-static int32_t gps_saved_lng  = 0;
+static double  gps_saved_lat  = 0;
+static double  gps_saved_lng  = 0;
 static bool    gps_use_saved_location   = false;
-static bool    gps_force_saved_location = false;
+static bool    gps_location_force = false;
 
-static inline bool gps_has_saved_location (void) { return gps_saved_lat && gps_saved_lng; }
+static bool gps_has_saved_location (void)
+{
+  return (gps_saved_lat < (BAD_FLOAT_VAL - 10.0) && gps_saved_lng < (BAD_FLOAT_VAL - 10.0));
+}
 
 enum                                 {no_fix,   true_fix,   recent_fix,   saved_fix};
 static const char *gps_fix_type[] = {"no_fix", "true_fix", "recent_fix", "saved_fix"};
@@ -2250,10 +2406,10 @@ static inline byte gps_get_fix_type (void)  // for oled_location_updatefn()
 {
   if (gps_has_fix)
     return true_fix;
-  if (gps_has_date_time) {
+  if (gps_has_date_time || ntp_time_is_valid) {
     if (gps_has_recent_location)
       return recent_fix;
-    if (gps_has_saved_location() && (gps_use_saved_location || gps_force_saved_location))
+    if (gps_has_saved_location() && (gps_use_saved_location || gps_location_force))
       return saved_fix;
   }
   return no_fix;
@@ -2262,24 +2418,44 @@ static inline byte gps_get_fix_type (void)  // for oled_location_updatefn()
 static inline byte gps_get_lat_lng (int32_t *lat, int32_t *lng)
 {
   if (gps_has_fix) {
-    *lat = (int32_t)(gps.location.lat() * GPS_MULT_FACTOR);
-    *lng = (int32_t)(gps.location.lng() * GPS_MULT_FACTOR);
+    *lat = gps.location.lat() * GPS_MULT_FACTOR;
+    *lng = gps.location.lng() * GPS_MULT_FACTOR;
     return true_fix;
   }
-  //FIXME Get Time/Date from internet if possible (access point mode) for quicker "Restore"
-  if (gps_has_date_time) {
+  if (gps_has_date_time || ntp_time_is_valid) {
     if (gps_has_recent_location) {
       *lat = gps_recent_lat * GPS_MULT_FACTOR;
       *lng = gps_recent_lng * GPS_MULT_FACTOR;
       return recent_fix;
     }
-    if (gps_has_saved_location() && (gps_use_saved_location || gps_force_saved_location)) {
-      *lat = gps_saved_lat;
-      *lng = gps_saved_lng;
+    if (gps_has_saved_location() && (gps_use_saved_location || gps_location_force)) {
+      *lat = gps_saved_lat * GPS_MULT_FACTOR;
+      *lng = gps_saved_lng * GPS_MULT_FACTOR;
       return saved_fix;
     }
   }
   return no_fix;
+}
+
+static void fakegps_command (char *cmd)
+{
+  if (2 == sscanf(cmd, "%lf %lf", &gps_saved_lat, &gps_saved_lng)) {
+    gps_detected = true;
+    gps_location_force = true;
+    nvram_save_int("gps.location.force", gps_location_force);
+    nvram_save_float("gps.location.lat", gps_saved_lat);
+    nvram_save_float("gps.location.lng", gps_saved_lng);
+    SERIAL_PRINTF("fakegps: lat=%lf lng=%lf fixtype=%u\r\n", gps_saved_lat, gps_saved_lng, gps_get_fix_type());
+  } else {
+    gps_saved_lat = BAD_FLOAT_VAL;
+    gps_saved_lng = BAD_FLOAT_VAL;
+    gps_detected  = false;  // A real GPS will turn this right back on again
+    gps_location_force = 0;
+    nvram_erase_val("gps.location.force");
+    nvram_erase_val("gps.location.lat");
+    nvram_erase_val("gps.location.lng");
+    SERIAL_PRINTLN("fakegps data cleared");
+  }
 }
 
 static void gps_save_location (void)
@@ -2287,14 +2463,16 @@ static void gps_save_location (void)
   int32_t lat, lng;
   byte fix_type = gps_get_lat_lng(&lat, &lng);
   if (fix_type == true_fix || recent_fix) {
-    gps_saved_lat = lat;
-    gps_saved_lng = lng;
+    gps_saved_lat = lat / GPS_MULT_FACTOR;
+    gps_saved_lng = lng / GPS_MULT_FACTOR;
+    nvram_save_float("gps.location.lat", gps_saved_lat);
+    nvram_save_float("gps.location.lng", gps_saved_lng);
   } else {
-    gps_saved_lat = 0;
-    gps_saved_lng = 0;
+    gps_saved_lat = BAD_FLOAT_VAL;
+    gps_saved_lng = BAD_FLOAT_VAL;
+    nvram_erase_val("gps.location.lng");
+    nvram_erase_val("gps.location.lng");
   }
-  nvram_save_val("gps.location.lat", gps_saved_lat);
-  nvram_save_val("gps.location.lng", gps_saved_lng);
   gps_use_saved_location = false;
 }
 
@@ -2308,6 +2486,12 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
   int32_t lat, lng;
   byte reply[AUXBUS_PKT_MAX], len, op = data[4];
 
+#if NTP_ENABLED
+  // TO-DO: pass NTP date/time to the GPS receiver to help it get a fix earlier?
+  if (!gps_has_date_time)
+    ntp_fast_update_secs = 60;
+#endif /* NTP_ENABLED */
+
   len = emulate_begin("gps_rx", data, reply);
   if (!gps_is_on && op != DEV_GET_VERSION)
     gps_turn_on(false, false);
@@ -2318,9 +2502,10 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
   switch (OP(op,data[1]))
   {
     case OP(GPS_TIME_VALID,3): {
-      reply[len++] = gps_has_date_time;
+      bool has_date_time = gps_has_date_time || ntp_time_is_valid;
+      reply[len++] = has_date_time;
       if (gps_debug)
-        SERIAL_PRINTF("GPS TIME_VALID: %s  %02u/%02u\r\n", gps_has_date_time ? "true" : "false", gps.satellites.value(), gps.satellitesInView());
+        SERIAL_PRINTF("GPS TIME_VALID: %s  %02u/%02u\r\n", has_date_time ? "true" : "false", gps.satellites.value(), gps.satellitesInView());
       break;
     }
     case OP(GPS_LINKED,3): {
@@ -2343,16 +2528,30 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_GET_YEAR,3): {
-      uint16_t year = gps.date.year();
-      reply[len++] = year >> 8;
-      reply[len++] = year;
+      if (gps_has_date_time || !ntp_time_is_valid) {
+        uint16_t year = gps.date.year();
+        reply[len++] = year >> 8;
+        reply[len++] = year;
+#if NTP_ENABLED
+      } else {
+        reply[len++] = ntp_time.year / 100;
+        reply[len++] = ntp_time.year % 100;
+#endif /* NTP_ENABLED */
+      }
       if (gps_debug)
         SERIAL_PRINTLN("GPS GET_YEAR");
       break;
     }
     case OP(GPS_GET_DATE,3): {
-      reply[len++] = gps.date.month();
-      reply[len++] = gps.date.day();
+      if (gps_has_date_time || !ntp_time_is_valid) {
+        reply[len++] = gps.date.month(); // 01..12
+        reply[len++] = gps.date.day();   // 01..32
+#if NTP_ENABLED
+      } else {
+        reply[len++] = ntp_time.month;
+        reply[len++] = ntp_time.day;
+#endif /* NTP_ENABLED */
+      }
       if (gps_debug)
         SERIAL_PRINTLN("GPS GET_DATE");
       break;
@@ -2400,7 +2599,7 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("GPS OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply(rxbuf, reply, len);
+  emulate_send_reply("gps_tx", rxbuf, reply, len);
 }
 
 static inline byte gps_dump_lbuf (char *lbuf, byte lcnt)
@@ -2601,7 +2800,7 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("SSAG OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply(rxbuf, reply, len);
+  emulate_send_reply("ssag_tx", rxbuf, reply, len);
 }
 #endif
 /************************** End   SSAG StarSense Auto Guider Emulation **************************/
@@ -2805,12 +3004,12 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
         break;  // Unable to get a plate right now
       reply[len++] = 0x09;
       reply[len++] = ssaa_image_nstars;
-      emulate_send_reply(rxbuf, reply, len);
+      emulate_send_reply("ssaa_tx", rxbuf, reply, len);
       if (ssaa_image_len != 0) {
         if ((plate_index % 3) == 2)
           ssaa_status = ssaa_idle;
         SERIAL_PRINTF("SSAA GET_PLATE %u stars\r\n", ssaa_image_nstars);
-        emulate_send_reply(rxbuf, ssaa_image_pkt, ssaa_image_len);
+        emulate_send_reply("ssaa_tx", rxbuf, ssaa_image_pkt, ssaa_image_len);
         ssaa_image_pkt = NULL;  // bus_tx() will free the memory
       }
       return;
@@ -2862,7 +3061,7 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("SSAA OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply(rxbuf, reply, len);
+  emulate_send_reply("ssaa_tx", rxbuf, reply, len);
 }
 
 #endif /* EMULATE_SSAA */
@@ -2877,10 +3076,19 @@ static bool fram_detected = false;
 #define FRAM_NVRAM_OFFSET   0
 #define FRAM_STEPPER_POS    0x800
 
+static bool i2c_detect_device (byte addr)
+{
+  Wire.beginTransmission(addr);
+  if (addr == FRAM_I2C_ADDR)
+    delay(40);         // Some FRAM chips need at least 37msecs of delay here.
+  else
+    Wire.write(0x00);  // Some models of Nunchuck require this here for successful detection.
+  return (Wire.endTransmission() == 0);
+}
+
 static void fram_setup (void)
 {
-  Wire.beginTransmission(FRAM_I2C_ADDR);
-  fram_detected = (Wire.endTransmission() == 0);
+  fram_detected = i2c_detect_device(FRAM_I2C_ADDR);
 }
 
 static void fram_write (uint16_t addr, void *datap, uint16_t len)
@@ -3170,7 +3378,7 @@ static void stepper_init (void)
   focus_target_pos = focus_restore_pos();
   long pos = FOCUS_TO_STEPPER_POS(focus_target_pos);
   if (stepper_driver == STEPPER_DRIVER_STEPDIR) {
-    stepdir_set_microsteps(atoi(nvram_get_val("focus.microsteps")));
+    stepdir_set_microsteps(nvram_get_int("focus.microsteps"));
     stepdirEngine.init();
     stepdir = stepdirEngine.stepperConnectToPin(STEPDIR_STEP_PIN, 0 /*DRIVER_MCPWM_PCNT*/);
     if (stepdir) {
@@ -3235,7 +3443,7 @@ static inline void stepper_loop (void)
   if (focus_calibration_running && time_after(millis(), focus_calibration_running)) {
     focus_calibration_running = 0;
     focus_calibrated = 1;
-    nvram_save_val("focus.calibrated", focus_calibrated);
+    nvram_save_int("focus.calibrated", focus_calibrated);
   }
   focus_check_backlash_timeout();
   if (stepper_driver == STEPPER_DRIVER_ULN2003) {
@@ -3371,7 +3579,7 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
       } else {
         focus_calibrated = 0;
         focus_calibration_running = get_timeout(1000);  // Pretend to be doing something briefly
-        nvram_save_val("focus.calibrated", focus_calibrated);
+        nvram_save_int("focus.calibrated", focus_calibrated);
       }
       if (focus_debug)
         SERIAL_PRINTF("FOCUS CALIBRATION_ENABLE %s\r\n", data[5] ? "begin" : "clear");
@@ -3385,14 +3593,14 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
     }
     case OP(MC_SET_POS_BACKLASH,4): {
       focus_backlash_pos = (data[5] < 100) ? data[5] : 99;
-      nvram_save_val("focus.backlash.pos", focus_backlash_pos);
+      nvram_save_int("focus.backlash.pos", focus_backlash_pos);
       if (focus_debug)
         SERIAL_PRINTF("FOCUS SET_POS_BACKLASH: %u\r\n", data[5]);
       break;
     }
     case OP(MC_SET_NEG_BACKLASH,4): {
       focus_backlash_neg = (data[5] < 100) ? data[5] : 99;
-      nvram_save_val("focus.backlash.neg", focus_backlash_neg);
+      nvram_save_int("focus.backlash.neg", focus_backlash_neg);
       if (focus_debug)
         SERIAL_PRINTF("FOCUS SET_NEG_BACKLASH: %u\r\n", data[5]);
       break;
@@ -3419,7 +3627,7 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("FOCUS OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply(rxbuf, reply, len);
+  emulate_send_reply("focus_tx", rxbuf, reply, len);
   return false;
 }
 
@@ -3430,9 +3638,9 @@ static void focus_set_save_limits (bool force, ulong min, ulong max)
   if (min < FOCUS_LIMIT_MIN || min >= max || max > FOCUS_LIMIT_MAX) {
     if (force) {
       *flimits = '\0';
-      nvram_delayed_save = get_timeout(nvram_save_val_delay);
+      nvram_delayed_save = get_timeout(nvram_save_delay);
       focus_calibrated = 0;
-      nvram_save_val("focus.calibrated", focus_calibrated);
+      nvram_save_int("focus.calibrated", focus_calibrated);
     }
   } else {
     focus_limit_min = min;
@@ -3440,10 +3648,10 @@ static void focus_set_save_limits (bool force, ulong min, ulong max)
     sprintf(tbuf, "%lu %lu", min, max);
     if (strcmp(tbuf, flimits)) {
       strcpy(flimits, tbuf);
-      nvram_delayed_save = get_timeout(nvram_save_val_delay);
+      nvram_delayed_save = get_timeout(nvram_save_delay);
     }
     focus_calibrated = 1;
-    nvram_save_val("focus.calibrated", focus_calibrated);
+    nvram_save_int("focus.calibrated", focus_calibrated);
   }
 }
 
@@ -3739,33 +3947,27 @@ static bool nchuck_blink_led = false;
 
 #define NCHUCK_POLL_INTERVAL   25 /* milli-seconds */
 #define NCHUCK_MIDDLE_SAMPLES  (750 / NCHUCK_POLL_INTERVAL)
-#define NCHUCK_DEVICE_ID        0x52
+#define NCHUCK_I2C_ADDR        0x52
 
 static void nchuck_request_data()
 {
-  if (!nchuck_detected)
+  if (!nchuck_detected || (nchuck_detected = i2c_detect_device(NCHUCK_I2C_ADDR)))
     return;
-  Wire.beginTransmission(NCHUCK_DEVICE_ID);
-  Wire.write(0x00);  // Some Nunchuck devices actually NEED this.  Do not remove it!!!
-  nchuck_detected = (Wire.endTransmission() == 0);
-
   // Stop movements when Nunchuck is unplugged mid-operation:
-  if (!nchuck_detected) {
-    SERIAL_PRINTLN("Nunchuck unplugged");
-    if (nchuck_blink_led) {
-      nchuck_blink_led = false;
-      set_blue_led(LED_OFF);
-    }
-    if (nchuck_oldx) {
-      nchuck_oldx = 0;
-      nchuck_send_mc_cmd(0, DEV_AZM, 0);
-    }
-    if (nchuck_oldy) {
-      nchuck_oldy = 0;
-      nchuck_send_mc_cmd(1, DEV_ALT, 0);
-    }
-    nchuck_send_mc_cmd(0, DEV_FOCUS, 0);
+  SERIAL_PRINTLN("Nunchuck unplugged");
+  if (nchuck_blink_led) {
+    nchuck_blink_led = false;
+    set_blue_led(LED_OFF);
   }
+  if (nchuck_oldx) {
+    nchuck_oldx = 0;
+    nchuck_send_mc_cmd(0, DEV_AZM, 0);
+  }
+  if (nchuck_oldy) {
+    nchuck_oldy = 0;
+    nchuck_send_mc_cmd(1, DEV_ALT, 0);
+  }
+  nchuck_send_mc_cmd(0, DEV_FOCUS, 0);
 }
 
 static bool nchuck_get_data (void)
@@ -3775,7 +3977,7 @@ static bool nchuck_get_data (void)
   if (time_before(now, nextpoll))
     return false;
   nextpoll = now + NCHUCK_POLL_INTERVAL;
-  Wire.requestFrom(NCHUCK_DEVICE_ID, sizeof(nchuck_buffer));
+  Wire.requestFrom(NCHUCK_I2C_ADDR, sizeof(nchuck_buffer));
   byte bytecount;
   for (bytecount = 0; bytecount < sizeof(nchuck_buffer) && Wire.available(); bytecount++) {
     byte b = Wire.read();
@@ -3871,12 +4073,12 @@ static bool nchuck_detect (bool blink_led)
   if (nchuck_detected || (next_poll && time_before(millis(), next_poll)))
     return nchuck_detected;
   next_poll = get_timeout(3000);
-  Wire.beginTransmission(NCHUCK_DEVICE_ID);
+  Wire.beginTransmission(NCHUCK_I2C_ADDR);
   Wire.write(0xf0);
   Wire.write(0x55);
   nchuck_detected = (Wire.endTransmission() == 0);
   if (nchuck_detected) {
-    Wire.beginTransmission(NCHUCK_DEVICE_ID);
+    Wire.beginTransmission(NCHUCK_I2C_ADDR);
     Wire.write(0xfb);
     Wire.write(0x00);
     nchuck_detected = (Wire.endTransmission() == 0);
@@ -3884,11 +4086,11 @@ static bool nchuck_detect (bool blink_led)
   if (!nchuck_detected)
     return false;
   next_poll = 0;
-  Wire.beginTransmission(NCHUCK_DEVICE_ID);
+  Wire.beginTransmission(NCHUCK_I2C_ADDR);
   Wire.write(0xfa);
   Wire.endTransmission();
   byte b[6];
-  Wire.requestFrom(NCHUCK_DEVICE_ID, sizeof(b));
+  Wire.requestFrom(NCHUCK_I2C_ADDR, sizeof(b));
   for (byte i = 0; i < sizeof(b); ++i)
     b[i] = Wire.read();
   bool not_nchuck = (b[0] != 0 && b[0] != 0xff) || b[1] || b[2] != 0xa4 || b[3] != 0x20 || b[4] || b[5];
@@ -3908,10 +4110,10 @@ static bool nchuck_detect (bool blink_led)
     set_blue_led(LED_ON);
   }
   // Fetch calibration data from the Nunchuck
-  Wire.beginTransmission(NCHUCK_DEVICE_ID);
+  Wire.beginTransmission(NCHUCK_I2C_ADDR);
   Wire.write(0x20);
   Wire.endTransmission();
-  Wire.requestFrom(NCHUCK_DEVICE_ID, sizeof(nchuck_cdata));
+  Wire.requestFrom(NCHUCK_I2C_ADDR, sizeof(nchuck_cdata));
   for (byte i = 0; i < sizeof(nchuck_cdata); ++i)
     nchuck_cdata[i] = Wire.read();
 #define NCHUCK_FAKE_DATA false
@@ -4033,10 +4235,10 @@ static void nchuck_loop ()
     } else if (!newc && !newz) {
       presets_enabled = true;
       buttons_down = 0;
-      if (mode_change_pending) {
+      if (mode_change_pending && !simple_mode) {
         mode_change_pending = false;
         nchuck_focus_only = !nchuck_focus_only;
-        nvram_save_val("focus.only", !!nchuck_focus_only);
+        nvram_save_int("focus.only", !!nchuck_focus_only);
         SERIAL_PRINTF("focus_only=%u\r\n", nchuck_focus_only);
         set_blue_led(LED_OFF);
       }
@@ -4147,7 +4349,7 @@ static void dew_set_aggression (byte channel, byte aggr)
     dew_aggression[channel] = aggr;
     char name[] = "dew0.aggression";
     name[3] += channel;
-    nvram_save_val(name, aggr);
+    nvram_save_int(name, aggr);
   }
 }
 
@@ -4359,7 +4561,7 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
         SERIAL_PRINTF("DEW OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
 done:
-  emulate_send_reply(rxbuf, reply, len);
+  emulate_send_reply("dew_tx", rxbuf, reply, len);
 }
 
 #define SHT3X_I2C_ADDR 0x44
@@ -4469,7 +4671,7 @@ static void dew_set_pwm_percent (int channel, uint percent)
       dew_manual_pwm[channel] = percent;
       char name[] = "dew0.manual.pwm";
       name[3] += channel;
-      nvram_save_val(name, percent);
+      nvram_save_int(name, percent);
     }
   }
 }
@@ -4554,7 +4756,7 @@ static void dew_read_thermistor (byte channel)
     return;
   }
   if (dew_debug)
-    SERIAL_PRINTF("Th%u: Bad reading=%d %f\r\n", channel, pinval, dew_temperature[channel]);
+    SERIAL_PRINTF("Th%u: Bad reading=%d %lf\r\n", channel, pinval, dew_temperature[channel]);
 bad_reading:
   thermistor_detected[channel] = false;
   sums[channel] = samples[channel] = 0;
@@ -4782,7 +4984,7 @@ static void oled_get_type (void)
     oled_setup();
 }
 
-#define OLED_I2C_ADDRESS  0x3c
+#define OLED_I2C_ADDR     0x3c
 static  SSD1306AsciiWire  oled;
 
 #define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
@@ -4904,7 +5106,7 @@ static void oled_manage_gps_sleep (void)
     gps_stop_timeout();
     gps_prevent_sleep = true;
   } else if (!oled_gps_timer) {
-    oled_gps_timer = get_timeout(2000);  // 2-second delay before waking up GPS, in case user switches to another updatefn
+    oled_gps_timer = get_timeout(2000);  // 2-second delay before waking up GPS, in case user switches to another screen
   } else if (time_after(millis(), oled_gps_timer)) {
     oled_gps_timer = 0;
     gps_turn_on(false, false);
@@ -5081,6 +5283,12 @@ static bool oled_gps_updatefn (byte arg)  // oled_arg_t
   int n;
   if (gps.date.is_valid())
     n = snprintf(tmp, OLED_ROW_CHARS, "%02d/%02d/%02d UTC ", gps.date.day(), gps.date.month(), gps.date.year() % 100);
+#if NTP_ENABLED
+  else if (ntp_time_is_valid) {
+    ntp_fast_update_secs = 60;
+    n = snprintf(tmp, OLED_ROW_CHARS, "%02d/%02d/%02d NTP ", ntp_time.day, ntp_time.month, ntp_time.year % 100);
+  }
+#endif /* NTP_ENABLED */
   else
     n = snprintf(tmp, OLED_ROW_CHARS, "%s", "--/--/-- UTC ");
   byte hms[3];
@@ -5138,10 +5346,10 @@ static void oled_dew_next_mode (byte channel)
         aggr = 1;
     }
   }
-  nvram_save_val_delay = 2500;
+  nvram_save_delay = 2500;
   dew_set_aggression (channel, aggr);
   dew_set_pwm_percent(channel, pwm);
-  nvram_save_val_delay = NVRAM_SAVE_VAL_DELAY;
+  nvram_save_delay = NVRAM_SAVE_DELAY;
 }
 #endif /* EMULATE_DEW */
 
@@ -5272,7 +5480,7 @@ static byte QRcode_image[] = {
 
 static void oled_cmd (uint8_t command)
 {
-  Wire.beginTransmission(OLED_I2C_ADDRESS);
+  Wire.beginTransmission(OLED_I2C_ADDR);
   Wire.write(0x00);        // Select "Command" mode
   Wire.write(command);     // The actual command byte
   Wire.endTransmission();
@@ -5291,7 +5499,7 @@ static void oled_send_image (byte *image, unsigned int image_size)
   oled_cmd(0x07);     //  High:   7
   const byte burst_size = 32;
   for (byte burst = 0; burst < (image_size / burst_size); burst++) {
-    Wire.beginTransmission(OLED_I2C_ADDRESS);
+    Wire.beginTransmission(OLED_I2C_ADDR);
     Wire.write(0x40);      // Select "Data" mode
     for (unsigned int i = 0; i < burst_size; ++i)
       Wire.write(*image++);
@@ -5400,12 +5608,11 @@ static void oled_setup ()
 {
   oled_force_clear();
   oled_init_modes();
-  Wire.beginTransmission(OLED_I2C_ADDRESS);
-  oled_detected = (Wire.endTransmission() == 0);
+  oled_detected = i2c_detect_device(OLED_I2C_ADDR);
   if (oled_detected) {
     if (OLED_MODE_PIN != -1)
       pinMode(OLED_MODE_PIN, INPUT_PULLUP);
-    oled.begin(oled_type, OLED_I2C_ADDRESS);
+    oled.begin(oled_type, OLED_I2C_ADDR);
     oled.clear();
     oled.setFont((oled_type->lcdHeight == 32) ? System5x7 : HomeBrew5x14_font);
 
@@ -5708,7 +5915,9 @@ static byte decode_starsense (struct rxbuf_s *rxbuf, byte b)
   return packet_reset(rxbuf, ret);
 }
 
-static bool ssag_discard_mc_acks = false;
+#if SSAG_DISCARD_MC_ACKS
+static bool ssag_discard_mc_acks = false;  //FIXME NVRAM ?
+#endif
 
 static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
 {
@@ -5785,7 +5994,7 @@ restart:
   if (TVERBOSE(rxbuf->data))
       print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
 
-#if 1 //FIXME ?
+#if SSAG_DISCARD_MC_ACKS
   if (ssag_discard_mc_acks) {
     // SSAG doesn't need acks back from the motor controllers, so discard those:
     if (dst == DEV_SSAG && (src == DEV_ALT || src == DEV_AZM) && rxbuf->data[1] == 0x03) {
@@ -5816,7 +6025,7 @@ restart:
 static void bt_setup (void)
 {
   init_rxbuf(&bt_rxbuf, "bt_rx");
-  if (musb_selected && musb_rfkill) {
+  if (simple_mode || (musb_selected && musb_rfkill)) {
     bt_enabled = false;
   } else {
     bt_enabled = true;
@@ -5972,7 +6181,7 @@ static void w2000_tx (bool from_ssaa, byte *data, uint16_t count)
   }
 }
 
-static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
+static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte *data, uint16_t len)
 {
   bool from_ssaa   = (data[0] == 0x3c);
   bool regular_pkt = (data[0] == 0x3b);
@@ -5981,6 +6190,8 @@ static void emulate_send_reply (struct rxbuf_s *rxbuf, byte *data, uint16_t len)
     data[1] = len - 3; // excludes 0x3b, itself, and checksum
     update_checksum(data);
   }
+  if (regular_pkt && data[3] == DEV_ESP32 && TVERBOSE(data))
+    print_packet(devname, NULL, data, data[1] + 3);
   if (!rxbuf) {
     tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
   } else {
@@ -6558,7 +6769,7 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"ota.version.path",
   (char *)"auxbus.stopbits",
   (char *)"musb.rfenable",
-  (char *)"gps.force.saved.location",  // was ota.timestamp until v8.5
+  (char *)"gps.location.force",  // was ota.timestamp until v8.5
   (char *)"ota.update.server",
   (char *)"ota.update.path",
   (char *)NULL
@@ -6602,13 +6813,13 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   ""                // ota.version.path
   ""                // auxbus.stopbits
   ""                // musb.rfenable
-  ""                // gps.force.saved.location  // was ota.timestamp until v8.5
+  ""                // gps.location.force  // was ota.timestamp until v8.5
   ""                // ota.update.server
   ""                // ota.update.path
   ""                // NULL
 };
 
-static int nvram_find_val (const char *name)
+static int nvram_find_var (const char *name)
 {
   for (int i = 0; nvram_vars[i]; ++i) {
     const char *v = nvram_vars[i];
@@ -6623,8 +6834,13 @@ static int nvram_find_val (const char *name)
 
 static const char *nvram_get_val (const char *name)
 {
-  int x = nvram_find_val(name);
+  int x = nvram_find_var(name);
   return (x == -1) ? "" : nvram_vals[x];
+}
+
+static int nvram_get_int (const char *name)
+{
+  return atoi(nvram_get_val(name));
 }
 
 static void nvram_get_nonblank_val (const char *name, char *dst)
@@ -6642,28 +6858,65 @@ static void nvram_clear_reserved_slots (void)
       if (nvram_vals[v][0]) {
         SERIAL_PRINTF("nvram: clearing %s: %s\r\n", nvram_vars[v], nvram_vals[v]);
         nvram_vals[v][0] = 0;
-        nvram_delayed_save = get_timeout(nvram_save_val_delay);
+        nvram_delayed_save = get_timeout(nvram_save_delay);
       }
     }
   }
 }
 
-static void nvram_save_val (const char *name, int val)
+static void nvram_save_int (const char *name, int val)
 {
-  int x = nvram_find_val(name);
+  int x = nvram_find_var(name);
   if (x != -1) {
     char *val_p = nvram_vals[x];
     if (atoi(val_p) != val) {
       sprintf(val_p, "%d", val);
-      nvram_delayed_save = get_timeout(nvram_save_val_delay);
+      nvram_delayed_save = get_timeout(nvram_save_delay);
     }
+  }
+}
+
+static void nvram_save_float (const char *name, double fval)
+{
+  int x = nvram_find_var(name);
+  if (x != -1) {
+    char *val = nvram_vals[x], tmp[NVRAM_VALS_MAX_LEN + 1];
+    sprintf(tmp, "%lf", fval);
+    if (strcmp(val, tmp)) {
+      strcpy(val, tmp);
+      nvram_delayed_save = get_timeout(nvram_save_delay);
+    }
+  }
+}
+
+static float nvram_get_float (const char *name)
+{
+  double fval = BAD_FLOAT_VAL;
+  int x = nvram_find_var(name);
+  if (x != -1) {
+    const char *val = nvram_vals[x];
+    if (index(val, '.'))
+      sscanf(val, "%lf", &fval);
+    else
+      nvram_erase_val(name);
+  }
+  return fval;
+}
+
+static void nvram_erase_val (const char *name)
+{
+  int x = nvram_find_var(name);
+  if (x != -1) {
+    char *val_p = nvram_vals[x];
+    *val_p = '\0';
+    nvram_delayed_save = get_timeout(nvram_save_delay);
   }
 }
 
 #if NCHUCK_ENABLED
 static void nchuck_save_preset (struct button_s *b)
 {
-  int x = nvram_find_val(b->name);
+  int x = nvram_find_var(b->name);
   if (x != -1) {
     long val = (b->approach == MC_MOVE_NEG) ? -b->position : b->position;
     sprintf(nvram_vals[x], "%ld", val);
@@ -6685,7 +6938,7 @@ static void nvram_load_defaults ()
   memcpy(nvram_vals, nvram_vals_defaults, sizeof(nvram_vals));
 
   // Set up a unique default SSID by appending last 6-digits of MAC:
-  default_ssid(nvram_vals[nvram_find_val("softap.ssid")]);
+  default_ssid(nvram_vals[nvram_find_var("softap.ssid")]);
   nvram_initialized = true;
 }
 
@@ -6706,7 +6959,7 @@ static bool nvram_get_bool (const char *name)
     if (0 == strcmp(val, "0") || 0 == strcasecmp(val, "false"))
       return false;
     *(char *)val = '\0';  // Fix bad value
-    nvram_delayed_save = get_timeout(nvram_save_val_delay);
+    nvram_delayed_save = get_timeout(nvram_save_delay);
   }
   return (0 == strcmp(name, "wlan.dhcp.enabled"));  // the only bool that defaults to "1"
 }
@@ -6769,12 +7022,12 @@ static void nvram_restore ()
     default_ssid(hbg3_ssid);
   musb_rfkill = !nvram_get_bool("musb.rfenable");
   suppress_lowbattery = nvram_get_bool("suppress.lowbattery");
-  byte tmp = atoi(nvram_get_val("auxbus.stopbits"));
+  byte tmp = nvram_get_int("auxbus.stopbits");
   if (tmp == 1 || tmp == 2)
     auxbus_stopbits = tmp;
 #if EMULATE_FOCUS
-  focus_backlash_pos = atoi(nvram_get_val("focus.backlash.pos"));
-  focus_backlash_neg = atoi(nvram_get_val("focus.backlash.neg"));
+  focus_backlash_pos = nvram_get_int("focus.backlash.pos");
+  focus_backlash_neg = nvram_get_int("focus.backlash.neg");
   focus_calibrated   =     nvram_get_bool("focus.calibrated");
   char *flimits = (char *)nvram_get_val("focus.limits");
   ulong min = ~0ul, max=~0ul;
@@ -6800,9 +7053,11 @@ static void nvram_restore ()
   gps_disabled = nvram_get_bool("gps.disable");
   if (gps_disabled)
     SERIAL_PRINTLN("gps.disable=1");
-  gps_saved_lat = atoi(nvram_get_val("gps.location.lat"));
-  gps_saved_lng = atoi(nvram_get_val("gps.location.lng"));
-  gps_force_saved_location = nvram_get_bool("gps.force.saved.location");
+  gps_saved_lat = nvram_get_float("gps.location.lat");
+  gps_saved_lng = nvram_get_float("gps.location.lng");
+  gps_location_force = nvram_get_bool("gps.location.force");
+  if (gps_location_force)
+    gps_detected = true;
 #endif
   const char *cw = nvram_get_val("cordwrap.override");
   if (cw) {
@@ -6816,16 +7071,16 @@ static void nvram_restore ()
 #if EMULATE_DEW
   dew_max_amperage[0] = dew_nvram_restore_amperage(0);
   dew_max_amperage[1] = dew_nvram_restore_amperage(1);
-  tmp = atoi(nvram_get_val("dew0.aggression"));
+  tmp = nvram_get_int("dew0.aggression");
   if (tmp >= 0 && tmp <= 10)
     dew_aggression[0] = tmp;
-  tmp = atoi(nvram_get_val("dew1.aggression"));
+  tmp = nvram_get_int("dew1.aggression");
   if (tmp >= 0 && tmp <= 10)
     dew_aggression[1] = tmp;
-  tmp = atoi(nvram_get_val("dew0.manual.pwm"));
+  tmp = nvram_get_int("dew0.manual.pwm");
   if (tmp >= 0 && tmp <= 100)
     dew_manual_pwm[0] = tmp;
-  tmp = atoi(nvram_get_val("dew1.manual.pwm"));
+  tmp = nvram_get_int("dew1.manual.pwm");
   if (tmp >= 0 && tmp <= 100)
     dew_manual_pwm[1] = tmp;
 #endif
@@ -6878,9 +7133,9 @@ static bool IP_fromString(IPAddress ip, const char *s)
   return false;
 }
 
-static void wifi_begin_server_mode()
+static void wifi_begin_server_mode ()
 {
-  SERIAL_PRINTLN("wifi_begin_server_mode:");
+  SERIAL_PRINTLN(__func__);
   const char *passkey = nvram_get_val("softap.passkey");
   wifi_relay_mode = false;
   SERIAL_PRINTF("esp32_wifi ON, softAP, ssid=%s, passkey=%s\r\n", hbg3_ssid, passkey);
@@ -6968,7 +7223,7 @@ static bool is_wifi_client_mode_requested()
     SERIAL_PRINTF("%09lu wifi_mode_switch: %s_mode\r\n", millis(), want_client ? "client" : "server");
   }
   if (wifi_client_mode_override)
-    return false;
+    want_client = false;
   return want_client;
 }
 
@@ -7061,14 +7316,18 @@ static void manage_esp32_wifi (bool want_off)
 
 static void manage_wifi_onoff ()
 {
-  // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
-  bool others_active = (bt_connected || musb_selected);
+  if (simple_mode) {
+    manage_esp32_wifi(true);
+  } else {
+    // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
+    bool others_active = (bt_connected || musb_selected);
 #if ETHERNET_ENABLED
-  others_active |= ethernet_detected && e2000.connected();
+    others_active |= ethernet_detected && e2000.connected();
 #endif
-  manage_esp32_wifi(others_active && musb_rfkill);
-  others_active |= (!esp32_wifi_off && w2000.connected());
-  manage_evo_wifi(others_active);
+    manage_esp32_wifi(others_active && musb_rfkill);
+    others_active |= (!esp32_wifi_off && w2000.connected());
+    manage_evo_wifi(others_active);
+  }
 }
 
 // **** Begin OTA Firmware Update **************************************************************************************
@@ -7278,6 +7537,7 @@ static const char help_serial_commands[] =
   "#                 -- Comment, ignore/print this line\r\n"
   "a                 -- Toggle AUX-bus only mode for traces\r\n"
   "b                 -- Toggle Bluetooth handshake debug on/off\r\n"
+  "baud              -- Change baud rate on USB/Serial port\r\n"
   "cls               -- Clear screen\r\n"
   "devs              -- List devnames usable with t1/t2 commands\r\n"
 #if EMULATE_DEW
@@ -7286,6 +7546,9 @@ static const char help_serial_commands[] =
   "D                 -- Toggle discard of MC ACKs to SSAG on/off\r\n"
 #if EMULATE_FOCUS
   "f                 -- Toggle Focus-Motor debug on/off\r\n"
+#endif
+#if EMULATE_GPS
+  "fakegps           -- Enable GPS emulation with lat/lng:  xx.xxxxxx -xx.xxxxxx\r\n"
 #endif
   "free              -- Show amount of free RAM (heap_size)\r\n"
 #if EMULATE_GPS
@@ -7299,16 +7562,18 @@ static const char help_serial_commands[] =
   "n                 -- Toggle Nunchuck debug on/off\r\n"
 #endif
   "r                 -- Toggle raw tracing of all AUX bus reception\r\n"
+  "send              -- Send AUX command to a device.  Eg.  send ALT 0xfe\r\n"
 #if EMULATE_SSAA
   "S                 -- Request huge image data packet from SSAA (for testing)\r\n"
 #endif
   "trace dev         -- Enable/disable tracing of a specific AUX dev\r\n"
   "t                 -- Send AUX bus test message\r\n"
+  "test_auxbus       -- low-level test for AUX bus functionality\r\n"
   "v                 -- Toggle verbose on/off\r\n"
 #if EMULATE_GPS
   "w                 -- Force GPS receiver on/off\r\n"
 #endif
-  "$$$               -- Enter ASCII pass-through mode to the Evolution-WiFi config interface\r\n"
+  "$$$               -- Enter ASCII pass-through mode to a Celestron WiFi adapter's config interface\r\n"
   "ssaa_recentre N   -- Reset SSAA Camera centre point to 640,480 for Profile slot N: 0-2\r\n"
   ;
 
@@ -7428,6 +7693,20 @@ static bool handle_serial_commands (char *cmd)
      SERIAL_PRINTF("%4s  %-6s   %s\r\n", "====", "======", "====================");
     for (byte i = 0; i < N_DEVNAMES; ++i)
       SERIAL_PRINTF("0x%02x  %-6s   %s\r\n", devnames[i].dev, devnames[i].name, devnames[i].desc);
+  } else if (match_word("test_auxbus", &cmd, true)) {
+    auxtest_remaining = 0;  // cancel the automatic tests
+    bus_test(&auxbus);
+    if (auxrelay.txq)
+      bus_test(&auxrelay);
+  } else if (match_word("baud", &cmd, false)) {
+    char *endp = NULL;
+    ulong baud = strtoul(cmd, &endp, 10);
+    if (!*cmd || *endp) {
+      SERIAL_PRINTF("Huh? \"%s\"\r\n", cmd);
+    } else {
+      SERIAL_PRINTF("New baud: %lu\r\n", baud);
+      SerialDebug->updateBaudRate(baud);
+    }
   } else if (match_word("trace", &cmd, false)) {
     int dev = -1;
     if (*cmd)
@@ -7441,7 +7720,7 @@ static bool handle_serial_commands (char *cmd)
   } else if (match_word("ssaa_recentre", &cmd, false)) {
     char *endp = NULL;
     ulong profile = strtoul(cmd, &endp, 10);
-    if (profile > 2 || (*cmd && *endp)) {
+    if (profile > 2 || (!*cmd || *endp)) {
       SERIAL_PRINTF("%s: expected profile number 0-2\r\n", ssaa_recentre);
     } else {
       SERIAL_PRINTF("%s: Setting centre point for profile %u to 640,480\r\n", ssaa_recentre, profile);
@@ -7457,9 +7736,11 @@ static bool handle_serial_commands (char *cmd)
     dew_debug = !dew_debug;
     SERIAL_PRINTF("dew_debug=%u\r\n", dew_debug);
 #endif
+#if SSAG_DISCARD_MC_ACKS
   } else if (b == 'D') {
     ssag_discard_mc_acks = !ssag_discard_mc_acks;
     SERIAL_PRINTF("ssag_discard_mc_acks=%u\r\n", ssag_discard_mc_acks);
+#endif
 #if EMULATE_FOCUS
   } else if (b == 'f') {
     focus_debug = !focus_debug;
@@ -7733,12 +8014,23 @@ static void status_command (void (*writep)(const char *))
     writep(tmp);
   }
 #endif  /* TXQ_MONITOR_SIZE */
+#if NTP_ENABLED
+  int32_t dont_care;
+  SERIAL_PRINTF("gps_has_saved_location=%u fix_type=%u gps_get_lat_lng=%u\r\n", gps_has_saved_location(), gps_get_fix_type(), gps_get_lat_lng(&dont_care, &dont_care));
+  if (ntp_time_is_valid)
+    SERIAL_PRINTF("NTP Time: %02u/%02u/%04u UTC %02u:%02u:%02u\r\n", ntp_time.day, ntp_time.month, ntp_time.year, ntp_time.hh, ntp_time.mm, ntp_time.ss);
+  else
+    SERIAL_PRINTLN("NTP Time: not available yet");
+#else
+    SERIAL_PRINTLN("NTP Time: not included");
+#endif /* NTP_ENABLED */
 }
 
 static char help_p3000_commands[] =
   "\r\n" HBG3_NAME " " VERSION " by Mark Lord: https://rtr.ca/hbg3/\r\n"
-  "Command list:\r\n\r\n"
+  "Command list:\r\n"
   "help              -- print command list\r\n"
+  "exit              -- close this connection\r\n"
   "debug             -- toggle HBG3 debug monitor mode on this connection\r\n"
   "reset             -- reset/restart the ESP32\r\n"
   "version           -- print version info\r\n"
@@ -7748,7 +8040,6 @@ static char help_p3000_commands[] =
 #endif
   "save              -- save any NVRAM changes from the 'set' command\r\n"
   "status            -- show some basic system information, including IP address\r\n"
-  "test_auxbus       -- low-level test for AUX bus functionality\r\n"
   "get all           -- list all NVRAM variables and values\r\n"
   "get var           -- show value of a specific variable\r\n"
   "set var val       -- change value of 'var' to 'val'\r\n"
@@ -7769,8 +8060,10 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
   } else if (match_word("help", &cmd, false)) {
     *index(help_p3000_commands, 'v') = hbg3_version[0];  // hack for 'v'/'r
     writep(help_p3000_commands);
-    if (p3000_debug || writep == SERIAL_WRITE)
+    if (p3000_debug || writep == SERIAL_WRITE) {
+      writep("\r\nDebug commands:\r\n");
       writep(help_serial_commands);
+    }
   } else if (match_word("version", &cmd, true)) {
     writep(ADAPTER_VERSION);
     writep(hbg3_version);
@@ -7796,14 +8089,13 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
       wlan_ssid_passkey_updated = false;
       wifi_client_mode_override = false;  // enable WiFi to connect with new parameters
     }
+#if EMULATE_GPS
+  } else if (match_word("fakegps", &cmd, false)) {
+    fakegps_command(cmd);
+#endif /* EMULATE_GPS */
   } else if (match_word("status", &cmd, true)) { // Show similar information to what OLED shows.
     status_command(writep);
     return true;
-  } else if (match_word("test_auxbus", &cmd, true)) {
-    auxtest_remaining = 0;  // cancel the automatic tests
-    bus_test(&auxbus);
-    if (auxrelay.txq)
-      bus_test(&auxrelay);
   } else if (match_word("get all", &cmd, true)) {
     nvram_get_all(writep);
     return true;
@@ -7827,7 +8119,7 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
         return true;
       }
     }
-    int x = nvram_find_val(c);
+    int x = nvram_find_var(c);
     if (x >= 0) {
       if (cmd[0] == 'g') {  // "get"
         writep(nvram_vals[x]);
@@ -7863,7 +8155,7 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
 
 static bool p3000_decoder (char b,  void (*writep)(const char *), void (*flushp)(void))
 {
-  static char cmd[64], *cmdp = cmd;
+  static char cmd[64];
   static byte cx = 0;
   if (writep == NULL || flushp == NULL) {
     cx = 0;
@@ -7876,6 +8168,7 @@ static bool p3000_decoder (char b,  void (*writep)(const char *), void (*flushp)
   if (b != '\n')
     return false;
   cx = 0;
+  char *cmdp = cmd;
   if (match_word("exit", &cmdp, true))
     return true;  // close connection
   if (!handle_p3000_commands(cmd, writep) && !(p3000_debug && handle_serial_commands(cmd)))
@@ -7965,7 +8258,8 @@ static void poll_for_new_w2000_connection()
             SERIAL_PRINTLN("UDP Broadcast");
         }
       }
-      udp.broadcastTo((uint8_t *)advertisement, strlen(advertisement), (uint16_t)55555);
+      static AsyncUDP udp_bcast;
+      udp_bcast.broadcastTo((uint8_t *)advertisement, strlen(advertisement), (uint16_t)55555);
     }
   }
 }
@@ -8066,10 +8360,28 @@ static void non_wifi_loop (void)
 
 void loop (void)
 {
+#if NTP_ENABLED
+  if (wifi_client_mode && !wifi_client_mode_override)
+    ntp_loop();
+#endif /* NTP_ENABLED */
   non_wifi_loop();
   manage_wifi_onoff();
   w2000_loop();
   w3000_loop();
+}
+
+static void detect_simple_mode (void)
+{
+#ifndef AIO_H
+  /*
+   * Simple mode is selected with a 50K-pulldown and 100K-pullup on the ESP32_WIFI_MODE_PIN (no switch wired).
+   * Normally this would read 2200+ with nothing, or 0 (zero) when a switch is activated.
+   * With the resistors and no switch, it reads around 1280, give or take.
+   */
+  int val = analogRead(ESP32_WIFI_MODE_PIN);
+  //SERIAL_PRINTF("%s: analogRead(ESP32_WIFI_MODE_PIN): %d\r\n", __func__, val);
+  simple_mode = (val > 1000 && val < 1400);
+#endif
 }
 
 void setup (void)
@@ -8080,37 +8392,31 @@ void setup (void)
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
 
-  Wire.begin();                   // Prepare the I2C bus for use.  Needed for OLED and AIO.
-  Wire.setClock(100000ul);        // 400000ul causes WiFi/BT issues.
+  Wire.begin();            // Prepare the I2C bus for use.  Needed for OLED and AIO.
+  Wire.setClock(100000ul); // 400000ul causes WiFi/BT issues.
+  fram_setup();
 #if OLED_ENABLED 
   oled_setup();
 #endif
 #ifdef AIO_H
-  aio_setup_early();  // needed here for the MUSB switch which uses a USB chip GPIO; also does oled_setup().
+  aio_setup_early();  // needed here for the MUSB switch which uses a USB chip GPIO.
 #endif
   // Now sort out the other uart assignments:
-  if (ESP32_WIFI_MODE_PIN != -1)
-    pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
   if (MUSB_SELECT_PIN != -1) {
     pinMode(MUSB_SELECT_PIN, INPUT_PULLUP);
     delay(5);
   }
-
   hwserial0->end();
   musb_selected = musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
   if (!musb_selected) {
     musb_uart   = NULL;
     SerialDebug = hwserial0;
-    SerialDebug->begin(115200, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN); // The USB pins are the main debug/command port:
-    SerialDebug->flush(false);
   } else {
     if (EMULATE_GPS || auxrelay_detected) {
       SerialDebug = NULL;
       musb_uart   = hwserial0;
     } else {
       SerialDebug = hwserial0;
-      SerialDebug->begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-      SerialDebug->flush(false);
       musb_uart   = &hwserial1;
     }
     init_rxbuf(&musb_rxbuf, "musb_rx");
@@ -8118,9 +8424,17 @@ void setup (void)
     musb_uart->setDebugOutput(false);  // Try and prevent ESP32 system debug messages after boot
     musb_uart->flush(false);
   }
+  if (SerialDebug) {
+    #define SERIAL_DEBUG_BAUD 115200
+    SerialDebug->begin(SERIAL_DEBUG_BAUD, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN); // The USB pins are the main debug/command port:
+    SerialDebug->flush(false);
+  }
+
+  detect_simple_mode();
+  if (ESP32_WIFI_MODE_PIN != -1)
+    pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
 
   pinMode(BLUE_LED_PIN, OUTPUT);
-  fram_setup();
   set_blue_led(LED_ON);
   WiFi.macAddress(wifi_mac_addr);       // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
   nvram_restore();                      // Also called oled_setup() again if non-default oled_type
@@ -8167,7 +8481,7 @@ void setup (void)
   SERIAL_PRINTF("Ethernet %sdetected\r\n", ethernet_detected ? "" : "not ");
 #endif  /* ETHERNET_ENABLED */
   bt_setup();
-  if (is_wifi_client_mode_requested()) {
+  if (!simple_mode && is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
     wifi_begin_server_mode();
     delay(50);
@@ -8175,7 +8489,13 @@ void setup (void)
     set_esp32_wifi_off(true);
   }
 #if NCHUCK_ENABLED
-  nchuck_focus_only = ('1' == *nvram_get_val("focus.only"));
+  if (simple_mode) {
+    auxtest_remaining = 0;
+    nchuck_focus_only = ('0' != *nvram_get_val("focus.only"));  // default to focus-only mode
+    SERIAL_PRINTF("\r\nSimple mode selected: disabling WiFi+BT+auxtest; focus_only=%u\r\n", nchuck_focus_only);
+  } else {
+    nchuck_focus_only = ('1' == *nvram_get_val("focus.only"));  // default to focus+slew mode
+  }
   if (nchuck_focus_only)
     fm_request_position(__func__, false);
 #endif
