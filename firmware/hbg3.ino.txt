@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.28"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-19"
+#define VERSION "v8.29"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-21"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,8 +37,13 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.29 2023-12-21
+ *  -- Where possible, eliminate unneeded double<-->int32_t conversions of GPS coordinates.
+ *  -- Tweak Nunchuck settings for Celestron Focus Motor speeds.
+ *  -- Be even more tolerant of extra spaces in commands.
+ *  -- Ensure Factory Reset clears NVRAM only once.
  * Version 8.28 2023-12-19
- *  -- New "simple_mode" of operation: wire 50K pull-down and 100K pull-up to ESP32_WIFI_MODE_PIN.
+ *  -- New "simple_mode" of operation: wire 50K pull-down and 100K pull-up on ESP32_WIFI_MODE_PIN.
  *  -- Improve I2C device detection for FRAM modules.
  *  -- Use original floating point lat/lng values for gps.location.lat and gps.location.lng values.
  *  -- Add new "fakegps" command to emulate a GPS receiver:  fakegps dd.dddddd -dd.dddddd
@@ -281,8 +286,8 @@ static long nvram_save_delay = NVRAM_SAVE_DELAY;
 #endif /* ETHERNET_ENABLED */
 
 #define BAD_FLOAT_VAL  999999.0
-static void        nvram_save_float (const char *name, float val);
-static float       nvram_get_float  (const char *name);
+static void        nvram_save_float (const char *name, double val);
+static double      nvram_get_float  (const char *name);
 static const char *nvram_get_val    (const char *name);
 static int         nvram_get_int    (const char *name);
 static void        nvram_save_int   (const char *name, int val);
@@ -632,7 +637,7 @@ static const struct auxdev_op_s aux_mc_ops[] = {
 
 // GPS ops:
 #define GPS_GET_LAT         0x01
-#define GPS_GET_LONG        0x02
+#define GPS_GET_LNG         0x02
 #define GPS_GET_DATE        0x03
 #define GPS_GET_YEAR        0x04
 #define GPS_GET_SAT_INFO    0x07
@@ -645,7 +650,7 @@ static const struct auxdev_op_s aux_mc_ops[] = {
 
 static const struct auxdev_op_s aux_gps_ops[] = {
   AUX_DEV_OP(GPS_GET_LAT),
-  AUX_DEV_OP(GPS_GET_LONG),
+  AUX_DEV_OP(GPS_GET_LNG),
   AUX_DEV_OP(GPS_GET_DATE),
   AUX_DEV_OP(GPS_GET_YEAR),
   AUX_DEV_OP(GPS_GET_SAT_INFO),
@@ -894,7 +899,7 @@ static void print_24bits (byte *data)
     int32_t v = val;
     if (is_neg)
       v = -(val | 0xff000000);
-    float degrees = v * 360.0 / 0x1000000;
+    double degrees = v * 360.0 / 0x1000000;
     if (is_neg && degrees)
       degrees = -degrees;
     SERIAL_PRINTF("%7.3f", degrees);
@@ -2210,17 +2215,19 @@ bool GPSTime::getHMS (byte dest[3])
   // It could be several seconds since last non-corrupted GPS/NTP time update.
   // So if feasible, adjust the returned time for better accuracy:
   s += adjust;
-  if (h == 23 && m == 59 && s >= 60) {
-    s = 59;  // Don't even attempt to handle date changes when crossing midnight: too complex.
+  while (s >= 60) {
+    if (h == 23 && m == 59) {
+      s = 59;  // Don't even attempt to handle date changes when crossing midnight: too complex.
 #if NTP_ENABLED
-    ntp_fast_update_secs = 1;
+      if (!is_valid())
+        ntp_fast_update_secs = 1;
 #endif /* NTP_ENABLED */
-  } else if (s >= 60) {
-    s -= 60;
-    m += 1;
-    if (m >= 60) {
-      m -= 60;
-      h += 1;
+    } else {
+      s -= 60;
+      if (++m >= 60) {
+        m -= 60;
+        h += 1;
+      }
     }
   }
   dest[0] = h;
@@ -2415,26 +2422,33 @@ static inline byte gps_get_fix_type (void)  // for oled_location_updatefn()
   return no_fix;
 }
 
-static inline byte gps_get_lat_lng (int32_t *lat, int32_t *lng)
+static byte gps_get_lat_lng (bool do_mult_factor, double *lat_p, double *lng_p)
 {
+  double lat, lng;
+  byte fix_type = no_fix;
+
   if (gps_has_fix) {
-    *lat = gps.location.lat() * GPS_MULT_FACTOR;
-    *lng = gps.location.lng() * GPS_MULT_FACTOR;
-    return true_fix;
-  }
-  if (gps_has_date_time || ntp_time_is_valid) {
+    lat = gps.location.lat();
+    lng = gps.location.lng();
+    fix_type = true_fix;
+  } else if (gps_has_date_time || ntp_time_is_valid) {
     if (gps_has_recent_location) {
-      *lat = gps_recent_lat * GPS_MULT_FACTOR;
-      *lng = gps_recent_lng * GPS_MULT_FACTOR;
-      return recent_fix;
-    }
-    if (gps_has_saved_location() && (gps_use_saved_location || gps_location_force)) {
-      *lat = gps_saved_lat * GPS_MULT_FACTOR;
-      *lng = gps_saved_lng * GPS_MULT_FACTOR;
-      return saved_fix;
+      lat = gps_recent_lat;
+      lng = gps_recent_lng;
+      fix_type = recent_fix;
+    } else if (gps_has_saved_location() && (gps_use_saved_location || gps_location_force)) {
+      lat = gps_saved_lat;
+      lng = gps_saved_lng;
+      fix_type = saved_fix;
     }
   }
-  return no_fix;
+  if (fix_type != no_fix) {
+    if (lat_p)
+      *lat_p = do_mult_factor ? lat * GPS_MULT_FACTOR : lat;
+    if (lng_p)
+      *lng_p = do_mult_factor ? lng * GPS_MULT_FACTOR : lng;
+  }
+  return fix_type;
 }
 
 static void fakegps_command (char *cmd)
@@ -2445,7 +2459,7 @@ static void fakegps_command (char *cmd)
     nvram_save_int("gps.location.force", gps_location_force);
     nvram_save_float("gps.location.lat", gps_saved_lat);
     nvram_save_float("gps.location.lng", gps_saved_lng);
-    SERIAL_PRINTF("fakegps: lat=%lf lng=%lf fixtype=%u\r\n", gps_saved_lat, gps_saved_lng, gps_get_fix_type());
+    SERIAL_PRINTF("fakegps: lat=%lf lng=%lf fix_type=%u\r\n", gps_saved_lat, gps_saved_lng, gps_get_fix_type());
   } else {
     gps_saved_lat = BAD_FLOAT_VAL;
     gps_saved_lng = BAD_FLOAT_VAL;
@@ -2460,11 +2474,11 @@ static void fakegps_command (char *cmd)
 
 static void gps_save_location (void)
 {
-  int32_t lat, lng;
-  byte fix_type = gps_get_lat_lng(&lat, &lng);
+  double lat, lng;
+  byte fix_type = gps_get_lat_lng(false, &lat, &lng);
   if (fix_type == true_fix || recent_fix) {
-    gps_saved_lat = lat / GPS_MULT_FACTOR;
-    gps_saved_lng = lng / GPS_MULT_FACTOR;
+    gps_saved_lat = lat;
+    gps_saved_lng = lng;
     nvram_save_float("gps.location.lat", gps_saved_lat);
     nvram_save_float("gps.location.lng", gps_saved_lng);
   } else {
@@ -2483,7 +2497,6 @@ static void gps_restore_location (void)
 
 static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
-  int32_t lat, lng;
   byte reply[AUXBUS_PKT_MAX], len, op = data[4];
 
 #if NTP_ENABLED
@@ -2497,8 +2510,6 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
     gps_turn_on(false, false);
   gps_start_timeout((gps_has_fix && gps_idle_timeout) ? gps_idle_timeout : 0ul);
 
-  byte fix_type = gps_get_lat_lng(&lat, &lng);
-
   switch (OP(op,data[1]))
   {
     case OP(GPS_TIME_VALID,3): {
@@ -2509,6 +2520,7 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_LINKED,3): {
+      byte fix_type = gps_get_fix_type();
       reply[len++] = (fix_type != no_fix);
       if (gps_debug)
         SERIAL_PRINTF("GPS LINKED: %s  %02u/%02u\r\n", gps_fix_type[fix_type], gps.satellites.value(), gps.satellitesInView());
@@ -2557,7 +2569,10 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       break;
     }
     case OP(GPS_GET_LAT,3): {
-      uint8_t* latBytePtr = (uint8_t*)&lat;
+      double lat;
+      gps_get_lat_lng(true, &lat, NULL);
+      int32_t ilat = lat + ((lat > 0) ? 0.499999 : -0.499999);
+      uint8_t* latBytePtr = (uint8_t*)&ilat;
       reply[len++] = latBytePtr[2];
       reply[len++] = latBytePtr[1];
       reply[len++] = latBytePtr[0];
@@ -2565,13 +2580,16 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
         SERIAL_PRINTLN("GPS GET_LAT");
       break;
     }
-    case OP(GPS_GET_LONG,3): {
-      uint8_t* lngBytePtr = (uint8_t*)&lng;
+    case OP(GPS_GET_LNG,3): {
+      double lng;
+      gps_get_lat_lng(true, NULL, &lng);
+      int32_t ilng = lng + ((lng > 0) ? 0.499999 : -0.499999);
+      uint8_t* lngBytePtr = (uint8_t*)&ilng;
       reply[len++] = lngBytePtr[2];
       reply[len++] = lngBytePtr[1];
       reply[len++] = lngBytePtr[0];
       if (gps_debug)
-        SERIAL_PRINTLN("GPS GET_LONG");
+        SERIAL_PRINTLN("GPS GET_LNG");
       break;
     }
     case OP(GPS_GET_SAT_INFO,3): {
@@ -3185,6 +3203,7 @@ enum {
 #define STEPDIR_STEP_PIN      STEPPER_PIN_A
 #define STEPDIR_ENA_PIN       STEPPER_PIN_B
 #define STEPDIR_DIR_PIN       STEPPER_PIN_C
+//      STEPDIR_DETECT_PIN    STEPPER_PIN_D  // Per above, GROUND this pin so HBG3 can auto-detect this style of motor driver chip.
 
 // ULN2003A driver chip uses the same pins like this instead:
 #define ULN2003_PINS          STEPPER_PIN_A, STEPPER_PIN_C,STEPPER_PIN_B,STEPPER_PIN_D  // For ULN2003 IN1,IN3,IN2,IN4, as well as GND to '-' and 5V to '+'
@@ -3915,8 +3934,8 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
       speed = fast_range ? focus_speeds_fast[speed] : focus_speeds_slow[speed];
 #endif  /* EMULATE_FOCUS */
     } else {
-      // Celestron Focus Motor only uses speeds 6,7,8,9. Lower speeds do nothing useful.
-      static const uint8_t focus_speeds_slow[5] = {6, 6, 6, 7, 7};  // must be in range 1..9; 0 is STOP
+      // Celestron Focus Motor only uses speeds 7,8,9. Lower speeds do nothing useful. Updated Dec/2023.
+      static const uint8_t focus_speeds_slow[5] = {7, 7, 7, 7, 8};  // must be in range 1..9; 0 is STOP
       static const uint8_t focus_speeds_fast[5] = {7, 7, 8, 8, 9};  // must be in range 1..9; 0 is STOP
       speed = fast_range ? focus_speeds_fast[speed] : focus_speeds_slow[speed];
     }
@@ -4235,11 +4254,13 @@ static void nchuck_loop ()
     } else if (!newc && !newz) {
       presets_enabled = true;
       buttons_down = 0;
-      if (mode_change_pending && !simple_mode) {
+      if (mode_change_pending) {
         mode_change_pending = false;
-        nchuck_focus_only = !nchuck_focus_only;
-        nvram_save_int("focus.only", !!nchuck_focus_only);
-        SERIAL_PRINTF("focus_only=%u\r\n", nchuck_focus_only);
+        if (!simple_mode) {
+          nchuck_focus_only = !nchuck_focus_only;
+          nvram_save_int("focus.only", !!nchuck_focus_only);
+          SERIAL_PRINTF("focus_only=%u\r\n", nchuck_focus_only);
+        }
         set_blue_led(LED_OFF);
       }
     }
@@ -4924,7 +4945,7 @@ static void dew_setup ()
     dew_detected = true;
     dew_pwm_setup();
     SERIAL_PRINTLN("SHT3X sensor detected, enabling Dew Heater Control");
-    SERIAL_PRINTF("dew0.amps=%4.2f dew1.amps=%4.2f\r\n", dew_max_amperage[0], dew_max_amperage[1]);
+    SERIAL_PRINTF("dew0.amps=%4.2lf dew1.amps=%4.2lf\r\n", dew_max_amperage[0], dew_max_amperage[1]);
   } else {
     SERIAL_PRINTLN("SHT3X sensor NOT detected, disabling Dew Heater Control");
   }
@@ -4932,12 +4953,12 @@ static void dew_setup ()
 
 static double dew_nvram_restore_amperage (byte channel)
 {
-  float amps = 1.8;  // default value
+  double amps = 1.8;  // default value
   char name[16];
   sprintf(name, "dew%u.amps", channel);
   const char *val = nvram_get_val(name);
   if (val && *val) {
-    float a = atof(val);
+    double a = atof(val);
     if (a > 0 && a <= 5.0)
       amps = a;
   }
@@ -5253,15 +5274,8 @@ static bool oled_gps_updatefn (byte arg)  // oled_arg_t
   snprintf(tmp, OLED_ROW_CHARS, "GPS Sats: %02u/%02u", gps.satellites.value(), gps.satellitesInView());
   oled_set_row(0, tmp);
 
-  int32_t ilat, ilng;
   double lat, lng;
-  byte fix_type = gps_get_lat_lng(&ilat, &ilng);
-  if (fix_type == no_fix) {
-    lat = lng = 0;
-  } else {
-    lat = ilat / GPS_MULT_FACTOR;
-    lng = ilng / GPS_MULT_FACTOR;
-  }
+  byte fix_type = gps_get_lat_lng(false, &lat, &lng);
   char colon = ':';
   if (fix_type == recent_fix)
     colon = '-';
@@ -5517,10 +5531,11 @@ static void oled_send_image (byte *image, unsigned int image_size)
 
 static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
 {
-  static bool need_redraw = false;
+  static bool need_redraw = false, did_reset = false;
 
   if (arg == oled_firstcall) {
     need_redraw = true;
+    did_reset   = false;
   } else if (arg == oled_longpress) {
     if (!oled_timer) {
       oled_timer = get_timeout(9 * 1000 + 500);
@@ -5531,7 +5546,8 @@ static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
     }
     need_redraw = true; // In case button is not held long enough to begin the reset
     return true;
-  } else if (arg == oled_timeout) {
+  } else if (arg == oled_timeout && !did_reset) {
+    did_reset = true;
     SERIAL_PRINTLN("Factory Reset");
     oled_set_row(2, "");
     oled_set_row(3, "Doing FACTORY RESET");
@@ -6889,7 +6905,7 @@ static void nvram_save_float (const char *name, double fval)
   }
 }
 
-static float nvram_get_float (const char *name)
+static double nvram_get_float (const char *name)
 {
   double fval = BAD_FLOAT_VAL;
   int x = nvram_find_var(name);
@@ -7056,6 +7072,7 @@ static void nvram_restore ()
   gps_saved_lat = nvram_get_float("gps.location.lat");
   gps_saved_lng = nvram_get_float("gps.location.lng");
   gps_location_force = nvram_get_bool("gps.location.force");
+
   if (gps_location_force)
     gps_detected = true;
 #endif
@@ -7617,11 +7634,13 @@ Huh:
 static bool match_word (const char *word, char **cmd_p, bool noargs)
 {
   char *cmd = *cmd_p;
+  while (*cmd == ' ')
+    ++cmd;
   if (0 == strncasecmp(word, cmd, strlen(word))) {
     cmd += strlen(word);
-    if (!*cmd || (!noargs && *cmd == ' ')) {
-      while (*cmd == ' ')
-        ++cmd;
+    while (*cmd == ' ')
+      ++cmd;
+    if (!*cmd || !noargs) {
       *cmd_p = cmd;
       return true;
     }
@@ -7704,7 +7723,7 @@ static bool handle_serial_commands (char *cmd)
     if (!*cmd || *endp) {
       SERIAL_PRINTF("Huh? \"%s\"\r\n", cmd);
     } else {
-      SERIAL_PRINTF("New baud: %lu\r\n", baud);
+      SERIAL_PRINTF("Setting new baud: %lu\r\n", baud);
       SerialDebug->updateBaudRate(baud);
     }
   } else if (match_word("trace", &cmd, false)) {
@@ -8015,8 +8034,7 @@ static void status_command (void (*writep)(const char *))
   }
 #endif  /* TXQ_MONITOR_SIZE */
 #if NTP_ENABLED
-  int32_t dont_care;
-  SERIAL_PRINTF("gps_has_saved_location=%u fix_type=%u gps_get_lat_lng=%u\r\n", gps_has_saved_location(), gps_get_fix_type(), gps_get_lat_lng(&dont_care, &dont_care));
+  SERIAL_PRINTF("gps_has_saved_location=%u fix_type=%u gps_get_lat_lng=%u\r\n", gps_has_saved_location(), gps_get_fix_type(), gps_get_lat_lng(false, NULL, NULL));
   if (ntp_time_is_valid)
     SERIAL_PRINTF("NTP Time: %02u/%02u/%04u UTC %02u:%02u:%02u\r\n", ntp_time.day, ntp_time.month, ntp_time.year, ntp_time.hh, ntp_time.mm, ntp_time.ss);
   else
