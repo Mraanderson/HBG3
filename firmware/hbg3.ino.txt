@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.29"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-21"
+#define VERSION "v8.30"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-23"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,9 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.30 2023-12-23
+ *  -- New "oled" command dumps all OLED displays to Serial/Debug, even when no OLED is wired up.
+ *  -- Use .println() instead of .write() for p3000 SERIAL_PRINTLN().
  * Version 8.29 2023-12-21
  *  -- Where possible, eliminate unneeded double<-->int32_t conversions of GPS coordinates.
  *  -- Tweak Nunchuck settings for Celestron Focus Motor speeds.
@@ -276,13 +279,10 @@ static long nvram_save_delay = NVRAM_SAVE_DELAY;
     static inline bool read_ethernet_client_mode_switch (void) { return (READ_WIFI_MODE_PIN() == LOW); }
   #endif
   #include "eth.h"
-  static bool ethernet_detected = false;
-  static char p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
-  #define E3000_ENDLINE() do { e3000.write("\r\n"); e3000.flush(); } while (0)
+  static bool p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
 #else
   #define p3000_debug_ethernet false
-  #define E3000_ENDLINE W3000_ENDLINE
-  #define e3000 w3000
+  #define e3000                w3000  // Keep compiler happy
 #endif /* ETHERNET_ENABLED */
 
 #define BAD_FLOAT_VAL  999999.0
@@ -341,16 +341,17 @@ static inline char SERIAL_READ      (void)          { return SerialDebug ? Seria
 static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  SerialDebug->flush(txonly);   }
 
 // Debug messages use these macros, normally sending to debug uart, but possibly instead to the TCP/IP Port-3000 connection:
-#define W3000_ENDLINE()             do {     w3000.write("\r\n"); w3000.flush(); } while (0)
+#define E3000_ENDLINE() do { e3000.println(); e3000.flush(); } while (0)
+#define W3000_ENDLINE() do { w3000.println(); w3000.flush(); } while (0)
 
 #define SERIAL_ENDLINE() do {                                                              \
   if (p3000_debug) {if (p3000_debug_ethernet) E3000_ENDLINE(); else W3000_ENDLINE();} else \
   if (SerialDebug) {SerialDebug->println(); SERIAL_FLUSH(true);}                           \
 } while (0)
 
-#define SERIAL_PRINTLN(x) do {                                                                             \
-  if (p3000_debug) {if (p3000_debug_ethernet) e3000.write(x); else w3000.write(x); SERIAL_ENDLINE();} else \
-  if (SerialDebug) {SerialDebug->println(x); SERIAL_FLUSH(true);}                                          \
+#define SERIAL_PRINTLN(x) do {                                                               \
+  if (p3000_debug) {if (p3000_debug_ethernet) e3000.println(x); else w3000.println(x);} else \
+  if (SerialDebug) {SerialDebug->println(x); SERIAL_FLUSH(true);}                            \
 } while (0)
 
 #define SERIAL_PRINTF(...) do {                                                                                \
@@ -5718,6 +5719,30 @@ static void oled_loop (void)
   } while (!wrote && oled_row_num != first_row);
   next_update = get_timeout(50);
 }
+
+static void oled_print_displays (void)
+{
+  char tmp[OLED_ROW_CHARS + 1];
+  int orig_mode = oled_mode;
+
+  SERIAL_PRINTLN("+-----------------------+");
+  oled_timer = 0;
+  for (oled_mode = 0; oled_mode < OLED_NMODES; ++oled_mode) {
+    bool (*updatefn)(byte) = oled_updatefn[oled_mode];
+    if (updatefn != oled_QRcode_updatefn && updatefn(oled_firstcall)) {
+      for (byte r = 0; r < 4; ++r) {
+        memcpy(tmp, oled_data[r], OLED_ROW_CHARS);
+        tmp[OLED_ROW_CHARS - 1] = '\0';  // Final char on each row is only 2-columns wide, not visible.
+        SERIAL_PRINTF("| %21s |\r\n", tmp);
+      }
+      SERIAL_PRINTLN("+-----------------------+");
+    }
+  }
+  oled_timer = 0;
+  oled_mode  = orig_mode;
+  oled_updatefn[oled_mode](oled_firstcall);
+}
+
 #endif /* OLED_ENABLED */
 // *** End OLED support  ****************************************************************************************************
 
@@ -7572,6 +7597,9 @@ static const char help_serial_commands[] =
   "g                 -- Toggle GPS debug on/off\r\n"
   "G                 -- Toggle display of GPS NMEA sentences on/off\r\n"
 #endif
+#if OLED_ENABLED
+  "oled              -- Dump contents of the various OLED screens\r\n"
+#endif
   "m                 -- Toggle MUSB debug on/off\r\n"
   "M                 -- Toggle MUSB timestamps on/off\r\n"
   "P                 -- Toggle passive_mode on/off\r\n"
@@ -7704,6 +7732,10 @@ static bool handle_serial_commands (char *cmd)
     SERIAL_PRINT("\033c");
   } else if (match_word("send", &cmd, false)) {
     handle_send_cmd(cmd);
+#if OLED_ENABLED
+  } else if (match_word("oled", &cmd, false)) {
+    oled_print_displays();
+#endif
   } else if (match_word("free", &cmd, true)) {
     SERIAL_PRINTF("free_heap=%lu, min_free=%lu, largest_free=%lu\r\n", esp_get_free_heap_size(),
       heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
@@ -8053,9 +8085,7 @@ static char help_p3000_commands[] =
   "reset             -- reset/restart the ESP32\r\n"
   "version           -- print version info\r\n"
   "load defaults     -- reset NVRAM to factory defaults\r\n"
-#if OLED_ENABLED
   "ota_update        -- fetch/install remote firmware update\r\n"
-#endif
   "save              -- save any NVRAM changes from the 'set' command\r\n"
   "status            -- show some basic system information, including IP address\r\n"
   "get all           -- list all NVRAM variables and values\r\n"
