@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.30"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-23"
+#define VERSION "v8.31"               /* MUST begin with 'v' */
+#define VERSION_DATE "2023-12-30"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,12 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.31 2023-12-30
+ *  -- Reduce PWM frequency for Dew Heaters from 8192Hz to 4Hz: theoretically more efficient.
+ *  -- New "focus.factor" (floating-point) setting for scaling 0..60000 focus motor steps up/down.
+ *  -- New "ssag.discard.mc.acks" (bool) setting to reduce Relay traffic with SSAG.
+ *  -- Misc tweaks and clean-ups.
+ *  -- Enable increasing NVRAM variable count without wiping old saved values.
  * Version 8.30 2023-12-23
  *  -- New "oled" command dumps all OLED displays to Serial/Debug, even when no OLED is wired up.
  *  -- Use .println() instead of .write() for p3000 SERIAL_PRINTLN().
@@ -1018,7 +1024,7 @@ static byte trace_dev  = 0;
 static bool         esp32_wifi_off = true;
 static char         advertisement[128];
 static WiFiServer   W2000(2000);  /* Listen on port 2000 for SkyPortal connections */
-static WiFiServer   W3000(3000);  /* Listen on port 3000 management commands */
+static WiFiServer   W3000(3000);  /* Listen on port 3000 for management/debug commands */
 
 static bool wifi_relay_mode           = false;  // true: AUX bus relay over WiFi
 static bool wifi_client_mode          = false;  // true=client; false=SoftAP
@@ -3163,9 +3169,6 @@ static bool fram_read (uint16_t addr, void *datap, uint16_t len)
 #define FOCUS_LIMIT_MIN                ((ulong)((FOCUS_ZERO_POS) - (FOCUS_MAX_TRAVEL)))
 #define FOCUS_LIMIT_MAX                ((ulong)((FOCUS_ZERO_POS) + (FOCUS_MAX_TRAVEL)))
 
-#define FOCUS_TO_STEPPER_POS(pos)      (((long)(pos)) - (FOCUS_ZERO_POS))
-#define STEPPER_TO_FOCUS_POS(pos)      (((long)(pos)) + (FOCUS_ZERO_POS))
-
 static bool focus_calibrated           = false;  // saved in NVRAM
 static ulong focus_limit_min           = FOCUS_LIMIT_MIN;  // saved in NVRAM
 static ulong focus_limit_max           = FOCUS_LIMIT_MAX;  // saved in NVRAM
@@ -3180,6 +3183,10 @@ static int   focus_speed               = 0;      // Used by backlash compensatio
 static long  focus_target_pos          = FOCUS_ZERO_POS;
 static bool  stepper_is_stopping       = false;
 static uint  stepper_microsteps        = 0;      // Configurable using MS1/MS2/MS2 pins on STEP/DIR motor drivers
+static double focus_factor             = 1.0;    // saved in NVRAM
+
+static inline ulong STEPPER_TO_FOCUS_POS (long spos) { return (spos / focus_factor) + FOCUS_ZERO_POS; }
+static inline long  FOCUS_TO_STEPPER_POS (long fpos) { return (fpos - FOCUS_ZERO_POS) * focus_factor; }
 
 #define STEPPER_DRIVER_NONE       0
 #define STEPPER_DRIVER_STEPDIR    1
@@ -3395,8 +3402,8 @@ static void stepper_init (void)
   stepper_autodetect();
   if (stepper_driver == STEPPER_DRIVER_NONE)
     return;
-  focus_target_pos = focus_restore_pos();
-  long pos = FOCUS_TO_STEPPER_POS(focus_target_pos);
+  long pos = stepper_restore_pos();
+  focus_target_pos = STEPPER_TO_FOCUS_POS(pos);
   if (stepper_driver == STEPPER_DRIVER_STEPDIR) {
     stepdir_set_microsteps(nvram_get_int("focus.microsteps"));
     stepdirEngine.init();
@@ -3418,20 +3425,21 @@ static void stepper_init (void)
   }
 }
 
-static ulong focus_restore_pos (void)
+static ulong stepper_restore_pos (void)
 {
-  ulong pos = 0;
+  long pos = 0;
   if (fram_read(FRAM_STEPPER_POS, &pos, sizeof(pos))) {
-    if (pos >= FOCUS_LIMIT_MIN && pos <= FOCUS_LIMIT_MAX)
+    ulong fpos = STEPPER_TO_FOCUS_POS(pos);
+    if (fpos >= FOCUS_LIMIT_MIN && fpos <= FOCUS_LIMIT_MAX)
       return pos;
   }
-  return FOCUS_ZERO_POS;
+  return FOCUS_TO_STEPPER_POS(FOCUS_ZERO_POS);
 }
 
-static inline void focus_save_pos (ulong pos)
+static inline void stepper_save_pos (long pos)
 {
   if (fram_detected) {
-    static ulong saved_pos = ~0ul;
+    static long saved_pos = ~0ul;
     if (pos != saved_pos) {
       saved_pos = pos;
       fram_write(FRAM_STEPPER_POS, &saved_pos, sizeof(saved_pos));
@@ -3441,9 +3449,9 @@ static inline void focus_save_pos (ulong pos)
 
 static inline ulong focus_currentPosition (void)
 {
-  ulong pos = STEPPER_TO_FOCUS_POS(stepper_getPos());
-  focus_save_pos(pos);
-  return pos;
+  long pos = stepper_getPos();
+  stepper_save_pos(pos);
+  return STEPPER_TO_FOCUS_POS(pos);
 }
 
 static void focus_check_backlash_timeout (void)
@@ -3476,7 +3484,7 @@ static inline void stepper_loop (void)
     if (uln2003_enabled)
       uln2003->run();
   }
-  focus_currentPosition();  // update position
+  stepper_save_pos(stepper_getPos());  // update position
 }
 
 static inline long focus_apply_limits (ulong pos)
@@ -4680,8 +4688,8 @@ static bool sht3x_fetch_measurement (void)
   return true;
 }
 
-#define PWM_FREQUENCY   8192  // high enough to be inaudible
-#define PWM_RESOLUTION  8      // 8-bits is enough here
+#define PWM_FREQUENCY   4     // Same as what Celestron uses
+#define PWM_RESOLUTION  8     // 8-bits is enough here
 
 static void dew_set_pwm_percent (int channel, uint percent)
 {
@@ -5957,7 +5965,7 @@ static byte decode_starsense (struct rxbuf_s *rxbuf, byte b)
 }
 
 #if SSAG_DISCARD_MC_ACKS
-static bool ssag_discard_mc_acks = false;  //FIXME NVRAM ?
+static bool ssag_discard_mc_acks = false;
 #endif
 
 static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
@@ -6770,10 +6778,8 @@ static void bus_loop (struct bus_s *bus)
   txq_free_pkt(txq, p);
 }
 
-#define NVRAM_COUNT 40
-
 // No need to keep these in order; they now get sorted by name when displayed with "get all".
-static char *nvram_vars[NVRAM_COUNT] = {
+static char *nvram_vars[] = {
   (char *)"softap.passkey",
   (char *)"softap.ssid",
   (char *)"wlan.dhcp.enabled",
@@ -6813,11 +6819,12 @@ static char *nvram_vars[NVRAM_COUNT] = {
   (char *)"gps.location.force",  // was ota.timestamp until v8.5
   (char *)"ota.update.server",
   (char *)"ota.update.path",
-  (char *)NULL
+  (char *)"focus.factor",
+  (char *)"ssag.discard.mc.acks",
+  NULL
 };
 
-static       char nvram_vals         [NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1];
-static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
+static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // softap.passkey
   "",               // softap.ssid
   "1",              // wlan.dhcp.enabled
@@ -6834,40 +6841,54 @@ static const char nvram_vals_defaults[NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // focus.backlash.neg
   "",               // focus.microsteps
   "",               // focus.calibrated
-  ""                // mount.reversed.alt
+  "",               // mount.reversed.alt
   "",               // emulate.ssaa
   "",               // emulate.ssag
-  ""                // dew0.amps
-  ""                // dew1.amps
-  ""                // gps.disable
-  ""                // cordwrap.override
-  ""                // dew0.aggression
-  ""                // dew1.aggression
-  ""                // focus.limits
-  ""                // suppress.lowbattery
-  ""                // gps.location.lat
-  ""                // rgps.location.lng
-  ""                // dew0.manual.pwm
-  ""                // dew1.manual.pwm
-  ""                // gps.idle.timeout
-  ""                // oled.type
-  ""                // ota.version.path
-  ""                // auxbus.stopbits
-  ""                // musb.rfenable
-  ""                // gps.location.force  // was ota.timestamp until v8.5
-  ""                // ota.update.server
-  ""                // ota.update.path
+  "",               // dew0.amps
+  "",               // dew1.amps
+  "",               // gps.disable
+  "",               // cordwrap.override
+  "",               // dew0.aggression
+  "",               // dew1.aggression
+  "",               // focus.limits
+  "",               // suppress.lowbattery
+  "",               // gps.location.lat
+  "",               // rgps.location.lng
+  "",               // dew0.manual.pwm
+  "",               // dew1.manual.pwm
+  "",               // gps.idle.timeout
+  "",               // oled.type
+  "",               // ota.version.path
+  "",               // auxbus.stopbits
+  "",               // musb.rfenable
+  "",               // gps.location.force  // was ota.timestamp until v8.5
+  "",               // ota.update.server
+  "",               // ota.update.path
+  "",               // focus.factor
+  "",               // ssag.discard.mc.acks
   ""                // NULL
 };
 
+#include <assert.h>
+#define NVRAM_COUNT  (sizeof(nvram_vars)          / sizeof(nvram_vars[0]))
+#define NVRAM_COUNT2 (sizeof(nvram_vals_defaults) / sizeof(nvram_vals_defaults[0]))
+static_assert(NVRAM_COUNT == NVRAM_COUNT2, "nvram_vars[] not same size as nvram_vals_defaults[]");
+
+static char nvram_vals [NVRAM_COUNT][NVRAM_VALS_MAX_LEN + 1];
+
 static int nvram_find_var (const char *name)
 {
+  unsigned int namelen = strlen(name);
   for (int i = 0; nvram_vars[i]; ++i) {
-    const char *v = nvram_vars[i];
-    byte len = strlen(v);
-    if (name[len] == '\0' || name[len] == ' ') {
-      if (0 == memcmp(name, v, len))
-        return i;
+    const char *vname = nvram_vars[i];
+    if (vname && *vname) {
+      byte len = strlen(vname);
+      if (len <= namelen) {
+        if (name[len] == '\0' || name[len] == ' ') {
+          if (0 == memcmp(name, vname, len))
+            return i;
+        }
+      }
     }
   }
   return -1;
@@ -6895,9 +6916,10 @@ static void nvram_clear_reserved_slots (void)
 {
   // Ensure "reservedNN" slots are empty, keeping them clean for future (re-)uses.
   for (byte v = 0; v < (NVRAM_COUNT - 1); ++v) {
-    if (0 == strncmp(nvram_vars[v], "reserved", 8)) {
+    const char *vname = nvram_vars[v];
+    if (!vname || !vname[0] || 0 == strncmp(vname, "reserved", 8)) {
       if (nvram_vals[v][0]) {
-        SERIAL_PRINTF("nvram: clearing %s: %s\r\n", nvram_vars[v], nvram_vals[v]);
+        SERIAL_PRINTF("nvram: clearing slot %u: %s\r\n", v, nvram_vals[v]);
         nvram_vals[v][0] = 0;
         nvram_delayed_save = get_timeout(nvram_save_delay);
       }
@@ -7009,13 +7031,13 @@ static void nvram_restore ()
 {
   if (nvram_initialized)
       return;
+  memcpy(nvram_vals, nvram_vals_defaults, sizeof(nvram_vals)); // In case restored vals[] is smaller than new size of vals[]
   if (FRAM_USE_FOR_NVRAM && fram_detected) {
     fram_read(FRAM_NVRAM_OFFSET, &nvram_signature, sizeof(nvram_signature));
-    if (strcmp(nvram_signature.sig, VARS_SIGNATURE) || nvram_signature.vsize != sizeof(nvram_vals)) {
-      SERIAL_PRINTLN("read(FRAM): signature mismatch");
-      SERIAL_PRINTF("Sig='%s'  vsize=%lu\r\n", nvram_signature.sig, nvram_signature.vsize);
+    if (strcmp(nvram_signature.sig, VARS_SIGNATURE) || nvram_signature.vsize > sizeof(nvram_vals)) {
+      SERIAL_PRINTF("read(FRAM): signature mismatch: Sig='%s' vsize=%lu\r\n", nvram_signature.sig, nvram_signature.vsize);
     } else {
-      fram_read(FRAM_NVRAM_OFFSET + sizeof(nvram_signature), nvram_vals, sizeof(nvram_vals));
+      fram_read(FRAM_NVRAM_OFFSET + sizeof(nvram_signature), nvram_vals, nvram_signature.vsize);
       nvram_initialized = true;
     }
   } else {
@@ -7038,10 +7060,10 @@ static void nvram_restore ()
         size_t ret = vf.read((uint8_t *)&nvram_signature, sizeof(nvram_signature));
         if (ret != sizeof(nvram_signature))
           SERIAL_PRINTF("read(" NVRAM_PATH ") failed: %d/%d\r\n", ret, sizeof(nvram_vals));
-        else if (strcmp(nvram_signature.sig, VARS_SIGNATURE) || nvram_signature.vsize != sizeof(nvram_vals))
-          SERIAL_PRINTLN("read(" NVRAM_PATH "): signature mismatch");
-        else if ((ret = vf.read((uint8_t *)nvram_vals, sizeof(nvram_vals)) != sizeof(nvram_vals)))
-          SERIAL_PRINTF("read(" NVRAM_PATH ") failed: %d/%d\r\n", ret, sizeof(nvram_vals));
+        else if (strcmp(nvram_signature.sig, VARS_SIGNATURE) || nvram_signature.vsize > sizeof(nvram_vals))
+          SERIAL_PRINTF("read(" NVRAM_PATH "): signature mismatch: vsize=%u/%u\r\n", nvram_signature.vsize, sizeof(nvram_vals));
+        else if ((ret = vf.read((uint8_t *)nvram_vals, nvram_signature.vsize)) != nvram_signature.vsize)
+          SERIAL_PRINTF("read(" NVRAM_PATH ") failed: %d/%d\r\n", ret, nvram_signature.vsize);
         else
           nvram_initialized = true;
       }
@@ -7067,9 +7089,12 @@ static void nvram_restore ()
   if (tmp == 1 || tmp == 2)
     auxbus_stopbits = tmp;
 #if EMULATE_FOCUS
-  focus_backlash_pos = nvram_get_int("focus.backlash.pos");
-  focus_backlash_neg = nvram_get_int("focus.backlash.neg");
-  focus_calibrated   =     nvram_get_bool("focus.calibrated");
+  focus_backlash_pos = nvram_get_int ("focus.backlash.pos");
+  focus_backlash_neg = nvram_get_int ("focus.backlash.neg");
+  focus_calibrated   = nvram_get_bool("focus.calibrated");
+  focus_factor = nvram_get_float("focus.factor");
+  if (focus_factor == 0.0 || focus_factor == BAD_FLOAT_VAL)
+    focus_factor = 1.0;
   char *flimits = (char *)nvram_get_val("focus.limits");
   ulong min = ~0ul, max=~0ul;
   sscanf(flimits, "%lu %lu", &min, &max);
@@ -7131,6 +7156,7 @@ static void nvram_restore ()
   nvram_get_nonblank_val("ota.update.path",   ota_update_path);
   nvram_get_nonblank_val("ota.version.path",  ota_version_path);
 #endif
+  ssag_discard_mc_acks = nvram_get_bool("ssag.discard.mc.acks");
   mount_reversed_alt = nvram_get_bool("mount.reversed.alt");
   // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
   // Insert our MAC address and ADAPTER_VERSION string into the advertisement broadcast string:
@@ -8004,7 +8030,8 @@ static void nvram_get_all (void (*writep)(const char *))
     int best = -1;
     for (int i = 0; nvram_vars[i]; ++i) {
       if (!wrote[i]) {
-        if (0 == strncmp(nvram_vars[i], "reserved", 8))
+        const char *vname = nvram_vars[i];
+        if (!vname || !vname[0] || 0 == strncmp(vname, "reserved", 8))
           wrote[i] = true;
         else if (best == -1 || strcmp(nvram_vars[best], nvram_vars[i]) > 0)
           best = i;
@@ -8252,7 +8279,7 @@ static bool wifi_port_is_connected (WiFiClient client, bool *connected, void (*p
 static void poll_for_new_w3000_connection()
 {
   w3000 = W3000.available();
-  if (w3000) {
+  if (w3000 && w3000.connected()) {
     (void)p3000_decoder(0, NULL, NULL); // reset the decoder
     w3000.write("> ");
   }
