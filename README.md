@@ -5,3 +5,7 @@ I've made this alternative location for documentation and files for the Celestro
 [Version history on Mark's website](https://rtr.ca/hbg3/history.html)
 
 [Check the Wiki for an evolving guide](https://github.com/Mraanderson/HBG3/wiki)
+
+[CloudyNights HBG3 thread](https://www.cloudynights.com/topic/854327-homebrew-gen3-pcb-wifibtgpsmusbrelay)
+
+[CloudyNights dew control thread](https://www.cloudynights.com/topic/848895-homebrew-celestron-compatible-dew-heater-control)
