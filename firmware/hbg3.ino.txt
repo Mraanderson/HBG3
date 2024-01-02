@@ -1,7 +1,7 @@
 /*
  * HBG3 (HomeBrew Gen3) Universal Accessory for the Celestron AUX bus.
  *
- * Copyright(c) 2020-2023 by Mark Lord <mlord@pobox.com>.
+ * Copyright(c) 2020-2024 by Mark Lord <mlord@pobox.com>.
  * This code is free for personal use/modification/whatever.
  *
  * This is a versatile add-on for the Celestron AUX bus.
@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.31"               /* MUST begin with 'v' */
-#define VERSION_DATE "2023-12-30"
+#define VERSION "v8.32"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-01-01"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,9 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.32 2024-01-01
+ *  -- Fix Stepper Motor control: was only moving in one direction (v8.31) because of a signed/unsigned math error.
+ *  -- Get rid of SSAG_DISCARD_MC_ACKS macro.
  * Version 8.31 2023-12-30
  *  -- Reduce PWM frequency for Dew Heaters from 8192Hz to 4Hz: theoretically more efficient.
  *  -- New "focus.factor" (floating-point) setting for scaling 0..60000 focus motor steps up/down.
@@ -114,7 +117,6 @@
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor. PIN conflict with Ethernet.
 #define ETHERNET_ENABLED          true  // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
-#define SSAG_DISCARD_MC_ACKS      true  // Don't forward MC ACKS to SSAG between Relay buses
 
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
 #define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
@@ -3185,8 +3187,8 @@ static bool  stepper_is_stopping       = false;
 static uint  stepper_microsteps        = 0;      // Configurable using MS1/MS2/MS2 pins on STEP/DIR motor drivers
 static double focus_factor             = 1.0;    // saved in NVRAM
 
-static inline ulong STEPPER_TO_FOCUS_POS (long spos) { return (spos / focus_factor) + FOCUS_ZERO_POS; }
-static inline long  FOCUS_TO_STEPPER_POS (long fpos) { return (fpos - FOCUS_ZERO_POS) * focus_factor; }
+static inline ulong STEPPER_TO_FOCUS_POS (long spos) { return (spos / focus_factor) + (long)FOCUS_ZERO_POS; }
+static inline long  FOCUS_TO_STEPPER_POS (long fpos) { return (fpos - (long)FOCUS_ZERO_POS) * focus_factor; }
 
 #define STEPPER_DRIVER_NONE       0
 #define STEPPER_DRIVER_STEPDIR    1
@@ -5964,9 +5966,7 @@ static byte decode_starsense (struct rxbuf_s *rxbuf, byte b)
   return packet_reset(rxbuf, ret);
 }
 
-#if SSAG_DISCARD_MC_ACKS
 static bool ssag_discard_mc_acks = false;
-#endif
 
 static byte packet_decoder (struct rxbuf_s *rxbuf, byte b)
 {
@@ -6043,7 +6043,6 @@ restart:
   if (TVERBOSE(rxbuf->data))
       print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
 
-#if SSAG_DISCARD_MC_ACKS
   if (ssag_discard_mc_acks) {
     // SSAG doesn't need acks back from the motor controllers, so discard those:
     if (dst == DEV_SSAG && (src == DEV_ALT || src == DEV_AZM) && rxbuf->data[1] == 0x03) {
@@ -6051,7 +6050,6 @@ restart:
       return packet_reset(rxbuf, pkt_fail);
     }
   }
-#endif
 
   bus_autodetect_ssforward(bus, src, dst);
   byte op = rxbuf->data[4];
@@ -7813,11 +7811,9 @@ static bool handle_serial_commands (char *cmd)
     dew_debug = !dew_debug;
     SERIAL_PRINTF("dew_debug=%u\r\n", dew_debug);
 #endif
-#if SSAG_DISCARD_MC_ACKS
   } else if (b == 'D') {
     ssag_discard_mc_acks = !ssag_discard_mc_acks;
     SERIAL_PRINTF("ssag_discard_mc_acks=%u\r\n", ssag_discard_mc_acks);
-#endif
 #if EMULATE_FOCUS
   } else if (b == 'f') {
     focus_debug = !focus_debug;
