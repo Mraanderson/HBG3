@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.32"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-01-01"
+#define VERSION "v8.33"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-01-03"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,12 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.33 2024-01-03
+ *  -- Support ENC28J60 ethernet modules again (build-time option in eth.h).
+ *  -- Use WiFi.mode(WIFI_OFF) instead of WiFi.softAPdisconnect(true), to get rid of "esp_wifi_get_mac failed" messages.
+ *  -- Don't try contacting NTP servers unless WiFi is actually connected.
+ *  -- Use faster I2C transfers for OLED and FRAM: the earlier WiFi/BT issues seem to have been resolved at some point.
+ *  -- Update OLED rows every 35msecs instead of every 50msecs.
  * Version 8.32 2024-01-01
  *  -- Fix Stepper Motor control: was only moving in one direction (v8.31) because of a signed/unsigned math error.
  *  -- Get rid of SSAG_DISCARD_MC_ACKS macro.
@@ -273,9 +279,7 @@ static long nvram_delayed_save   = 0;
 static long nvram_save_delay = NVRAM_SAVE_DELAY;
 
 #if ETHERNET_ENABLED && !defined(AIO_H)
-  #if __has_include("eth.h")
-    #warning "Including support for Wiznet W5x00 Ethernet modules"
-  #else
+  #if ! __has_include("eth.h")
     #undef  ETHERNET_ENABLED
     #define ETHERNET_ENABLED false
   #endif
@@ -289,6 +293,7 @@ static long nvram_save_delay = NVRAM_SAVE_DELAY;
   #include "eth.h"
   static bool p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
 #else
+  #define ETH_TYPE "NONE"
   #define p3000_debug_ethernet false
   #define e3000                w3000  // Keep compiler happy
 #endif /* ETHERNET_ENABLED */
@@ -1726,6 +1731,10 @@ void ntp_loop (void)
     }
   }
   if (!ntp_nexttime || time_after(now, ntp_nexttime)) {
+    if (WiFi.status() != WL_CONNECTED) {
+      ntp_nexttime = get_timeout(5 * 1000);
+      return;
+    }
     memset(pkt, 0, sizeof(pkt));
     pkt[ 0] = 0b11100011;   // LI, Version, Mode
     pkt[ 1] = 0;            // Stratum, or type of clock
@@ -3105,6 +3114,7 @@ static bool fram_detected = false;
 
 static bool i2c_detect_device (byte addr)
 {
+  Wire.setClock(100000ul);
   Wire.beginTransmission(addr);
   if (addr == FRAM_I2C_ADDR)
     delay(40);         // Some FRAM chips need at least 37msecs of delay here.
@@ -3123,6 +3133,7 @@ static void fram_write (uint16_t addr, void *datap, uint16_t len)
   if (!fram_detected)
     return;
   //if (verbose) SERIAL_PRINTF("%s: addr=0x%x len=%lu\r\n", __func__, addr, len);
+  Wire.setClock(400000ul);
   byte *data = (byte *)datap;
   while (len) {
     uint16_t this_len = (len > 128) ? 128 : len;  // Break up transfer to prevent WiFi interrupt errors
@@ -3142,6 +3153,7 @@ static bool fram_read (uint16_t addr, void *datap, uint16_t len)
   if (!fram_detected)
     return false;
   //if (verbose) SERIAL_PRINTF("%s: addr=0x%x len=%lu\r\n", __func__, addr, len);
+  Wire.setClock(400000ul);
   byte *data = (byte *)datap;
   while (len) {
     uint16_t this_len = (len > 128) ? 128 : len;  // Break up transfer to prevent WiFi interrupt errors
@@ -4103,6 +4115,7 @@ static bool nchuck_detect (bool blink_led)
   if (nchuck_detected || (next_poll && time_before(millis(), next_poll)))
     return nchuck_detected;
   next_poll = get_timeout(3000);
+  Wire.setClock(100000ul);
   Wire.beginTransmission(NCHUCK_I2C_ADDR);
   Wire.write(0xf0);
   Wire.write(0x55);
@@ -4600,6 +4613,7 @@ done:
 
 static bool sht3x_send_command (uint8_t MSB, uint8_t LSB)
 {
+  Wire.setClock(100000ul);
   Wire.beginTransmission(SHT3X_I2C_ADDR);
   Wire.write(MSB);
   Wire.write(LSB);
@@ -5505,6 +5519,7 @@ static byte QRcode_image[] = {
 
 static void oled_cmd (uint8_t command)
 {
+  Wire.setClock(800000ul);
   Wire.beginTransmission(OLED_I2C_ADDR);
   Wire.write(0x00);        // Select "Command" mode
   Wire.write(command);     // The actual command byte
@@ -5523,6 +5538,7 @@ static void oled_send_image (byte *image, unsigned int image_size)
   oled_cmd(0x00);     //  Low:    0
   oled_cmd(0x07);     //  High:   7
   const byte burst_size = 32;
+  Wire.setClock(800000ul);
   for (byte burst = 0; burst < (image_size / burst_size); burst++) {
     Wire.beginTransmission(OLED_I2C_ADDR);
     Wire.write(0x40);      // Select "Data" mode
@@ -5727,7 +5743,7 @@ static void oled_loop (void)
     wrote = oled_write_row(oled_row_num);
     oled_row_num = (oled_row_num + 1) % 4;
   } while (!wrote && oled_row_num != first_row);
-  next_update = get_timeout(50);
+  next_update = get_timeout(35);  // Could be faster, perhaps?
 }
 
 static void oled_print_displays (void)
@@ -6044,7 +6060,7 @@ restart:
       print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
 
   if (ssag_discard_mc_acks) {
-    // SSAG doesn't need acks back from the motor controllers, so discard those:
+    // SSAG doesn't need to see ACKs back from the motor controllers, so discard those:
     if (dst == DEV_SSAG && (src == DEV_ALT || src == DEV_AZM) && rxbuf->data[1] == 0x03) {
       rxbuf->len = 0;  // eat it
       return packet_reset(rxbuf, pkt_fail);
@@ -7246,7 +7262,7 @@ static bool wifi_begin_client_mode()
     const char *gw     = nvram_get_val("wlan.static.gateway");
     const char *dns    = nvram_get_val("wlan.static.dns");
     IPAddress IP, NMASK, GW, DNS;
-    if (!ip || !*ip || !nmask || !*nmask || !gw || !*gw || !dns || !*dns)
+    if (!*ip || !*nmask || !*gw || !*dns)
       SERIAL_PRINTLN("static IP config failed; using DHCP");
     else if (IP_fromString(IP,ip) && IP_fromString(NMASK,nmask) && IP_fromString(GW,gw) && IP_fromString(DNS,dns))
       WiFi.config(IP, DNS, GW, NMASK);
@@ -7298,15 +7314,15 @@ static void set_esp32_wifi_off (bool want_off)
   if (esp32_wifi_off == want_off)
     return;  /* all okay as-is */
   esp32_wifi_off = want_off;
+#if NTP_ENABLED
+  ntp_time_is_valid = 0;
+#endif
   if (want_off) {
     wifi_relay_mode = false;
     SERIAL_PRINTLN("esp32_wifi OFF");
-    if (wifi_client_mode) {
+    if (wifi_client_mode)
       WiFi.disconnect(true);
-    } else {
-      WiFi.softAPdisconnect(true);
-      //WiFi.enableAP(false);  // Avoids "esp_wifi_get_mac failed!" error when disabling WiFi.
-    }
+    WiFi.mode(WIFI_OFF);
   } else {
     wifi_client_mode = is_wifi_client_mode_requested();
     SERIAL_PRINTF("esp32_wifi ON, %s mode\r\n", wifi_client_mode ? "Client" : "Server");
@@ -8464,7 +8480,7 @@ void setup (void)
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
 
   Wire.begin();            // Prepare the I2C bus for use.  Needed for OLED and AIO.
-  Wire.setClock(100000ul); // 400000ul causes WiFi/BT issues.
+  Wire.setTimeOut(500);    // This supposedly helps mitigate I2C vs. WiFi issues
   fram_setup();
 #if OLED_ENABLED 
   oled_setup();
@@ -8511,9 +8527,9 @@ void setup (void)
   nvram_restore();                      // Also called oled_setup() again if non-default oled_type
   set_blue_led(LED_OFF);
 
-  SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u\r\n",
+  SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u ETH=%s\r\n",
          hbg3_version, auxrelay_detected, EMULATE_GPS, BLOCK_CFM_CONNECTIONS,
-         NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, mount_reversed_alt);
+         NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, mount_reversed_alt, ETH_TYPE);
   init_rxbuf(&w2000_rxbuf, "w2000_rx");
   memset(spaces, ' ', sizeof(spaces) - 1);
 #if EMULATE_GPS
@@ -8549,7 +8565,6 @@ void setup (void)
     if (stepper_driver == STEPPER_DRIVER_NONE)
   #endif
   ethernet_setup();
-  SERIAL_PRINTF("Ethernet %sdetected\r\n", ethernet_detected ? "" : "not ");
 #endif  /* ETHERNET_ENABLED */
   bt_setup();
   if (!simple_mode && is_wifi_client_mode_requested()) {
