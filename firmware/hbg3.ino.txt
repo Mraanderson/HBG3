@@ -9,7 +9,7 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.35"               /* MUST begin with 'v' */
+#define VERSION "v8.36"               /* MUST begin with 'v' */
 #define VERSION_DATE "2024-01-07"
 /*
  * Arduino IDE configuration for this project:
@@ -37,9 +37,11 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.36 2024-01-07
+ *  -- Fix NTP year formatting for transfer to a Celestron hand-controller.
  * Version 8.35 2024-01-07
  *  -- Fix NTP dates by using gmtime_r() instead of buggy local calculations.
- *  -- Change default "amps" (informational-only) setting from 1.8 to 1.7, matching Celestrons 8" Dew Ring.
+ *  -- Change default "dew0.amps" (informational-only) setting from 1.8 to 1.7, matching Celestrons 8" Dew Ring.
  *  -- Enable use of opcode names with the "send" command.
  *  -- Tweaks and tidying to opcode name printing.
  *  -- Fix fake Focus Motor calibration to persist across reset/power cycles.
@@ -2568,8 +2570,8 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
         reply[len++] = year;
 #if NTP_ENABLED
       } else {
-        reply[len++] = ntp_time.year / 100;
-        reply[len++] = ntp_time.year % 100;
+        reply[len++] = ntp_time.year >> 8;
+        reply[len++] = ntp_time.year;
 #endif /* NTP_ENABLED */
       }
       if (gps_debug)
