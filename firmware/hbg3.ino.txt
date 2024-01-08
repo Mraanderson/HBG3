@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.34"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-01-04"
+#define VERSION "v8.35"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-01-07"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,15 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.35 2024-01-07
+ *  -- Fix NTP dates by using gmtime_r() instead of buggy local calculations.
+ *  -- Change default "amps" (informational-only) setting from 1.8 to 1.7, matching Celestrons 8" Dew Ring.
+ *  -- Enable use of opcode names with the "send" command.
+ *  -- Tweaks and tidying to opcode name printing.
+ *  -- Fix fake Focus Motor calibration to persist across reset/power cycles.
+ *  -- Get rid of "focus.calibrated" variable: focus.limits does same job.
+ *  -- Revamp Focus Motor Calibration screen.
+ *  -- Enable forcing a temporary ota_update_path on the command line for "ota_update" (also skips version check).
  * Version 8.34 2024-01-04
  *  -- Handle zero-data GET_MODEL response from older Nexstar-GPS firmware versions.
  * Version 8.33 2024-01-03
@@ -135,6 +144,7 @@ static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
 static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
 static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
 static bool ota_partition_size_okay = false;
+static bool ota_ignore_version = false;
 #endif /* OTA_ENABLED */
 
 // PIN definitions for this project:
@@ -503,12 +513,6 @@ struct auxdev_op_s {
 
 #define OP(op,len) ((uint)((((uint)op) << 8) | ((uint)len)))
 
-// All devices ops:
-#define DEV_GET_VERSION                0xfe
-#define DEV_GET_MODEL                  0x05
-#define DEV_PROGRAM_ENA                0x8a
-#define DEV_BAD_OP                     0xf0  // Devices return 'f0 xx' when 'xx' is an unsupported opcode
-
 // Motor Controller ops:
 #define MC_GET_POS                     0x01
 #define MC_GOTO_FAST                   0x02
@@ -764,26 +768,74 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
   {0xff, NULL}
 };
 
-#define SET_EVO_WIFI        0x10
+// Various oddball ops:
 #define BATT_GET_VOLTAGE    0x10
 #define BATT_MAX_CURRENT    0x18
-#define LEDS_GET_LEVEL      0x10
+#define LEDS_LEVEL          0x10  // Always returns levels; sets new levels if 1-byte of data supplied.
 #define PWRCHG_GET_MODE     0x10
 #define UART_SET_BAUD       0x51
+#define SET_EVO_WIFI        0x10
+// All devices ops:
+#define DEV_PROGRAM_ENA     0x8a
+#define DEV_GET_VERSION     0xfe
+#define DEV_GET_MODEL       0x05
+#define DEV_BAD_OP          0xf0  // Devices return 'f0 xx' when 'xx' is an unsupported opcode
 
-// Oddball ops:
-static const struct auxdev_oddball_s {
-  byte dev;
-  struct auxdev_op_s op_name;
-} aux_oddball_ops[] = {
-  {DEV_BATT,   AUX_DEV_OP(BATT_GET_VOLTAGE)},
-  {DEV_BATT,   AUX_DEV_OP(BATT_MAX_CURRENT)},
-  {DEV_LEDS,   AUX_DEV_OP(LEDS_GET_LEVEL)},
-  {DEV_PWRCHG, AUX_DEV_OP(PWRCHG_GET_MODE)},
-  {DEV_UART,   AUX_DEV_OP(UART_SET_BAUD)},
-  {DEV_EVWIFI, AUX_DEV_OP(SET_EVO_WIFI)},
-  {0xff, 0xff, NULL}
+static const struct auxdev_op_s aux_misc_ops[] = {
+  AUX_DEV_OP(BATT_GET_VOLTAGE),
+  AUX_DEV_OP(BATT_MAX_CURRENT),
+  AUX_DEV_OP(LEDS_LEVEL),
+  AUX_DEV_OP(PWRCHG_GET_MODE),
+  AUX_DEV_OP(UART_SET_BAUD),
+  AUX_DEV_OP(SET_EVO_WIFI),
+  AUX_DEV_OP(DEV_PROGRAM_ENA),
+  AUX_DEV_OP(DEV_GET_VERSION), // special handling
+  AUX_DEV_OP(DEV_GET_MODEL),   // special handling
+  AUX_DEV_OP(DEV_BAD_OP),      // special handling
+  {0xff, NULL}   // MUST update misc_ops_dev[] below whenever changing this array!
 };
+
+static const byte misc_ops_devs[] = {
+  DEV_BATT,
+  DEV_BATT,
+  DEV_LEDS,
+  DEV_PWRCHG,
+  DEV_UART,
+  DEV_EVWIFI,
+  0,             // any dev: GET_PROGRAM_ENA
+  0,             // any dev: GET_VERSION
+  0,             // any dev: GET_MODEL
+  0,             // any dev: GET_BAD_OP
+  0xff           // MUST update this array whenever changing aux_misc_ops[]
+};
+
+static byte find_op_by_name_array (const char *name, const struct auxdev_op_s *a)
+{
+  for (const char *aname; (aname = a->name) != NULL; a++) {
+    if (0 == strcasecmp(name, aname))
+      break;
+    while (*aname != '_' && *++aname);
+    if (*aname == '_' && *++aname && 0 == strcasecmp(name, aname))
+      break;
+  }
+  return a->op;
+}
+
+// find_op_by_name() is for use with the "send" command:
+static byte find_op_by_name (const char *name)
+{
+  byte op = find_op_by_name_array(name, aux_mc_ops);
+  if (op != 0xff) return op;
+  op = find_op_by_name_array(name, aux_misc_ops);
+  if (op != 0xff) return op;
+  op = find_op_by_name_array(name, aux_ssag_ops);
+  if (op != 0xff) return op;
+  op = find_op_by_name_array(name, aux_ssaa_ops);
+  if (op != 0xff) return op;
+  op = find_op_by_name_array(name, aux_gps_ops);
+  if (op != 0xff) return op;
+  return find_op_by_name_array(name, aux_dew_ops);
+}
 
 static const char *op_lookup (byte op, const struct auxdev_op_s *dev_ops)
 {
@@ -905,29 +957,24 @@ static uint32_t get_24bit_value (byte *p)
   return val;
 }
 
-#define ENABLE_SHOW_POS_DEGREES true  // false to reduce code size/overhead
-
 static void print_24bits (byte *data)
 {
-  if (ENABLE_SHOW_POS_DEGREES) {
-    int32_t val    = get_24bit_value(data);
-    int     is_neg = val & 0x800000;
-    int32_t v = val;
-    if (is_neg)
-      v = -(val | 0xff000000);
-    double degrees = v * 360.0 / 0x1000000;
-    if (is_neg && degrees)
-      degrees = -degrees;
-    SERIAL_PRINTF("%7.3f", degrees);
-  }
+  int32_t val    = get_24bit_value(data);
+  int     is_neg = val & 0x800000;
+  int32_t v = val;
+  if (is_neg)
+    v = -(val | 0xff000000);
+  double degrees = v * 360.0 / 0x1000000;
+  if (degrees < 0.001)
+    degrees = 0;
+  if (is_neg && degrees)
+    degrees = -degrees;
+  SERIAL_PRINTF("%7.3f", degrees);
 }
 
 static const char *op_decoder (byte *data)
 {
   byte op = data[4];
-  if (op == DEV_PROGRAM_ENA) {
-    return "PROGRAM_ENA";
-  }
   if (op == DEV_GET_VERSION) {
     if (data[1] != 0x03)
       return get_version_decoder(data);
@@ -941,34 +988,45 @@ static const char *op_decoder (byte *data)
       return get_model_decoder(data);
     return "GET_MODEL";
   }
-  if (op == DEV_BAD_OP) {
-    SERIAL_PRINTF("BAD_OP 0x%02x", data[5]);
+  if (op == MC_GET_POS && (src == DEV_AZM || src == DEV_ALT)) {
+    SERIAL_PRINT(" MC_GET_POS ");
+    print_24bits(data + 5);
     return NULL;
   }
-  if (ENABLE_SHOW_POS_DEGREES) {
-    if (src == DEV_AZM || src == DEV_ALT) {
-      if (op == MC_GET_POS) {
-        SERIAL_PRINT(" MC_GET_POS ");
-        print_24bits(data + 5);
-        return NULL;
-      }
-    }
-    if (src == DEV_AZM && op == MC_GET_CORDWRAP_POS) {
+  if (src == DEV_AZM) {
+    if (op == MC_GET_CORDWRAP_POS) {
       SERIAL_PRINT(" MC_GET_CORDWRAP_POS ");
       print_24bits(data + 5);
       return NULL;
     }
-    if (dst == DEV_AZM) {
-      if (op == MC_SET_CORDWRAP_POS) {
-        SERIAL_PRINT(" MC_SET_CORDWRAP_POS ");
-        print_24bits(data + 5);
-        return NULL;
-      }
+    if (op == MC_SET_CORDWRAP_POS) {
+      SERIAL_PRINT(" MC_SET_CORDWRAP_POS ");
+      print_24bits(data + 5);
+      return NULL;
     }
-  } /* ENABLE_SHOW_POS_DEGREES */
-  if (src == DEV_FOCUS && op == MC_GET_POS) {
+  }
+  if (op == MC_GET_POS && src == DEV_FOCUS) {
     SERIAL_PRINTF(" MC_GET_POS %lu", get_24bit_value(data + 5));
     return NULL;
+  }
+  if (src == DEV_BATT) {
+    if (op == BATT_MAX_CURRENT) {
+      uint bc = ((uint)data[5] << 8) | data[6];
+      SERIAL_PRINTF(" BATT_MAX_CURRENT %u.%03uA", bc / 1000, bc % 1000);
+      return NULL;
+    }
+    if (op == BATT_GET_VOLTAGE) {
+      const char *state;
+      ulong bv = (((ulong)data[7] << 24) | ((ulong)data[8] << 16) | ((ulong)data[9] << 8) | data[10]) / 1000;
+      switch (data[5] & 3) {
+        case 00: state = "Discharging"; break;
+        case 01: state = "Charging";    break;
+        case 02: state = "Charged";     break;
+        default: state = "ChargeFault"; break;
+      }
+      SERIAL_PRINTF(" BATT_GET_VOLTAGE %s %u.%02uV", state, bv / 1000, bv % 1000);
+      return NULL;
+    }
   }
   switch (dst) {
     case DEV_FOCUS:
@@ -990,26 +1048,9 @@ static const char *op_decoder (byte *data)
         return op_lookup(op, aux_mc_ops);
       return op_lookup(op, aux_ssag_ops);
   }
-  if (src == DEV_BATT && op == BATT_MAX_CURRENT) {
-    uint bc = ((uint)data[5] << 8) | data[6];
-    SERIAL_PRINTF(" BATT_MAX_CURRENT %u.%03uA", bc / 1000, bc % 1000);
-    return NULL;
-  }
-  if (src == DEV_BATT && op == BATT_GET_VOLTAGE) {
-    const char *state;
-    ulong bv = (((ulong)data[7] << 24) | ((ulong)data[8] << 16) | ((ulong)data[9] << 8) | data[10]) / 1000;
-    switch (data[5] & 3) {
-      case 00: state = "Discharging"; break;
-      case 01: state = "Charging";    break;
-      case 02: state = "Charged";     break;
-      default: state = "ChargeFault"; break;
-    }
-    SERIAL_PRINTF(" BATT_GET_VOLTAGE %s %u.%02uV", state, bv / 1000, bv % 1000);
-    return NULL;
-  }
-  for (const struct auxdev_oddball_s *d = aux_oddball_ops; d->op_name.name; ++d) {
-      if (dst == d->dev && op == d->op_name.op)
-        return d->op_name.name;
+  for (byte d = 0; aux_misc_ops[d].name; ++d) {
+    if (op == aux_misc_ops[d].op && (!misc_ops_devs[d] || dst == misc_ops_devs[d]))
+      return aux_misc_ops[d].name;
   }
   if (op == MC_SEND_WARNING || op == MC_SEND_ERROR) {
     if (src == DEV_AZM || src == DEV_ALT) {
@@ -1017,6 +1058,7 @@ static const char *op_decoder (byte *data)
         return "WARNING LOW_BATTERY";
       return op_lookup(op, aux_mc_ops);
     }
+    return (op == MC_SEND_WARNING) ? "MC_SEND_WARNING?" : "MC_SEND_ERROR?";
   }
   return NULL;
 }
@@ -1643,13 +1685,6 @@ static byte long_to_4bytes (byte *dest, ulong v)
 static long ntp_time_is_valid    = 0;  // Timestamp of most recent NTP update.
 static byte ntp_fast_update_secs = 0;  // Interval in seconds for next NTP update, when requested.
 
-/* Date calculation based on __secs_to_tm() from http://git.musl-libc.org/cgit/musl/tree/src/time/__secs_to_tm.c */
-
-#define LEAPOCH       (946684800ull + 86400 * (31 + 29))  /* 2000-03-01 (mod 400 year, immediately after feb29 */
-#define DAYS_PER_400Y (365 * 400 + 97)
-#define DAYS_PER_100Y (365 * 100 + 24)
-#define DAYS_PER_4Y   (365 *   4 + 1)
-
 static struct ntp_time_s {
   uint16_t  year;
   uint8_t   month;
@@ -1659,52 +1694,19 @@ static struct ntp_time_s {
   uint8_t   ss;
 } ntp_time;
 
-static inline void timesecs_to_utc (long long secsSince1900)
+static void timesecs_to_utc (ulong ntp_secs)
 {
-  const ulong seventyYears = 2208988800UL;
-        ulong seconds      = secsSince1900 - seventyYears;
-  long long days, secs;
-  long remdays, remsecs, remyears, years, leap, qc_cycles, c_cycles, q_cycles;
-  byte months, wday;
-  static const char days_in_month[] = {31,30,31,30,31,31,30,31,30,31,31,29};
+  struct tm t;
+  const ulong seventy_years = 2208988800ul;
+  time_t secs    = ntp_secs - seventy_years;  // NTP returns secs since 1900; gmtime() wants secs since 1970
 
-  secs = seconds - LEAPOCH;
-  days = secs / 86400;
-  remsecs = secs % 86400;
-  if (remsecs < 0) {
-    remsecs += 86400;
-    days--;
-  }
-  qc_cycles = days / DAYS_PER_400Y;
-  remdays = days % DAYS_PER_400Y;
-  if (remdays < 0) {
-    remdays += DAYS_PER_400Y;
-    qc_cycles--;
-  }
-  c_cycles = remdays / DAYS_PER_100Y;
-  if (c_cycles == 4) c_cycles--;
-  remdays -= c_cycles * DAYS_PER_100Y;
-  q_cycles = remdays / DAYS_PER_4Y;
-  if (q_cycles == 25) q_cycles--;
-  remdays -= q_cycles * DAYS_PER_4Y;
-  remyears = remdays / 365;
-  if (remyears == 4) remyears--;
-  remdays -= remyears * 365;
-  leap     = !remyears && (q_cycles || !c_cycles);
-  years    =  remyears + 4*q_cycles + 100*c_cycles + 400ll*qc_cycles;
-
-  for (months=0; days_in_month[months] <= remdays; months++)
-    remdays -= days_in_month[months];
-  if (months > 10) {
-    months -= 12;
-    years++;
-  }
-  ntp_time.year  = years   + 2000;
-  ntp_time.month = months  + 2 + 1;   // Month as 01..12 !!
-  ntp_time.day   = remdays + 1;
-  ntp_time.hh    = remsecs / 3600;
-  ntp_time.mm    = remsecs / 60 % 60;
-  ntp_time.ss    = remsecs % 60;
+  gmtime_r(&secs, &t);
+  ntp_time.year  = t.tm_year + 1900;
+  ntp_time.month = t.tm_mon  + 1;
+  ntp_time.day   = t.tm_mday;
+  ntp_time.hh    = t.tm_hour;
+  ntp_time.mm    = t.tm_min;
+  ntp_time.ss    = t.tm_sec;
 }
 
 #include <WiFiUdp.h>
@@ -1755,9 +1757,9 @@ void ntp_loop (void)
   if (!udp_ntp.parsePacket())
     return;
   ntp_time_is_valid = millis();
-  udp_ntp.read(pkt, sizeof(pkt)); // read the packet into the buffer
-  ulong secsSince1900 = ((ulong)pkt[40] << 24) | ((ulong)pkt[41] << 16) | ((ulong)pkt[42] << 8) | pkt[43];
-  timesecs_to_utc(secsSince1900);
+  udp_ntp.read(pkt, sizeof(pkt)); // get UDP response packet into pkt[]
+  ulong ntp_secs = ((ulong)pkt[40] << 24) | ((ulong)pkt[41] << 16) | ((ulong)pkt[42] << 8) | pkt[43];
+  timesecs_to_utc(ntp_secs);
   if (verbose)
     SERIAL_PRINTF("ntp_time: %02u/%02u/%04u UTC %02u:%02u:%02u\r\n", ntp_time.day, ntp_time.month, ntp_time.year, ntp_time.hh, ntp_time.mm, ntp_time.ss);
 }
@@ -3189,7 +3191,7 @@ static bool focus_calibrated           = false;  // saved in NVRAM
 static ulong focus_limit_min           = FOCUS_LIMIT_MIN;  // saved in NVRAM
 static ulong focus_limit_max           = FOCUS_LIMIT_MAX;  // saved in NVRAM
 static bool  focus_debug               = false;
-static long  focus_calibration_running = 0;
+static long  focus_fake_calibration_running = 0;
 static byte  focus_backlash_pos        = 0;      // saved in NVRAM
 static byte  focus_backlash_neg        = 0;      // saved in NVRAM
 static long  focus_backlash_timeout    = 0;      // Used by backlash compensation logic
@@ -3479,15 +3481,35 @@ static void focus_check_backlash_timeout (void)
   }
 }
 
+static void focus_set_calibration (ulong min, ulong max)
+{
+  char tbuf[16], *flimits = (char *)nvram_get_val("focus.limits");
+  if (min < FOCUS_LIMIT_MIN || min >= max || max > FOCUS_LIMIT_MAX) {
+    focus_calibrated = 0;
+    focus_limit_min = FOCUS_LIMIT_MIN;
+    focus_limit_max = FOCUS_LIMIT_MAX;
+    tbuf[0] = '\0';
+  } else {
+    focus_calibrated = 1;
+    focus_limit_min = min;
+    focus_limit_max = max;
+    sprintf(tbuf, "%lu %lu", min, max);
+  }
+  if (strcmp(tbuf, flimits)) {
+    strcpy(flimits, tbuf);
+    nvram_delayed_save = get_timeout(nvram_save_delay);
+  }
+  SERIAL_PRINTF("%s(%lu,%lu): limits=%lu:%lu focus_calibrated=%u\r\n", __func__, min, max, focus_limit_min, focus_limit_max, focus_calibrated);
+}
+
 static inline void stepper_loop (void)
 {
   if (stepper_driver == STEPPER_DRIVER_NONE)
     return;
   stepper_stop_assist();
-  if (focus_calibration_running && time_after(millis(), focus_calibration_running)) {
-    focus_calibration_running = 0;
-    focus_calibrated = 1;
-    nvram_save_int("focus.calibrated", focus_calibrated);
+  if (focus_fake_calibration_running && time_after(millis(), focus_fake_calibration_running)) {
+    focus_fake_calibration_running = 0;
+    focus_set_calibration(FOCUS_LIMIT_MIN, FOCUS_LIMIT_MAX);
   }
   focus_check_backlash_timeout();
   if (stepper_driver == STEPPER_DRIVER_ULN2003) {
@@ -3619,11 +3641,14 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
     }
     case OP(MC_CALIBRATION_ENABLE,4): { // 1-byte 0=force_stop; non-zero=begin_calibration
       if (data[5] == 0) {
-        focus_calibration_running = 0;
+        focus_fake_calibration_running = 0;
       } else {
-        focus_calibrated = 0;
-        focus_calibration_running = get_timeout(1000);  // Pretend to be doing something briefly
-        nvram_save_int("focus.calibrated", focus_calibrated);
+        const ulong FAKE_DELAY = 1000;
+        ulong odelay = nvram_save_delay;
+        nvram_save_delay = FAKE_DELAY + 500;  // Save wear-and-tear: prevent focus_set_calibration() from writing to NVRAM
+        focus_set_calibration(0,0);
+        nvram_save_delay = odelay;
+        focus_fake_calibration_running = get_timeout(FAKE_DELAY);  // Pretend to be doing something briefly
       }
       if (focus_debug)
         SERIAL_PRINTF("FOCUS CALIBRATION_ENABLE %s\r\n", data[5] ? "begin" : "clear");
@@ -3673,30 +3698,6 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
   }
   emulate_send_reply("focus_tx", rxbuf, reply, len);
   return false;
-}
-
-static void focus_set_save_limits (bool force, ulong min, ulong max)
-{
-  char tbuf[16], *flimits = (char *)nvram_get_val("focus.limits");
-  tbuf[0] = '\0';
-  if (min < FOCUS_LIMIT_MIN || min >= max || max > FOCUS_LIMIT_MAX) {
-    if (force) {
-      *flimits = '\0';
-      nvram_delayed_save = get_timeout(nvram_save_delay);
-      focus_calibrated = 0;
-      nvram_save_int("focus.calibrated", focus_calibrated);
-    }
-  } else {
-    focus_limit_min = min;
-    focus_limit_max = max;
-    sprintf(tbuf, "%lu %lu", min, max);
-    if (strcmp(tbuf, flimits)) {
-      strcpy(flimits, tbuf);
-      nvram_delayed_save = get_timeout(nvram_save_delay);
-    }
-    focus_calibrated = 1;
-    nvram_save_int("focus.calibrated", focus_calibrated);
-  }
 }
 
 /************************** End   Stepper motor emulation of Celestron Focus Motor *************************/
@@ -4980,7 +4981,7 @@ static void dew_setup ()
 
 static double dew_nvram_restore_amperage (byte channel)
 {
-  double amps = 1.8;  // default value
+  double amps = 1.7;  // default value
   char name[16];
   sprintf(name, "dew%u.amps", channel);
   const char *val = nvram_get_val(name);
@@ -5166,7 +5167,7 @@ static bool focus_updatefn (byte arg)  // oled_arg_t
 {
   static byte which_screen;
   static bool got_action, draw_screen;
-  static ulong p, min = ~0ul, max = ~0ul;
+  static ulong p;
   static long final_delay, next_poll = 0;
   char tmp[OLED_ROW_CHARS + 1];
 
@@ -5181,25 +5182,19 @@ static bool focus_updatefn (byte arg)  // oled_arg_t
   } else if (next_poll && time_before(millis(), next_poll)) {
     return true;
   }
-
-  p = focus_currentPosition();
   next_poll = get_timeout(500);  // Updating OLED REALLY interferes with the stepper motor!
-  snprintf(tmp, OLED_ROW_CHARS, "    Pos: %5lu", p);
-  oled_set_row(2, tmp);
   if (which_screen == 0) {
     if (draw_screen) {
       draw_screen = false;
       oled_set_row(0, "Focus Motor:");
-      oled_set_row(3, "Press/Hold for Limits");
-      min = focus_limit_min;
-      max = focus_limit_max;
-      snprintf(tmp, OLED_ROW_CHARS, "Min/Max: %-5lu %-5lu", min, max);
-      oled_set_row(1, tmp);
+      oled_set_row(2, "Push+Hold button");
+      oled_set_row(3, " to Begin Calibration.");
     }
     if (arg == oled_normal) {
       if (got_action) {
         got_action = false;
         which_screen = 1;
+        focus_set_calibration(0, 0);
         draw_screen = true;
         next_poll = 0;
       }
@@ -5207,30 +5202,31 @@ static bool focus_updatefn (byte arg)  // oled_arg_t
       oled_timer = get_timeout(700);
     } else if (arg == oled_timeout) {
       got_action = true;
+      oled_set_row(2, "");
       oled_set_row(3, "Okay. Let Go Now.");
     }
-    return true;
+    goto show_position;
   }
   if (draw_screen) {
     draw_screen = false;
     if (which_screen == 1) {
       focus_limit_min = FOCUS_LIMIT_MIN;
       oled_set_row(0, "Focus Min-Limit:  ");
-      oled_set_row(1, "Move motor to Min:");
-    } else {
+      oled_set_row(2, "Move motor to Min..");
+    } else if (which_screen == 2) {
       focus_limit_max = FOCUS_LIMIT_MAX;
       oled_set_row(0, "Focus Max-Limit:  ");
-      oled_set_row(1, "Move motor to Max:");
+      oled_set_row(2, "Move motor to Max");
     }
-    oled_set_row(3, "Push/hold to Set.");
+    oled_set_row(3, "  Push+Hold to Set.");
   }
   if (arg == oled_normal) {
     if (got_action) {
       got_action = false;
       draw_screen = true;
       next_poll = 0;
-      if (which_screen++ == 2) {
-        focus_set_save_limits(false, min, max);
+      if (++which_screen == 3) {
+        focus_set_calibration(focus_limit_min, focus_limit_max);
         which_screen = 0;
       }
     }
@@ -5239,11 +5235,16 @@ static bool focus_updatefn (byte arg)  // oled_arg_t
   } else if (arg == oled_timeout) {
     got_action = true;
     if (which_screen == 1)
-      min = p;
-    else
-      max = p;
+      focus_limit_min = p;
+    else if (which_screen == 2)
+      focus_limit_max = p;
+    oled_set_row(2, "");
     oled_set_row(3, "Okay. Let Go Now.");
   }
+show_position:
+  p = focus_currentPosition();
+  snprintf(tmp, OLED_ROW_CHARS, "%5lu<< %5lu >>%-5lu", focus_limit_min, p, focus_limit_max);
+  oled_set_row(1, tmp);
   return true;
 }
 #endif /* EMULATE_FOCUS */
@@ -5479,7 +5480,7 @@ static bool oled_ota_updatefn (byte arg)  // oled_arg_t
   if (oled_timer)
     oled_set_row(2, "Hold for 3 seconds");
   else if (fwupdate_possible)
-    oled_set_row(2, "Push/hold button");
+    oled_set_row(2, "Push+Hold button");
   return true;
 }
 #endif /* OTA_ENABLED */
@@ -6799,6 +6800,8 @@ static void bus_loop (struct bus_s *bus)
   txq_free_pkt(txq, p);
 }
 
+static const char RESERVED[] = "RESERVED";
+
 // No need to keep these in order; they now get sorted by name when displayed with "get all".
 static char *nvram_vars[] = {
   (char *)"softap.passkey",
@@ -6816,7 +6819,7 @@ static char *nvram_vars[] = {
   (char *)"focus.backlash.pos",
   (char *)"focus.backlash.neg",
   (char *)"focus.microsteps",
-  (char *)"focus.calibrated",
+  (char *) RESERVED,     // was focus.calibrated until v8.35
   (char *)"mount.reversed.alt",
   (char *)"emulate.ssaa",
   (char *)"emulate.ssag",
@@ -6861,7 +6864,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // focus.backlash.pos
   "",               // focus.backlash.neg
   "",               // focus.microsteps
-  "",               // focus.calibrated
+  "",               // RESERVED   was focus.calibrated
   "",               // mount.reversed.alt
   "",               // emulate.ssaa
   "",               // emulate.ssag
@@ -6938,7 +6941,7 @@ static void nvram_clear_reserved_slots (void)
   // Ensure "reservedNN" slots are empty, keeping them clean for future (re-)uses.
   for (byte v = 0; v < (NVRAM_COUNT - 1); ++v) {
     const char *vname = nvram_vars[v];
-    if (!vname || !vname[0] || 0 == strncmp(vname, "reserved", 8)) {
+    if (!vname || !vname[0] || 0 == strncmp(vname, RESERVED, strlen(RESERVED))) {
       if (nvram_vals[v][0]) {
         SERIAL_PRINTF("nvram: clearing slot %u: %s\r\n", v, nvram_vals[v]);
         nvram_vals[v][0] = 0;
@@ -7112,14 +7115,14 @@ static void nvram_restore ()
 #if EMULATE_FOCUS
   focus_backlash_pos = nvram_get_int ("focus.backlash.pos");
   focus_backlash_neg = nvram_get_int ("focus.backlash.neg");
-  focus_calibrated   = nvram_get_bool("focus.calibrated");
   focus_factor = nvram_get_float("focus.factor");
   if (focus_factor == 0.0 || focus_factor == BAD_FLOAT_VAL)
     focus_factor = 1.0;
+  ulong min, max;
   char *flimits = (char *)nvram_get_val("focus.limits");
-  ulong min = ~0ul, max=~0ul;
-  sscanf(flimits, "%lu %lu", &min, &max);
-  focus_set_save_limits(true, min, max);
+  if (2 != sscanf(flimits, "%lu %lu", &min, &max))
+    min = max = 0;
+  focus_set_calibration(min, max);
 #endif /* EMULATE_FOCUS */
 #if EMULATE_SSAA
   emulate_ssaa = nvram_get_bool("emulate.ssaa");
@@ -7583,19 +7586,22 @@ static void ota_fetch_update (void)
 
   ota_show_progress(0, 0);  // Initialize the display
   ota_fetch_file(ota_update_server, ota_version_path, ota_update_path);
-  // Note: server seems to respond with a bytecount line as well as the actual data..
+  // Note: server responds with a (hex) bytecount line as well as the actual data..
   while (1) {
     ota_wait_for_data();
     String line = otaclient.readStringUntil('\n');
+    line.trim();
     const char *data = line.c_str();
     SERIAL_PRINTF("server: %s\r\n", data);
     if (data[0] == 'v') {
       strncpy(version, data, sizeof(version) - 1);
       break;
     }
+    if (!data[0])
+      ota_exit("File not found.");
   }
   SERIAL_PRINTF("OTA: running=" VERSION " " VERSION_DATE ", available=%s\r\n", version);
-  if (0 == strcmp(version, VERSION " " VERSION_DATE))
+  if (!ota_ignore_version && 0 == strcmp(version, VERSION " " VERSION_DATE))
     ota_exit("Already Up-to-date");
 #if OLED_ENABLED
   char tmp[OLED_ROW_CHARS + 1];
@@ -7685,8 +7691,7 @@ static int get_hex_byte_val (char **cmd_p)
   char *cmd = *cmd_p;
   int x1, x2;
 
-  while (*cmd == ' ')
-    ++cmd;
+  while (*cmd == ' ') ++cmd;
   if (cmd[0] == '0' && cmd[1] == 'x')
     cmd += 2;
   x1 = get_hex_digit(*cmd);
@@ -7697,8 +7702,7 @@ static int get_hex_byte_val (char **cmd_p)
     goto Huh;
   if (*++cmd && *cmd != ' ')
     goto Huh;
-  while (*cmd == ' ')
-    ++cmd;
+  while (*cmd == ' ') ++cmd;
   *cmd_p = cmd;
   return (x1 << 4) | x2;
 Huh:
@@ -7709,16 +7713,13 @@ Huh:
 static bool match_word (const char *word, char **cmd_p, bool noargs)
 {
   char *cmd = *cmd_p;
-  while (*cmd == ' ')
-    ++cmd;
+  while (*cmd == ' ') ++cmd;
   if (0 == strncasecmp(word, cmd, strlen(word))) {
     cmd += strlen(word);
-    while (*cmd == ' ')
-      ++cmd;
-    if (!*cmd || !noargs) {
-      *cmd_p = cmd;
+    while (*cmd == ' ') ++cmd;
+    *cmd_p = cmd;
+    if (!*cmd || !noargs)
       return true;
-    }
   }
   return false;
 }
@@ -7726,8 +7727,7 @@ static bool match_word (const char *word, char **cmd_p, bool noargs)
 static int get_dev_name (char **cmd_p)
 {
   char *cmd = *cmd_p;
-  while (*cmd == ' ')
-    ++cmd;
+  while (*cmd == ' ') ++cmd;
   if (!*cmd)
     return -1;
   for (byte i = 0; i < N_DEVNAMES; ++i) {
@@ -7753,12 +7753,30 @@ static void handle_send_cmd (char *cmd)
   if (val == -1)
     return;
   msg[len++] = val;
-  do {
+  while (*cmd == ' ') ++cmd;
+
+  // Look for a possible opcode name as first parameter:
+  if (cmd[0] && (cmd[0] < '0' || cmd[0] > '9') && cmd[1] && cmd[2] && cmd[2] != ' ') {
+    char savedc, *t = cmd;
+    while (*t && *t != ' ') ++t;    // Find end-of-word
+    savedc = *t;                    // Temporarily save char after end-of-word
+    *t = '\0';                      // Zero-terminate the word
+    byte op = find_op_by_name(cmd);
+    *t = savedc;                    // Restore original char
+    if (op != 0xff) {               // Was opcode name found?
+      msg[len++] = op;              // Stuff opcode into msg
+      cmd = t;                      // Skip ahead to next word
+      while (*cmd == ' ') ++cmd;    // Skip to next word, needed by loop below
+    }
+  }
+
+  // Now collect the remaining parameters as additional message data:
+  while (*cmd && len < (AUXBUS_PKT_MAX - 1)) {
     val = get_hex_byte_val(&cmd);
     if (val == -1)
       return;
     msg[len++] = val;
-  } while (*cmd && len < (AUXBUS_PKT_MAX - 1));
+  }
   if (len < 5)
     SERIAL_PRINTLN("Huh? missing opcode");
   else
@@ -8050,7 +8068,7 @@ static void nvram_get_all (void (*writep)(const char *))
     for (int i = 0; nvram_vars[i]; ++i) {
       if (!wrote[i]) {
         const char *vname = nvram_vars[i];
-        if (!vname || !vname[0] || 0 == strncmp(vname, "reserved", 8))
+        if (!vname || !vname[0] || 0 == strncmp(vname, RESERVED, strlen(RESERVED)))
           wrote[i] = true;
         else if (best == -1 || strcmp(nvram_vars[best], nvram_vars[i]) > 0)
           best = i;
@@ -8131,7 +8149,7 @@ static char help_p3000_commands[] =
   "reset             -- reset/restart the ESP32\r\n"
   "version           -- print version info\r\n"
   "load defaults     -- reset NVRAM to factory defaults\r\n"
-  "ota_update        -- fetch/install remote firmware update\r\n"
+  "ota_update [path] -- fetch/install remote firmware update\r\n"
   "save              -- save any NVRAM changes from the 'set' command\r\n"
   "status            -- show some basic system information, including IP address\r\n"
   "get all           -- list all NVRAM variables and values\r\n"
@@ -8170,7 +8188,11 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
     writep("Loaded defaults");
     wlan_ssid_passkey_updated = false;
 #if OTA_ENABLED
-  } else if (match_word("ota_update", &cmd, true)) {
+  } else if (match_word("ota_update", &cmd, false)) {
+    if (*cmd) {
+      ota_ignore_version = true;
+      strcpy(ota_update_path, cmd);
+    }
     if (ota_partition_size_okay)
       ota_fetch_update();
     else
