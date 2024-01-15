@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.37"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-01-08"
+#define VERSION "v8.38"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-01-11"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,9 +37,13 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.38 2024-01-11
+ *  -- Add missing WiFi.persistent(false); to setup().
+ *  -- Sort out the pin assignments for Dew Control on the All-In-One (AIO).
+ *  -- Fix Dew Control pin assignment logic for Relay+Stepper configurations.
  * Version 8.37 2024-01-08
  *  -- New "dew.force.enabled" boolean variable to enable Dew Control even without a SHT3x sensor being present.
- *  -- Select different thermistor_pins[] and dew_pwm_pins[] when AUXRELAY is wired.
+ *  -- Select different dew_thm_pins[] and dew_pwm_pins[] when AUXRELAY is wired.
  *  -- Disable Dew Channel-1 if no pins are available for it, due to conflicts with Ethernet, Host-USB, or Stepper motor.
  * Version 8.36 2024-01-07
  *  -- Fix NTP year formatting for transfer to a Celestron hand-controller.
@@ -4335,13 +4339,21 @@ static void nchuck_loop ()
 #if EMULATE_DEW
 
 #define DEW_NUMCHANNELS  2
-static byte thermistor_pins [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39;  (34 conflict with AUXRELAY pins).
-static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUXRELAY pins.
 
-// The established thermistor_pins[] and dew_pwm_pins[] conflict with AUXRELAY pins.  Here are the (automatic) alternates:
-#define AUXRELAY_THM0_PIN  36
-#define AUXRELAY_PWM0_PIN  12
-#define AUXRELAY_PWM1_PIN  18 // Conflicts with SPI (Ethernet, Host-USB), and Stepper Motor.
+#ifndef DEW_THM0_PIN
+#define DEW_THM0_PIN         34  // Must be from GPIOs 32..39
+#define DEW_THM1_PIN         39  // Must be from GPIOs 32..39
+#define DEW_PWM0_PIN         14  // Any available ouput pin
+#define DEW_PWM1_PIN         26  // Any available ouput pin
+#define DEW_RELAY_THM0_PIN   36  // Regular THM0 pin used instead for AUXRELAY
+#define DEW_RELAY_THM1_PIN   DEW_THM1_PIN
+#define DEW_RELAY_PWM0_PIN   12  // Regular PWM0 pin used instead for AUXRELAY
+#define DEW_RELAY_PWM1_PIN   18  // Conflicts with SPI (Ethernet, Host-USB), and Stepper Motor.
+#endif /* DEW_THM0_PIN */
+
+// These pins might get rearranged at run-time by dew_setup():
+static byte dew_thm_pins[DEW_NUMCHANNELS] = {DEW_THM0_PIN, DEW_THM1_PIN};
+static byte dew_pwm_pins[DEW_NUMCHANNELS] = {DEW_PWM0_PIN, DEW_PWM1_PIN};
 
 #define ADC_VREF_ENABLE true  // When true, thermistor readings will use the factory-calibrated VREF value.
 #if __has_include("ADC_LUT.h")
@@ -4360,7 +4372,7 @@ static double dew_max_amperage [DEW_NUMCHANNELS] = { 0,  0};  // kept in NVRAM
 static byte   dew_aggression_to_degreesC [11] = {0, 2, 3, 4, 5, 7, 9, 10, 12, 14, 15};
 static bool   thermistor_detected [DEW_NUMCHANNELS] = {false, false};
 
-static char   dew_oled_rows[4][22] = {{0,},};   //FIXME get rid of this someday to save RAM.
+static char   dew_oled_rows[4][22] = {{0,},};   // To-Do: get rid of this someday to save RAM.
 
 static bool   sht3x_detected                    = false;
 static bool   sht3x_calibration_running         = false;
@@ -4788,7 +4800,7 @@ static void dew_read_thermistor (byte channel)
   static double sums    [DEW_NUMCHANNELS] = {0,};
   static uint   samples [DEW_NUMCHANNELS] = {0,};
   double fpinval;
-  byte thm_pin = thermistor_pins[channel];
+  byte thm_pin = dew_thm_pins[channel];
   int pinval;
 
   if (!thm_pin)
@@ -4975,24 +4987,27 @@ static void dew_setup ()
 {
   sht3x_detected = false;
   if (auxrelay_detected) {
-    // Re-assign Dew Channel-0 pins to avoid conflicts with auxrelay pins:
-    thermistor_pins [0] = AUXRELAY_THM0_PIN;
-    dew_pwm_pins    [0] = AUXRELAY_PWM0_PIN;
-
-    // Pin conflicts are still possible with Dew Channel-1 though. Try and sort out the mess:
+    // Switch to alternate Dew Control pins, to avoid conflicts with auxrelay pins:
     #ifdef AIO_H
-      #define PIN_CONFLICT (true)
-    #elif ETHERNET_ENABLED && EMULATE_FOCUS
-      #define PIN_CONFLICT (ethernet_detected || stepper_driver != STEPPER_DRIVER_NONE)
-    #elif ETHERNET_ENABLED
-      #define PIN_CONFLICT (ethernet_detected)
+      dew_thm_pins[1] = 0;  // Manual-only for Channel-1; no alternate ADC1 pin available on AIO.
     #else
-      #define PIN_CONFLICT (false)
-    #endif
-    if (PIN_CONFLICT)
-      dew_pwm_pins[1] = thermistor_pins[1] = 0; // Pin conflicts: disable Dew Channel-1
-    else
-      dew_pwm_pins[1] = AUXRELAY_PWM1_PIN;      // No conflict detected, enable Dew Channel-1
+      dew_thm_pins [0] = DEW_RELAY_THM0_PIN;
+      dew_thm_pins [1] = DEW_RELAY_THM1_PIN;
+      dew_pwm_pins [0] = DEW_RELAY_PWM0_PIN;
+      dew_pwm_pins [1] = DEW_RELAY_PWM1_PIN;
+
+      // Pin conflicts are still possible with Dew Channel-1 though. Try and sort out the mess:
+      #if !ETHERNET_ENABLED
+        #define ethernet_detected false
+      #endif
+      #if EMULATE_FOCUS
+        #define DEW1_PIN_CONFLICT (ethernet_detected || stepper_driver != STEPPER_DRIVER_NONE)
+      #else
+        #define DEW1_PIN_CONFLICT (ethernet_detected)
+      #endif
+      if (DEW1_PIN_CONFLICT)
+        dew_pwm_pins[1] = dew_thm_pins[1] = 0; // No pin available for pwm1: disable Channel-1 completely.
+    #endif /* !AIO_H */
   }
   dew_get_adc_vref();
   if (sht3x_softreset() || sht3x_softreset() || sht3x_softreset()) {
@@ -5010,7 +5025,9 @@ static void dew_setup ()
   if (dew_enabled) {
     dew_pwm_setup();
     if (!dew_pwm_pins[1])
-      SERIAL_PRINTLN("Dew Channel-1 disabled (pin conflicts)");
+      SERIAL_PRINTLN("Dew Channel-1 disabled (pin conflicts).");
+    else if (!dew_thm_pins[1])
+      SERIAL_PRINTLN("Dew Channel-1 manual control only, no thermistor (pin conflicts).");
   }
 }
 
@@ -8546,14 +8563,14 @@ void setup (void)
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
 
-  Wire.begin();            // Prepare the I2C bus for use.  Needed for OLED and AIO.
+  Wire.begin();            // Prepare the I2C bus for use.  Needed early for OLED and AIO, then for FRAM and NCHUCK.
   Wire.setTimeOut(500);    // This supposedly helps mitigate I2C vs. WiFi issues
-  fram_setup();
 #if OLED_ENABLED 
   oled_setup();
 #endif
+  fram_setup();
 #ifdef AIO_H
-  aio_setup_early();  // needed here for the MUSB switch which uses a USB chip GPIO.
+  aio_setup_early();  // needed here for READ_MUSB_SELECT_PIN(), which accesses a USB chip GPIO.
 #endif
   // Now sort out the other uart assignments:
   if (MUSB_SELECT_PIN != -1) {
@@ -8591,7 +8608,7 @@ void setup (void)
   pinMode(BLUE_LED_PIN, OUTPUT);
   set_blue_led(LED_ON);
   WiFi.macAddress(wifi_mac_addr);       // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
-  nvram_restore();                      // Also called oled_setup() again if non-default oled_type
+  nvram_restore();                      // Also calls oled_setup() again if non-default oled_type
   set_blue_led(LED_OFF);
 
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u ETH=%s\r\n",
@@ -8613,8 +8630,9 @@ void setup (void)
 #endif /* EMULATE_GPS */
   SERIAL_PRINTF("OLED %sdetected\r\n", oled_detected ? "" : "not ");
 
-  routing_add_dev(DEV_AZM, auxbus.rxbuf);
-  routing_add_dev(DEV_ALT, auxbus.rxbuf);
+  // Pre-populate routing table with these frequently used entries:
+  routing_add_dev(DEV_AZM,   auxbus.rxbuf);
+  routing_add_dev(DEV_ALT,   auxbus.rxbuf);
   routing_add_dev(DEV_ESP32, auxbus.rxbuf);
   routing_add_dev(DEV_DUMMY, auxbus.rxbuf);
 
@@ -8634,6 +8652,7 @@ void setup (void)
   dew_setup();  // MUST come after stepper_setup() and ethernet_setup(), to resolve pin conflicts.
 #endif
   bt_setup();
+  WiFi.persistent(false);
   if (!simple_mode && is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
     wifi_begin_server_mode();
