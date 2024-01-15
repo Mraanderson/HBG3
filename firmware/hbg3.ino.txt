@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.36"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-01-07"
+#define VERSION "v8.37"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-01-08"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,10 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.37 2024-01-08
+ *  -- New "dew.force.enabled" boolean variable to enable Dew Control even without a SHT3x sensor being present.
+ *  -- Select different thermistor_pins[] and dew_pwm_pins[] when AUXRELAY is wired.
+ *  -- Disable Dew Channel-1 if no pins are available for it, due to conflicts with Ethernet, Host-USB, or Stepper motor.
  * Version 8.36 2024-01-07
  *  -- Fix NTP year formatting for transfer to a Celestron hand-controller.
  * Version 8.35 2024-01-07
@@ -200,24 +204,10 @@ static bool ota_ignore_version = false;
   #define HBG3_NAME  "HBG1"
 #endif
 
-#if EMULATE_DEW
-#define DEW_NUMCHANNELS           2
-static byte thermistor_pins [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39.  Conflicts with AUXRELAY pins.
-static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUXRELAY pins.
-#endif
-
 // The first include of this file defines PINs.
 #if __has_include("aio.h")
   #include "aio.h"
 #endif
-
-#if EMULATE_DEW
-  #define ADC_VREF_ENABLE true    // When true, thermistor readings will use the factory-calibrated VREF value.
-  #if __has_include("ADC_LUT.h")
-    #warning "Including ADC_LUT.h"
-    #include "ADC_LUT.h"
-  #endif
-#endif /* EMULATE_DEW */
 
 #include <limits.h>
 #include <string.h>
@@ -3417,7 +3407,7 @@ static uint stepper_set_speed_0_to_9 (byte from_dev, byte speed_0_to_9)
   return speed;
 }
 
-static void stepper_init (void)
+static void stepper_setup (void)
 {
   stepper_autodetect();
   if (stepper_driver == STEPPER_DRIVER_NONE)
@@ -4344,9 +4334,24 @@ static void nchuck_loop ()
 // *** Begin DEW support  ******************************************************************************************
 #if EMULATE_DEW
 
+#define DEW_NUMCHANNELS  2
+static byte thermistor_pins [DEW_NUMCHANNELS] = {34, 39};  // Must be from GPIOs 32..39;  (34 conflict with AUXRELAY pins).
+static byte dew_pwm_pins    [DEW_NUMCHANNELS] = {14, 26};  // Conflicts with AUXRELAY pins.
+
+// The established thermistor_pins[] and dew_pwm_pins[] conflict with AUXRELAY pins.  Here are the (automatic) alternates:
+#define AUXRELAY_THM0_PIN  36
+#define AUXRELAY_PWM0_PIN  12
+#define AUXRELAY_PWM1_PIN  18 // Conflicts with SPI (Ethernet, Host-USB), and Stepper Motor.
+
+#define ADC_VREF_ENABLE true  // When true, thermistor readings will use the factory-calibrated VREF value.
+#if __has_include("ADC_LUT.h")
+  #warning "Including ADC_LUT.h"
+  #include "ADC_LUT.h"
+#endif
+
 // Support up to four Dew Control "channels", by defining pairs of non-zero pin numbers here:
-static bool   dew_detected                      = false;
-static double dew_input_current_limit           = 3.000;      // amperage
+static bool   dew_enabled                        = false;
+static double dew_input_current_limit            = 3.000;     // amperage
 static byte   dew_pwm_percent  [DEW_NUMCHANNELS] = { 0,  0};  // percent 0..100
 static byte   dew_aggression   [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 (NVRAM)
 static byte   dew_manual_pwm   [DEW_NUMCHANNELS] = { 0,  0};  // 0..100 (NVRAM)
@@ -4355,8 +4360,9 @@ static double dew_max_amperage [DEW_NUMCHANNELS] = { 0,  0};  // kept in NVRAM
 static byte   dew_aggression_to_degreesC [11] = {0, 2, 3, 4, 5, 7, 9, 10, 12, 14, 15};
 static bool   thermistor_detected [DEW_NUMCHANNELS] = {false, false};
 
-static char   dew_oled_rows[4][22] = {{0,},};
+static char   dew_oled_rows[4][22] = {{0,},};   //FIXME get rid of this someday to save RAM.
 
+static bool   sht3x_detected                    = false;
 static bool   sht3x_calibration_running         = false;
 static long   sht3x_calibration_heating_done    = false;
 static long   sht3x_calibration_timeout         = 0;
@@ -4659,10 +4665,8 @@ static bool sht3x_crc (uint8_t MSB, uint8_t LSB, uint8_t CRC)
   return (crc == CRC);
 }
 
-static double calc_dewpoint (double T, double RH)
+static inline double calc_dewpoint (double T, double RH)
 {
-  if (!dew_detected)
-    return -40.0;
   const double a = 17.625, b = 243.04;
   double alpha   = log(RH / 100.0) + ((a * T) / (b + T));
   return (b * alpha) / (a - alpha);
@@ -4784,8 +4788,12 @@ static void dew_read_thermistor (byte channel)
   static double sums    [DEW_NUMCHANNELS] = {0,};
   static uint   samples [DEW_NUMCHANNELS] = {0,};
   double fpinval;
+  byte thm_pin = thermistor_pins[channel];
+  int pinval;
 
-  int pinval = analogRead(thermistor_pins[channel]);
+  if (!thm_pin)
+    goto bad_reading;
+  pinval = analogRead(thm_pin);
   if (pinval < 10 || pinval == ADCMAX) {
     if (dew_debug && samples[channel])
       SERIAL_PRINTF("Th%u: Bad reading=%d\r\n", channel, pinval);
@@ -4941,7 +4949,7 @@ static void dew_loop ()
       }
     }
   }
-  if (!sht3x_fetch_measurement()) {
+  if (sht3x_detected && !sht3x_fetch_measurement()) {
     nexttime = get_timeout(100);
     return;
   }
@@ -4965,19 +4973,44 @@ static void dew_loop ()
 
 static void dew_setup ()
 {
-  dew_detected = false;
+  sht3x_detected = false;
   if (auxrelay_detected) {
-    SERIAL_PRINTLN("auxrelay detected, disabling Dew Heater detection");
-    return;
+    // Re-assign Dew Channel-0 pins to avoid conflicts with auxrelay pins:
+    thermistor_pins [0] = AUXRELAY_THM0_PIN;
+    dew_pwm_pins    [0] = AUXRELAY_PWM0_PIN;
+
+    // Pin conflicts are still possible with Dew Channel-1 though. Try and sort out the mess:
+    #ifdef AIO_H
+      #define PIN_CONFLICT (true)
+    #elif ETHERNET_ENABLED && EMULATE_FOCUS
+      #define PIN_CONFLICT (ethernet_detected || stepper_driver != STEPPER_DRIVER_NONE)
+    #elif ETHERNET_ENABLED
+      #define PIN_CONFLICT (ethernet_detected)
+    #else
+      #define PIN_CONFLICT (false)
+    #endif
+    if (PIN_CONFLICT)
+      dew_pwm_pins[1] = thermistor_pins[1] = 0; // Pin conflicts: disable Dew Channel-1
+    else
+      dew_pwm_pins[1] = AUXRELAY_PWM1_PIN;      // No conflict detected, enable Dew Channel-1
   }
   dew_get_adc_vref();
   if (sht3x_softreset() || sht3x_softreset() || sht3x_softreset()) {
-    dew_detected = true;
-    dew_pwm_setup();
+    sht3x_detected = dew_enabled = true;
     SERIAL_PRINTLN("SHT3X sensor detected, enabling Dew Heater Control");
     SERIAL_PRINTF("dew0.amps=%4.2lf dew1.amps=%4.2lf\r\n", dew_max_amperage[0], dew_max_amperage[1]);
+  } else if (!dew_enabled) {
+    SERIAL_PRINTLN("SHT3X sensor NOT detected, disabling Dew Heater Control.");
   } else {
-    SERIAL_PRINTLN("SHT3X sensor NOT detected, disabling Dew Heater Control");
+    SERIAL_PRINTLN("SHT3X Dew sensor not detected; Dew control will be manual only.");
+    sht3x_temperature = 18.0;
+    sht3x_relhumidity = 50.0;
+    sht3x_dewpoint    = calc_dewpoint(sht3x_temperature, sht3x_relhumidity);
+  }
+  if (dew_enabled) {
+    dew_pwm_setup();
+    if (!dew_pwm_pins[1])
+      SERIAL_PRINTLN("Dew Channel-1 disabled (pin conflicts)");
   }
 }
 
@@ -5348,7 +5381,7 @@ static bool oled_gps_updatefn (byte arg)  // oled_arg_t
 #if EMULATE_DEW
 static bool oled_dewcontrol_updatefn (byte arg)  // oled_arg_t
 {
-  if (!dew_detected)
+  if (!dew_enabled)
     return false;  // skip this screen
   if (arg == oled_longpress && !oled_timer) {
     oled_timer = get_timeout(200);
@@ -5373,7 +5406,7 @@ static void oled_dew_next_mode (byte channel)
   byte aggr = dew_aggression [channel];
   byte pwm  = dew_pwm_percent[channel];
 
-  if (aggr && !thermistor_detected[channel]) {
+  if (aggr && (!sht3x_detected || !thermistor_detected[channel])) {
     aggr = 0;
     pwm  = 100; // this immediately rolls around to 0 below
   }
@@ -5386,7 +5419,7 @@ static void oled_dew_next_mode (byte channel)
     pwm = pwm - (pwm % 20) + 20;
     if (pwm > 100) {
       pwm = 0;
-      if (thermistor_detected[channel])
+      if (sht3x_detected && thermistor_detected[channel])
         aggr = 1;
     }
   }
@@ -5815,7 +5848,7 @@ static inline bool dev_is_emulated (byte dst)
       || (dst == DEV_FOCUS && stepper_driver != STEPPER_DRIVER_NONE)
 #endif
 #if EMULATE_DEW
-      || ((dst == DEV_DEW || dst == DEV_DEWBB) && dew_detected)
+      || ((dst == DEV_DEW || dst == DEV_DEWBB) && dew_enabled)
 #endif
       || (EMULATING_SSAG && dst == DEV_SSAG)
       || (EMULATING_SSAA && dst == DEV_SSAA);
@@ -6676,7 +6709,7 @@ static inline struct pkt_s *bus_get_next_txq_entry (struct bus_s *bus)
     }
 #endif
 #if EMULATE_DEW
-    if (dew_detected && (dst == DEV_DEW || dst == DEV_DEWBB)) {
+    if (dew_enabled && (dst == DEV_DEW || dst == DEV_DEWBB)) {
       dew_handle_request(p->from_rxbuf, pdata);
       goto discard_txq_entry;
     }
@@ -6847,6 +6880,7 @@ static char *nvram_vars[] = {
   (char *)"ota.update.path",
   (char *)"focus.factor",
   (char *)"ssag.discard.mc.acks",
+  (char *)"dew.force.enabled",
   NULL
 };
 
@@ -6892,6 +6926,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // ota.update.path
   "",               // focus.factor
   "",               // ssag.discard.mc.acks
+  "",               // dew.force.enabled
   ""                // NULL
 };
 
@@ -7162,6 +7197,7 @@ static void nvram_restore ()
       cordwrap_override = 0;  // no cordwrap override
   }
 #if EMULATE_DEW
+  dew_enabled |= nvram_get_bool("dew.force.enabled");
   dew_max_amperage[0] = dew_nvram_restore_amperage(0);
   dew_max_amperage[1] = dew_nvram_restore_amperage(1);
   tmp = nvram_get_int("dew0.aggression");
@@ -8455,7 +8491,7 @@ static void non_wifi_loop (void)
   stepper_loop();
 #endif /* EMULATE_FOCUS */
 #if EMULATE_DEW
-  if (dew_detected)
+  if (dew_enabled)
     dew_loop();
 #endif
 #if OLED_ENABLED
@@ -8585,11 +8621,8 @@ void setup (void)
 #if NCHUCK_ENABLED
   nchuck_detect(false);  // Do this part earlier than the rest so user can touch thumbstick sooner
 #endif
-#if EMULATE_DEW
-  dew_setup();
-#endif
 #if EMULATE_FOCUS
-  stepper_init();
+  stepper_setup();
 #endif
 #if ETHERNET_ENABLED
   #if EMULATE_FOCUS
@@ -8597,6 +8630,9 @@ void setup (void)
   #endif
   ethernet_setup();
 #endif  /* ETHERNET_ENABLED */
+#if EMULATE_DEW
+  dew_setup();  // MUST come after stepper_setup() and ethernet_setup(), to resolve pin conflicts.
+#endif
   bt_setup();
   if (!simple_mode && is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
