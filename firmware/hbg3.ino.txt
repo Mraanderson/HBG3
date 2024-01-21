@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.38"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-01-11"
+#define VERSION "v8.39"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-01-19"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,8 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.39 2024-01-19
+ *  -- Get project to build/run with new Arduino ESP32-v3.x.x board support. Also needs new library patches!
  * Version 8.38 2024-01-11
  *  -- Add missing WiFi.persistent(false); to setup().
  *  -- Sort out the pin assignments for Dew Control on the All-In-One (AIO).
@@ -354,7 +356,7 @@ static const IPAddress server_static_ip(SERVER_IPADDRESS);
 static const IPAddress server_static_netmask(255,255,255,0);
 
 static bool bt_enabled = false;
-static enum {bt_mode_aux, bt_mode_usb} bt_mode = bt_mode_aux;
+static enum {bt_protocol_aux, bt_protocol_hc} bt_protocol = bt_protocol_aux;  // "bt_mode" conflicts with v3.0.x libraries
 
 static inline void SERIAL_WRITE     (const char *s) { if    (SerialDebug)  SerialDebug->write(s);        }
 static inline int  SERIAL_AVAILABLE (void)          { return SerialDebug ? SerialDebug->available() : 0; }
@@ -385,8 +387,13 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
   if (SerialDebug) {SerialDebug->print(x);}                                              \
 } while (0)
 
-#ifdef Serial
-#error "The HBG3 does not yet work with version 3.x.x of the ESP32 board package. Install version 2.0.11 instead."
+#if ESP_IDF_VERSION_MAJOR >= 5
+  #undef Serial
+  #define pwm_enable(channel)               ledcAttach(dew_pwm_pins[channel],PWM_FREQUENCY,PWM_RESOLUTION)
+  #define pwm_set_duty_cycle(channel,duty)  ledcWrite(dew_pwm_pins[channel],duty)
+#else
+  #define pwm_enable(channel)               do {ledcSetup(channel,PWM_FREQUENCY,PWM_RESOLUTION); ledcAttachPin(dew_pwm_pins[channel],channel);} while (0)
+  #define pwm_set_duty_cycle(channel,duty)  ledcWrite(channel,duty)
 #endif
 #define Serial      Serial_UNDEFINED  // Prevent using "Serial" by accident
 
@@ -418,8 +425,9 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_FOCUS   0x12
 #define DEV_DEW     0x17
 #define DEV_SW      0x20
+#define DEV_SCANR   0x2f  // Python3 AUX Bus Scanner version 0.9.35+
 #define DEV_CFM     0x21
-#define DEV_FUTIL   0x22
+#define DEV_FUTIL   0x22  // Celestron Focuser Utility, or older versions of the Python3 AUX Bus Scanner software.
 #define DEV_RASW    0x30
 #define DEV_DECSW   0x31
 #define DEV_DECAGP  0x32
@@ -465,6 +473,7 @@ static const struct devnames_s {
   AUXDEV(SW,     "CPWI, SkyPortal, SkySafari etc."),
   AUXDEV(CFM,    "Celestron Firmware Manager"),
   AUXDEV(FUTIL,  "Focuser Utility"),
+  AUXDEV(SCANR,  "AUX Bus Scanner"),
   AUXDEV(RASW,   "CGX RA Switch"),
   AUXDEV(DECSW,  "CGX DEC Switch"),
   AUXDEV(DECAGP, "CGX DEC AutoGuide Pt"),
@@ -914,7 +923,7 @@ static const char *get_model_decoder (byte *data)
           case 0x10: desc = "SkyProdigy";      break;
           case 0x13: desc = "Starseeker";      break;
           case 0x15: desc = "Cosmos";          break;
-          case 0x18: desc = "CGXL";            break;
+          case 0x18: desc = "CGX-L";           break;
           case 0x19: desc = "Astrofi";         break;
           case 0x1a: desc = "SkyWatcher";      break;
           default:
@@ -1199,8 +1208,8 @@ static void txq_init (struct txq_s *txq, const char *name, HardwareSerial *uart,
   if (busyout_pin == busyin_pin) {
     pinMode(rx_pin, INPUT);           // get rid of internal pull-up for this scenario only
   } else {
-    digitalWrite(busyout_pin, HIGH);  // Tri-state BUSYOUT
     pinMode(busyout_pin, OUTPUT);
+    digitalWrite(busyout_pin, HIGH);  // Tri-state BUSYOUT
   }
 }
 
@@ -1232,8 +1241,8 @@ static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
     delay(50);
     pinMode(rx_pin, INPUT);
     pinMode(tx_pin, OUTPUT);
-    digitalWrite(busyout_pin, LOW);
     pinMode(busyout_pin, OUTPUT);
+    digitalWrite(busyout_pin, LOW);
     byte test = 0xa5;
     while (test != 0) {
       int bit = (test & 1) ? HIGH : LOW;
@@ -3266,7 +3275,7 @@ static void stepper_autodetect (void)
   if (stepper_driver == STEPPER_DRIVER_NONE)
     SERIAL_PRINTF("Stepper driver not detected, Focus Motor emulation disabled.\r\n", __func__);
   else
-    SERIAL_PRINTF("Detected %s stepper driver, Focus Motor emulation enabled.\r\n", __func__, STEPPER_DRIVER_NAMES[stepper_driver]);
+    SERIAL_PRINTF("Detected %s stepper driver, Focus Motor emulation enabled.\r\n", STEPPER_DRIVER_NAMES[stepper_driver]);
 }
 
 // STEP/DIR drivers use the FastAccelStepper library:
@@ -3421,7 +3430,7 @@ static void stepper_setup (void)
   if (stepper_driver == STEPPER_DRIVER_STEPDIR) {
     stepdir_set_microsteps(nvram_get_int("focus.microsteps"));
     stepdirEngine.init();
-    stepdir = stepdirEngine.stepperConnectToPin(STEPDIR_STEP_PIN, 0 /*DRIVER_MCPWM_PCNT*/);
+    stepdir = stepdirEngine.stepperConnectToPin(STEPDIR_STEP_PIN, DRIVER_RMT);
     if (stepdir) {
       stepdir->setEnablePin    (STEPDIR_ENA_PIN);
       stepdir->setDirectionPin (STEPDIR_DIR_PIN);
@@ -4732,7 +4741,7 @@ static void dew_set_pwm_percent (int channel, uint percent)
 {
   dew_pwm_percent[channel] = percent;
   byte duty_cycle = percent * ((1 << PWM_RESOLUTION) - 1) / 100;
-  ledcWrite(channel, duty_cycle);
+  pwm_set_duty_cycle(channel, duty_cycle);
   if (dew_aggression[channel] == 0) {  // Manual mode?
     if (percent != dew_manual_pwm[channel]) {
       dew_manual_pwm[channel] = percent;
@@ -4748,8 +4757,7 @@ static void dew_pwm_setup()
   for (byte channel = 0; channel < DEW_NUMCHANNELS; ++channel) {
     if (dew_pwm_pins[channel]) {
       pinMode(dew_pwm_pins[channel], OUTPUT);
-      ledcSetup(channel, PWM_FREQUENCY, PWM_RESOLUTION);
-      ledcAttachPin(dew_pwm_pins[channel], channel);
+      pwm_enable(channel);
       dew_set_pwm_percent(channel, 0);
     }
   }
@@ -5461,7 +5469,7 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
       (connection[0] != 'B' || bt_active) ? (bt_handshake ? "Handshake" : "Connected") : "Session");
   oled_set_row(0, tmp);
   if (connection[0] == 'B') {
-    snprintf(tmp, OLED_ROW_CHARS, "Mode: %s", (bt_mode == bt_mode_aux) ? "AUX protocol" : "USB handset");
+    snprintf(tmp, OLED_ROW_CHARS, "Mode: %s", (bt_protocol == bt_protocol_aux) ? "AUX protocol" : "USB handset");
     oled_set_row(1, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", hbg3_ssid);
     oled_set_row(2, tmp);
@@ -5477,9 +5485,9 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
     oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : "WiFi is off");
 #if ETHERNET_ENABLED
     if (ethernet_detected) {
-      snprintf(tmp, OLED_ROW_CHARS,   "Eth DHCP %s", ethernet_client_mode ? "Client" : "Server");
+      snprintf(tmp, OLED_ROW_CHARS,   "Eth: DHCP %s", ethernet_client_mode ? "Client" : "Server");
       oled_set_row(2, tmp);
-      snprintf(tmp, OLED_ROW_CHARS,   "Eth %s", Ethernet.localIP().toString().c_str());
+      snprintf(tmp, OLED_ROW_CHARS,   " IP: %s", Ethernet.localIP().toString().c_str());
       oled_set_row(3, tmp);
     } else
 #endif /* ETHERNET_ENABLED */
@@ -6177,7 +6185,7 @@ static inline bool bt_check_connection (void)
 {
   bool connected = bt_enabled ? bt.connected() : false;
   if (connected != bt_connected) {
-    SERIAL_PRINTF("BT: %sCONNECTED mode %s\r\n", connected ? "" : "DIS", (bt_mode == bt_mode_aux) ? "AUX" : "HC");
+    SERIAL_PRINTF("BT: %sCONNECTED mode %s\r\n", connected ? "" : "DIS", (bt_protocol == bt_protocol_aux) ? "AUX" : "HC");
     bt_connected = connected;
     bt_active    = 0;
     bt_handshake = 0;
@@ -6752,6 +6760,21 @@ discard_txq_entry:
   return NULL;  /* Nothing to send at the moment */
 }
 
+static inline void txq_assert_busyout (struct txq_s *txq)
+{
+  if (txq->busyout_pin == txq->busyin_pin)
+    pinMode(txq->busyout_pin, OUTPUT);      // Assert BUSYOUT
+  digitalWrite(txq->busyout_pin, LOW);      // Assert BUSYOUT
+}
+
+static inline void txq_deassert_busyout (struct txq_s *txq)
+{
+  if (txq->busyout_pin == txq->busyin_pin)
+    pinMode(txq->busyout_pin, INPUT);       // Tri-state BUSY
+  else
+    digitalWrite(txq->busyout_pin, HIGH);   // Deassert BUSYOUT
+}
+
 static inline bool claim_bus_for_tx (struct bus_s *bus)
 {
   struct txq_s *txq = bus->txq;
@@ -6772,8 +6795,7 @@ static inline bool claim_bus_for_tx (struct bus_s *bus)
     return false; /* bus is busy */
   }
   // "Claim" the bus
-  digitalWrite(txq->busyout_pin, LOW); // Assert BUSYOUT
-  pinMode(txq->busyout_pin, OUTPUT);   // Assert BUSYOUT
+  txq_assert_busyout(txq);
   if (txq->busy_timestamp) {
     ulong delta = time_delta(millis(), txq->busy_timestamp);
     if (delta > 1500)
@@ -6789,10 +6811,7 @@ static inline void bus_tx (struct txq_s *txq, byte *data, uint16_t len)
 {
   txq->uart->write(data, len);
   txq->uart->flush(true);                   // flush tx only
-  if (txq->busyout_pin == txq->busyin_pin)
-    pinMode(txq->busyout_pin, INPUT);       // Tri-state BUSY
-  else
-    digitalWrite(txq->busyout_pin, HIGH);   // Tri-state BUSYOUT
+  txq_deassert_busyout(txq);
 }
 
 static inline void bus_forward (struct bus_s *bus, byte forward, byte *pdata, uint16_t len)
@@ -8003,11 +8022,10 @@ static void send_ascii_passthru (char *cmd)
     if (time_after(millis(), timeout))
       break;
   }
-  digitalWrite(txq->busyout_pin, LOW);    // Assert BUSYOUT
-  pinMode(txq->busyout_pin, OUTPUT);      // Assert BUSYOUT
+  txq_assert_busyout(txq);
   txq->uart->println(cmd);
   txq->uart->flush(true);                 // flush tx only
-  digitalWrite(txq->busyout_pin, HIGH);   // Tri-state BUSYOUT
+  txq_deassert_busyout(txq);
 }
 
 static void serial_loop (void)
@@ -8160,7 +8178,7 @@ static void status_command (void (*writep)(const char *))
   strcat(tmp, "; ");
   writep(tmp);
   if (connection[0] == 'B') {
-    sprintf(tmp, "Mode: Bluetooth %s, SSID: %s; ", (bt_mode == bt_mode_aux) ? "AUX" : "USB", hbg3_ssid);
+    sprintf(tmp, "Mode: Bluetooth %s, SSID: %s; ", (bt_protocol == bt_protocol_aux) ? "AUX" : "USB", hbg3_ssid);
     writep(tmp);
   }
   if (connection[0] == 'U') {
@@ -8496,7 +8514,7 @@ static void non_wifi_loop (void)
     serial_loop();
   auxtest_loop();
   bus_loop(&auxbus);
-  if (bt_mode == bt_mode_aux)
+  if (bt_protocol == bt_protocol_aux)
     bt_aux_loop();
   if (auxrelay_detected)
     bus_loop(&auxrelay);
@@ -8644,7 +8662,7 @@ void setup (void)
 #endif
 #if ETHERNET_ENABLED
   #if EMULATE_FOCUS
-    if (stepper_driver == STEPPER_DRIVER_NONE)
+    if (stepper_driver == STEPPER_DRIVER_NONE)  // Stepper motors use the SPI pins, so cannot have Ethernet as well as stepper.
   #endif
   ethernet_setup();
 #endif  /* ETHERNET_ENABLED */
