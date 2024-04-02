@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.39"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-01-19"
+#define VERSION "v8.40"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-03-13"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,8 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.40 2024-03-13
+ *  -- Enable use of 0x?? hex values for most numeric settings.
  * Version 8.39 2024-01-19
  *  -- Get project to build/run with new Arduino ESP32-v3.x.x board support. Also needs new library patches!
  * Version 8.38 2024-01-11
@@ -420,8 +422,8 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_HC4     0x04
 #define DEV_HC5     0x0d
 #define DEV_SSHC    0x0e
-#define DEV_AZM     0x10
-#define DEV_ALT     0x11
+#define DEV_AZM     0x10  // Aka. DEV_RA
+#define DEV_ALT     0x11  // Aka. DEV_DEC
 #define DEV_FOCUS   0x12
 #define DEV_DEW     0x17
 #define DEV_SW      0x20
@@ -3073,8 +3075,8 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
       p->x_extra = make_uint16(data[ 8], data[ 7]);
       p->y_coord = make_uint16(data[10], data[ 9]);
       p->y_extra = make_uint16(data[12], data[11]);
-      reply[len++] = 0x11;  // ??
-      reply[len++] = 0x00;  // ??
+      reply[len++] = 0x11;  // SSAA always returns this here, regardless of slot
+      reply[len++] = 0x00;  // SSAA always returns this here, regardless of slot
       SERIAL_PRINTF("SSAA SET_PROFILE %u %u,%u\r\n", data[13], p->x_coord, p->y_coord);
       break;
     }
@@ -6999,7 +7001,7 @@ static const char *nvram_get_val (const char *name)
 
 static int nvram_get_int (const char *name)
 {
-  return atoi(nvram_get_val(name));
+  return strtol(nvram_get_val(name), NULL, 0);
 }
 
 static void nvram_get_nonblank_val (const char *name, char *dst)
@@ -7186,8 +7188,8 @@ static void nvram_restore ()
   if (tmp == 1 || tmp == 2)
     auxbus_stopbits = tmp;
 #if EMULATE_FOCUS
-  focus_backlash_pos = nvram_get_int ("focus.backlash.pos");
-  focus_backlash_neg = nvram_get_int ("focus.backlash.neg");
+  focus_backlash_pos = nvram_get_int("focus.backlash.pos");
+  focus_backlash_neg = nvram_get_int("focus.backlash.neg");
   focus_factor = nvram_get_float("focus.factor");
   if (focus_factor == 0.0 || focus_factor == BAD_FLOAT_VAL)
     focus_factor = 1.0;
