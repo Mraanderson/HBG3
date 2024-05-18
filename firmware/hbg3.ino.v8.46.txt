@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.45"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-05-02"
+#define VERSION "v8.46"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-05-11"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -37,6 +37,13 @@
  * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.46 2024-05-11
+ *  -- Use P2000_ACTIVITY_TIMEOUT for MUSB as well as WiFi/BT connections.
+ *  -- Increase P2000_ACTIVITY_TIMEOUT to 8 seconds (was 4).  SSAA has been observed taking 5-seconds to respond.
+ *  -- Dump SSSWI challenge/response pairs together when verbose=1
+ *  -- ADS1115: Use I2C clock of 800KHz for lower overhead.
+ *  -- ADS1115: use 475 SPS, so that a sample can be read in 2.1msec.
+ *  -- Increase default oled.timeout.secs to 120 (was 60).
  * Version 8.45 2024-05-02
  *  -- Add ADS1115 ADC support for thermistors. Wire ADC A0 to 3.3V, A1 to Thm0, A2 to Thm1. ADC A3 is not-used.
  *  -- Incorporate a default ADC_LUT[] table.
@@ -155,7 +162,7 @@ static bool ota_ignore_version = false;
 #include <Wire.h>
 #include "BluetoothSerial.h"
 
-#define P2000_ACTIVITY_TIMEOUT   (4 * 1000)     // Close port 2000 connection when idle this long
+#define P2000_ACTIVITY_TIMEOUT   (8 * 1000)     // Close port 2000 connection when idle this long. SSAA can take more than 5-secs.
 
 static  bool simple_mode = false;  // In "simple_mode", no auxtest, no WiFi, no BT.
 
@@ -983,16 +990,20 @@ static const char *op_decoder (byte *data)
         return op_lookup(op, aux_mc_ops);
       return op_lookup(op, aux_ssag_ops);
   }
+  static uint32_t ssswi_last_challenge = 0;
   if (op == SSSWI_GET_CHALLENGE) {
     if (dst == DEV_SSSWI)
       return "GET_CHALLENGE";
     if (src == DEV_SSSWI) {
-      SERIAL_PRINTF(" CHALLENGE 0x%08x", *(uint32_t *)(data + 5));
+      ssswi_last_challenge = *(uint32_t *)(data + 5);
+      SERIAL_PRINTF(" CHALLENGE 0x%08x", ssswi_last_challenge);
       return NULL;
     }
   } else if (op == SSSWI_RESPONSE) {
     if (dst == DEV_SSSWI) {
-      SERIAL_PRINTF(" RESPONSE  0x%08x", *(uint32_t *)(data + 5));
+      uint32_t response = *(uint32_t *)(data + 5);
+      SERIAL_PRINTF(" RESPONSE  0x%08x", response);
+      SERIAL_PRINTF("\r\nCR: 0x%08lx  0x%08lx", ssswi_last_challenge, response);  //FIXME temporary while reverse-engineering SSSWI handshakes.
       return NULL;
     }
     if (src == DEV_SSSWI)
@@ -1490,7 +1501,6 @@ static void auxbus_send_msg (byte *data, uint16_t len)
 
 // **** Begin Mount-USB (MUSB) **********************************************************************************************************
 
-#define MUSB_TIMEOUT  3500   // 3.5 seconds of no activity drops the connection
 static struct rxbuf_s musb_rxbuf;
 static bool           musb_selected     = false;
 static bool           musb_rfkill       = true;  // nvram
@@ -1594,7 +1604,7 @@ static void musb_loop (void)
         }
       }
       if (pkt_complete == packet_decoder(&musb_rxbuf, b))
-        musb_connected = get_timeout(MUSB_TIMEOUT);
+        musb_connected = get_timeout(P2000_ACTIVITY_TIMEOUT);
       else if (!musb_connected)
         musb_autobaud(b);
     }
@@ -4773,6 +4783,7 @@ static void dew_pwm_setup()
 #define ADS1115_I2C_ADDR  0x48
 #define ADS1115_CONV_REG  0x00
 #define ADS1115_CFG_REG   0x01
+#define ADS1115_CFG_VAL   0xc3e3  // 475 SPS, 2msec response
 
 static uint8_t Wire_write16 (byte addr, uint8_t reg, uint16_t val)
 {
@@ -4800,6 +4811,7 @@ static bool ads1115_detected = false;
 
 static void ads1115_setup (void)
 {
+  Wire.setClock(800000ul);
   Wire.beginTransmission(ADS1115_I2C_ADDR);
   ads1115_detected = (Wire.endTransmission() == 0);
   SERIAL_PRINTF("ADS1115 %sfound!\r\n", ads1115_detected ? "" : "not ");
@@ -4809,8 +4821,9 @@ static int16_t ads1115_read_ADC (uint16_t channel)  // 0,1,2,3
 {
   static int16_t pinvals[4] = {0,};  // for maintaning a 2-sample average for each ADC
 
-  Wire_write16(ADS1115_I2C_ADDR, ADS1115_CFG_REG, 0xc383 | (channel << 12));
-  while (!(Wire_read16(ADS1115_I2C_ADDR, ADS1115_CFG_REG) & 0x8000));  // Takes about 8-milliseconds
+  Wire_write16(ADS1115_I2C_ADDR, ADS1115_CFG_REG, ADS1115_CFG_VAL | (channel << 12));
+  delay(1);  // Response is available after 2.1msecs when using 475 SPS
+  while (!(Wire_read16(ADS1115_I2C_ADDR, ADS1115_CFG_REG) & 0x8000));
   int16_t v = Wire_read16(ADS1115_I2C_ADDR, ADS1115_CONV_REG);
   if (pinvals[channel])
     pinvals[channel] = (pinvals[channel] + v) / 2;  // keep a running average of 2 samples
@@ -4824,6 +4837,7 @@ static int16_t ads1115_vref = 26112;  // 3.3V
 static int16_t ads1115_read_thermistor (byte channel)  // 0,1
 {
   static byte counter = 7;
+  Wire.setClock(800000ul);
   if ((++counter % 8) == 0)  // periodically re-sample the "3.3V" value on channel-0
     ads1115_vref = ads1115_read_ADC(0);
   int16_t pinval = ads1115_read_ADC(1 + channel);
@@ -4847,7 +4861,7 @@ static void get_esp32_adc_vref()
   esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
 }
 
-static double pinval_to_degreesC (int16_t pinval, int16_t pinmax)  //FIXME merge this with ads1115_pinval_to_degreesC()
+static double pinval_to_degreesC (int16_t pinval, int16_t pinmax)
 {
   const double R1      = 10000.0;      // voltage divider resistor value
   const double Beta    = 3950.0;       // Beta value
@@ -5127,7 +5141,7 @@ static struct oled_type_s {
   {NULL, NULL}
 };
 
-static int oled_timeout_secs = 60;  // (default) 60-seconds inactivity timeout for turning off the OLED
+static int oled_timeout_secs = 120;  // (default) 60-seconds inactivity timeout for turning off the OLED
 
 // Set oled type in NVRAM.  Eg.  set oled.type SH1106_128x64
 //
@@ -8591,7 +8605,7 @@ static void w2000_loop()
         AUXBUS_SEND_MSG(DEV_ESP32, DEV_DUMMY, DEV_GET_VERSION);
       } else {
         w2000.stop();
-        SERIAL_PRINTLN("w2000 Timed-out");
+        SERIAL_PRINTF("%09lu w2000 Timed-out\r\n", millis());
       }
     }
   }
