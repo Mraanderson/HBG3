@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.46"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-05-11"
+#define VERSION "v8.47"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-05-29"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -28,15 +28,17 @@
  * Tools-->Board-->Boards_Manager: ensure the esp32 support is 2.1.x or higher, but not 3.x.x.
  *
  * For Mount-USB and Arduino IDE:
- * >>> MS-Windows Driver installation is required for the onboard CP210x USB-25rial chip:
+ * >>> MS-Windows Driver installation is required for the onboard CP210x USB-Serial chip:
  *     Go here:  https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers?tab=downloads
  *     Download/save the CP210x Universal Windows Driver .zip file.
  *     Extract the .zip file.
  *     Right click on the extracted silabser.inf file, and click INSTALL.
  *
- * WiFi note: client mode was failing on my ASUS Router until I tweaked some 2.4GHz settings, and then un-tweaked them again. WTF?
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.47 2024-05-29
+ *  -- Work around CPWI CORDWRAP bug: CPWI uses DEV_ALT instead of DEV_AZM for some (but not all) CORDWRAP commands.
+ *  -- Revert to 4-sec p2000_timeout for most stuff; use a longer timeout during SSAA capture activity.
  * Version 8.46 2024-05-11
  *  -- Use P2000_ACTIVITY_TIMEOUT for MUSB as well as WiFi/BT connections.
  *  -- Increase P2000_ACTIVITY_TIMEOUT to 8 seconds (was 4).  SSAA has been observed taking 5-seconds to respond.
@@ -162,7 +164,10 @@ static bool ota_ignore_version = false;
 #include <Wire.h>
 #include "BluetoothSerial.h"
 
-#define P2000_ACTIVITY_TIMEOUT   (8 * 1000)     // Close port 2000 connection when idle this long. SSAA can take more than 5-secs.
+#define P2000_NORMAL_TIMEOUT        ( 4 * 1000)    // Close port 2000 connection when idle this long.
+#define P2000_SSAA_CAPTURE_TIMEOUT  (20 * 1000)    // Longer timeout needed during SSAA capture operations.
+
+static long p2000_timeout = P2000_NORMAL_TIMEOUT;  // Gets increased to 15-secs if SSAA is used.
 
 static  bool simple_mode = false;  // In "simple_mode", no auxtest, no WiFi, no BT.
 
@@ -328,7 +333,7 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
   #define pwm_enable(channel)               do {ledcSetup(channel,PWM_FREQUENCY,PWM_RESOLUTION); ledcAttachPin(dew_pwm_pins[channel],channel);} while (0)
   #define pwm_set_duty_cycle(channel,duty)  ledcWrite(channel,duty)
 #endif
-#define Serial      Serial_UNDEFINED  // Prevent using "Serial" by accident
+#define Serial  Serial_UNDEFINED  // Prevent using "Serial" by accident
 
 static long blue_led_timer = 0;
 
@@ -1535,6 +1540,7 @@ static void musb_disconnect (void)
   musb_connected = 0;
   musb_last4 = 0;
   musb_uart->updateBaudRate(19200);
+  p2000_timeout = P2000_NORMAL_TIMEOUT;
   SERIAL_PRINTLN("MUSB baud 19200");
 }
 
@@ -1604,7 +1610,7 @@ static void musb_loop (void)
         }
       }
       if (pkt_complete == packet_decoder(&musb_rxbuf, b))
-        musb_connected = get_timeout(P2000_ACTIVITY_TIMEOUT);
+        musb_connected = get_timeout(p2000_timeout);
       else if (!musb_connected)
         musb_autobaud(b);
     }
@@ -5600,7 +5606,7 @@ static bool oled_ota_updatefn (byte arg)  // oled_arg_t
 }
 #endif /* OTA_ENABLED */
 
-static byte QRcode_image[] = {
+static const byte QRcode_image[] = {
   0xff,0xc0,0xc0,0xc0,0xff,0x00,0xff,0xc3,0xc3,0xc3,0x3c,0x00,0xfc,0x03,0x03,0x03,0x0c,0x00,0x03,0x03,0x33,0xcf,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xc0,
   0x30,0x30,0xc0,0x00,0xf0,0x00,0x00,0x00,0xf0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
   0xff,0xff,0xff,0x07,0x07,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0xe7,0x07,0x07,0xff,0xff,0xff,0xe7,0xe7,0xe7,0xe7,0xe7,0xff,0xff,0xff,0xff,0xff,
@@ -5644,7 +5650,7 @@ static void oled_cmd (uint8_t command)
   Wire.endTransmission();
 }
 
-static void oled_send_image (byte *image, unsigned int image_size)
+static void oled_send_image (const byte *image, unsigned int image_size)
 {
   oled_force_clear(); // so that next use after this works
   oled_cmd(0x20);     // Set MemoryMode to next byte:
@@ -6246,6 +6252,10 @@ restart:
     }
   }
 
+  // If a SSAA capture sequence has completed, we can revert back to normal timeouts again:
+  if (src == DEV_SSAA && rxbuf->data[4] == SSAA_CAPTURE_GET_RESULT)
+    p2000_timeout = P2000_NORMAL_TIMEOUT;  // Safe to revert to normal timeouts now.
+
   bus_autodetect_ssforward(bus, src, dst);
   byte op = rxbuf->data[4];
 
@@ -6302,10 +6312,11 @@ static inline bool bt_check_connection (void)
   bool connected = bt_enabled ? bt.connected() : false;
   if (connected != bt_connected) {
     SERIAL_PRINTF("BT: %sCONNECTED mode %s\r\n", connected ? "" : "DIS", (bt_protocol == bt_protocol_aux) ? "AUX" : "HC");
-    bt_connected = connected;
-    bt_active    = 0;
-    bt_handshake = 0;
-    bt_ready     = false;
+    bt_connected  = connected;
+    bt_active     = 0;
+    bt_handshake  = 0;
+    bt_ready      = false;
+    p2000_timeout = P2000_NORMAL_TIMEOUT;
     BT_SET_STATE(BT_IDLE);
     if (connected)
       bt_handshake = get_timeout(2000);
@@ -6384,7 +6395,7 @@ static inline void bt_aux_loop (void)
     do {
       bt_aux_rx();
     } while (bt.available());
-    bt_active = get_timeout(P2000_ACTIVITY_TIMEOUT);
+    bt_active = get_timeout(p2000_timeout);
     return;
   }
   if (!bt_check_connection())
@@ -6486,130 +6497,168 @@ static void negate_16bit_position (byte *p)
 }
 
 static byte cordwrap_original_op    = 0;
+static byte cordwrap_original_dev   = 0;
 static long evo_wifi_change_pending = 0;
 
 /* Try and achieve compatibility with older mounts such as the Nexstar GPS NXGPS */
 static uint16_t hack_response_pkt (byte *data, uint16_t len)
 {
+  bool rewritten = false;
   byte src = data[2], dst = data[3], op = data[4];
+  uint16_t op_len = OP(op,data[1]);
+
   if (op == DEV_GET_MODEL && (src == DEV_AZM || src == DEV_ALT)) {
     if (data[1] == 3) { // older firmware on Nexstar-GPS returns no data.
       data[1] += 1;
       data[5] = 0x01;
       len += 1;
+      rewritten = true;
     }
     if (data[1] == 4) {
       // 1-byte response from newer Nexstar-GPS firmware: {0x3b,0x04,0x10,0x20,0x05,0x01,0xc6}:
       // Latest CPWI is happy with it now, but older versions were not.
       // And SkyPortal/SkySafari still expect a 2-byte response.
-      if (TVERBOSE(data))
-        SERIAL_PRINTLN("Translating MC_GET_MODEL response");
       data[1] += 1;
       data[6] = 0x00;  // append one extra byte to convert 1-byte model to 2-byte model.
-      update_checksum(data);
       len += 1;
+      rewritten = true;
     }
     if (data[1] == 5)  // Save mount_model for other uses.  Eg. Evo Wifi on/off.
       mount_model = (((uint16_t)data[5]) << 8) | data[6];
-    return len;
+    goto done;
   }
-  uint16_t op_len = OP(op,data[1]);
   if (src == DEV_EVWIFI && op_len == OP(SET_EVO_WIFI, 3)) {
     evo_wifi_change_pending = 0;
-    return len;
+    goto done;
   }
   // StarSense-For-Skywatcher box replies from DEV_SSSWI instead of DEV_AZM: 3b 07 b8 0e fe 01 00 17 90 8d
-  if (src == DEV_SSSWI && dst == DEV_SW && op == DEV_GET_VERSION) {
+  if (src == DEV_SSSWI && dst == DEV_SW && op_len == OP(DEV_GET_VERSION,3)) {
     data[2] = DEV_AZM;
-    update_checksum(data);
-    return len;
+    rewritten = true;
+    goto done;
   }
-  // Handle cordwrap_override for CPWI etc.
-  if (src == DEV_AZM && cordwrap_original_op) {
-    if (op_len == OP(MC_DISABLE_CORDWRAP,3) || op_len == OP(MC_ENABLE_CORDWRAP,3)) {
-      data[4] = cordwrap_original_op;
-      SERIAL_PRINTF("%s: restored op=%02x\r\n", __func__, cordwrap_original_op);
-      cordwrap_original_op = 0;
-      update_checksum(data);
-      return len;
+  // Handle cordwrap_overrides for CPWI etc.
+  if (src == DEV_AZM) {
+    if (cordwrap_original_dev) {
+      switch (op_len) {
+        case OP(MC_ENABLE_CORDWRAP,3):
+        case OP(MC_DISABLE_CORDWRAP,3):
+        case OP(MC_SET_CORDWRAP_POS,3):
+        case OP(MC_POLL_CORDWRAP,3):
+        case OP(MC_GET_CORDWRAP_POS,6):
+          data[2] = src = cordwrap_original_dev;
+          rewritten = true;
+      }
+      cordwrap_original_dev = 0;
     }
-    cordwrap_original_op = 0;
+    if (cordwrap_original_op) {
+      if (op_len == OP(MC_DISABLE_CORDWRAP,3) || op_len == OP(MC_ENABLE_CORDWRAP,3)) {
+        data[4] = cordwrap_original_op;
+        rewritten = true;
+      }
+      cordwrap_original_op = 0;
+    }
   }
   if (src == DEV_ALT && mount_reversed_alt) {
     switch (op_len) {
       case OP(MC_GET_POS,6):
         negate_24bit_position(data + 5);
+        rewritten = true;
         break;
       case OP(MC_SET_POS_GUIDERATE,3):
         data[4] = MC_SET_NEG_GUIDERATE;
+        rewritten = true;
         break;
       case OP(MC_SET_NEG_GUIDERATE,3):
         data[4] = MC_SET_POS_GUIDERATE;
+        rewritten = true;
         break;
       case OP(MC_SET_POS_BACKLASH,3):
         data[4] = MC_SET_NEG_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_SET_NEG_BACKLASH,3):
         data[4] = MC_SET_POS_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_MOVE_POS,3):
         data[4] = MC_MOVE_NEG;
+        rewritten = true;
         break;
       case OP(MC_MOVE_NEG,3):
         data[4] = MC_MOVE_POS;
+        rewritten = true;
         break;
       case OP(MC_GET_POS_BACKLASH,4):
         data[4] = MC_GET_NEG_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_GET_NEG_BACKLASH,4):
         data[4] = MC_GET_POS_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_GET_APPROACH,4):
         data[5] = !data[5];
+        rewritten = true;
         break;
-      default:
-        return len;
     }
+  }
+done:
+  if (rewritten) {
     update_checksum(data);
+    if (TVERBOSE(data))
+      print_packet("rewritten", NULL, data, len);
   }
   return len;
 }
 
 /* Hook to allow altering auxbus commands just before they are sent on the bus */
-static inline uint16_t hack_regular_pkt (byte *data, uint16_t len)
+static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
 {
+  bool rewritten = false;
   byte dst = data[3], op = data[4];
   uint16_t op_len = OP(op,data[1]);
+
+  // CPWI bug: sends some cordwrap commands to wrong MC:
+  if (dst == DEV_ALT) {
+    switch (op_len) {
+      case OP(MC_ENABLE_CORDWRAP,3):
+      case OP(MC_DISABLE_CORDWRAP,3):
+      case OP(MC_SET_CORDWRAP_POS,6):
+      case OP(MC_POLL_CORDWRAP,3):
+      case OP(MC_POLL_CORDWRAP,4):
+      case OP(MC_GET_CORDWRAP_POS,3):
+        cordwrap_original_dev = dst;
+        data[3] = dst = DEV_AZM;
+        rewritten = true;
+    }
+  }
   if (dst == DEV_AZM) {
     // CPWI bug: includes an extra (0x01) byte in MC_GOTO_DONE for focuser at least.
     if (op_len == OP(MC_GOTO_DONE,4)) {
       data[1] = 0x03;
-      update_checksum(data);
-      return len - 1;
+      len -= 1;
+      rewritten = true;
     }
     // CPWI bug: includes an extra (0x01) byte in MC_POLL_CORDWRAP
     if (op_len == OP(MC_POLL_CORDWRAP,4)) {
       data[1] = 0x03;
-      update_checksum(data);
-      return len - 1;
+      len -= 1;
+      rewritten = true;
     }
     // Handle cordwrap_override for CPWI etc.
     if (cordwrap_override) {
       // MC_SET_CORDWRAP_POS also enables CORDWRAP..
       if (cordwrap_override == 1 && (op_len == OP(MC_ENABLE_CORDWRAP,3) || op_len == OP(MC_SET_CORDWRAP_POS,6))) {
         cordwrap_original_op = op;
-        data[1] = 3;
         data[4] = MC_DISABLE_CORDWRAP;
-        SERIAL_PRINTF("%s: changed op %02x to %02x\r\n", __func__, cordwrap_original_op, data[4]);
-        update_checksum(data);
-        return data[1] + 3;
-      }
-      if (cordwrap_override == 2 && op_len == OP(MC_DISABLE_CORDWRAP,3)) {
+        data[1] = 3;
+        len = data[1] + 3;
+        rewritten = true;
+      } else if (cordwrap_override == 2 && op_len == OP(MC_DISABLE_CORDWRAP,3)) {
         cordwrap_original_op = MC_DISABLE_CORDWRAP;
         data[4] = MC_ENABLE_CORDWRAP;
-        SERIAL_PRINTF("%s: changed op %02x to %02x\r\n", __func__, cordwrap_original_op, data[4]);
-        update_checksum(data);
-        return len;
+        rewritten = true;
       }
     }
   }
@@ -6618,47 +6667,62 @@ static inline uint16_t hack_regular_pkt (byte *data, uint16_t len)
       case OP(MC_GOTO_SLOW,5):
       case OP(MC_GOTO_FAST,5):
         negate_16bit_position(data + 5);
+        rewritten = true;
         break;
       case OP(MC_GOTO_SLOW,6):
       case OP(MC_GOTO_FAST,6):
         negate_24bit_position(data + 5);
+        rewritten = true;
         break;
       case OP(MC_SET_POS,6):
         negate_24bit_position(data + 5);
+        rewritten = true;
         break;
       case OP(MC_SET_POS_GUIDERATE,5):
       case OP(MC_SET_POS_GUIDERATE,6):
         data[4] = MC_SET_NEG_GUIDERATE;
+        rewritten = true;
         break;
       case OP(MC_SET_NEG_GUIDERATE,5):
       case OP(MC_SET_NEG_GUIDERATE,6):
         data[4] = MC_SET_POS_GUIDERATE;
+        rewritten = true;
         break;
       case OP(MC_SET_POS_BACKLASH,4):
         data[4] = MC_SET_NEG_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_SET_NEG_BACKLASH,4):
         data[4] = MC_SET_POS_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_MOVE_NEG,4):
         data[4] = MC_MOVE_POS;
+        rewritten = true;
         break;
       case OP(MC_MOVE_POS,4):
         data[4] = MC_MOVE_NEG;
+        rewritten = true;
         break;
       case OP(MC_GET_POS_BACKLASH,3):
         data[4] = MC_GET_NEG_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_GET_NEG_BACKLASH,3):
         data[4] = MC_GET_POS_BACKLASH;
+        rewritten = true;
         break;
       case OP(MC_SET_APPROACH,4):
         data[5] = !data[5];
+        rewritten = true;
         break;
-      default:
-        return len;
     }
+  }
+done:
+  if (rewritten) {
     update_checksum(data);
+    if (TVERBOSE(data))
+      print_packet("rewritten", NULL, data, len);
   }
   return len;
 }
@@ -6861,10 +6925,14 @@ static inline struct pkt_s *bus_get_next_txq_entry (struct bus_s *bus)
       goto discard_txq_entry;
     }
 #endif
+    if (dst == DEV_SSAA) {
 #if EMULATE_SSAA
-    if (EMULATING_SSAA && dst == DEV_SSAA) {
-      ssaa_handle_request(p->from_rxbuf, pdata);
-      goto discard_txq_entry;
+      if (EMULATING_SSAA) {
+        ssaa_handle_request(p->from_rxbuf, pdata);
+        goto discard_txq_entry;
+      }
+      if (pdata[4] == SSAA_CAPTURE_BEGIN)
+        p2000_timeout = P2000_SSAA_CAPTURE_TIMEOUT;  // Need longer timeouts until the capture is completed.
     }
 #endif
   }
@@ -6977,7 +7045,7 @@ static void bus_loop (struct bus_s *bus)
         return;                                    // bus in-use */
     min_busy_time = micros() + 100;                // Allow BUSY to assert for 100usec before tx
     if (bus == &auxbus && p->regular_pkt)
-      p->len = hack_regular_pkt(pdata, p->len);
+      p->len = hack_command_pkt(pdata, p->len);
     while (time_before(micros(), min_busy_time));  // Wait until BUSY has been asserted long enough
     bus_tx(txq, pdata, p->len);                    // All good; now send the packet
   } else {
@@ -8499,22 +8567,28 @@ static bool p3000_decoder (char b,  void (*writep)(const char *), void (*flushp)
   return false;
 }
 
+static inline void wifi_got_disconnected (bool *connected, const char *name)
+{
+  *connected = false;
+  p2000_timeout = P2000_NORMAL_TIMEOUT;
+  init_rxbuf(&w2000_rxbuf, "w2000_rx");
+  SERIAL_PRINTF("%09lu %s Disconnected\r\n", millis(), name);
+}
+
 // Common code for w2000_loop() and w3000_loop():
 static bool wifi_port_is_connected (WiFiClient client, bool *connected, void (*poll_for_connection)(), const char *name)
 {
   if (esp32_wifi_off) {
-    *connected = false;
+    if (*connected)
+      wifi_got_disconnected(connected, name);
   } else if (client.connected()) {
     if (!*connected) {
       *connected = true;
       SERIAL_PRINTF("%09lu %s Connected\r\n", millis(), name);
     }
   } else {
-    if (*connected) {
-      *connected = false;
-      init_rxbuf(&w2000_rxbuf, "w2000_rx");
-      SERIAL_PRINTF("%09lu %s Disconnected\r\n", millis(), name);
-    }
+    if (*connected)
+      wifi_got_disconnected(connected, name);
     poll_for_connection();
   }
   return *connected;
@@ -8555,6 +8629,7 @@ static void poll_for_new_w2000_connection()
   else
     w2000 = W2000.available();
   if (w2000.connected()) {
+    p2000_timeout = P2000_NORMAL_TIMEOUT;
     init_rxbuf(&w2000_rxbuf, "w2000_rx");
     /* Enable KEEPALIVE messages */
     int flags = 1;
@@ -8598,7 +8673,7 @@ static void w2000_loop()
       } while (w2000.available());
       w2000_timeout = 0;
     } else if (!w2000_timeout) {
-      w2000_timeout = get_timeout(wifi_relay_mode ? 5000 : P2000_ACTIVITY_TIMEOUT);
+      w2000_timeout = get_timeout(wifi_relay_mode ? (5 * 1000) : p2000_timeout);
     } else if (time_after(millis(), w2000_timeout)) {
       w2000_timeout = 0;
       if (WIFIRELAY_ENABLED && wifi_relay_mode) { /* dummy keep-alive message */
