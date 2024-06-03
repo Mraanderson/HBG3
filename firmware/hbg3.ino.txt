@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.47"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-05-29"
+#define VERSION "v8.48"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-05-31"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,8 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.48 2024-05-31
+ *  -- Some mounts (eg. CPC) return an extra byte in response to certain cordwrap commands. Deal with it!
  * Version 8.47 2024-05-29
  *  -- Work around CPWI CORDWRAP bug: CPWI uses DEV_ALT instead of DEV_AZM for some (but not all) CORDWRAP commands.
  *  -- Revert to 4-sec p2000_timeout for most stuff; use a longer timeout during SSAA capture activity.
@@ -6540,19 +6542,19 @@ static uint16_t hack_response_pkt (byte *data, uint16_t len)
   // Handle cordwrap_overrides for CPWI etc.
   if (src == DEV_AZM) {
     if (cordwrap_original_dev) {
-      switch (op_len) {
-        case OP(MC_ENABLE_CORDWRAP,3):
-        case OP(MC_DISABLE_CORDWRAP,3):
-        case OP(MC_SET_CORDWRAP_POS,3):
-        case OP(MC_POLL_CORDWRAP,3):
-        case OP(MC_GET_CORDWRAP_POS,6):
+      switch (op) {   // Cannot use op_len, as response len varies by mount model!!  Eg. CPC vs Evo.
+        case MC_ENABLE_CORDWRAP:
+        case MC_DISABLE_CORDWRAP:
+        case MC_SET_CORDWRAP_POS:
+        case MC_POLL_CORDWRAP:
+        case MC_GET_CORDWRAP_POS:
           data[2] = src = cordwrap_original_dev;
           rewritten = true;
       }
       cordwrap_original_dev = 0;
     }
     if (cordwrap_original_op) {
-      if (op_len == OP(MC_DISABLE_CORDWRAP,3) || op_len == OP(MC_ENABLE_CORDWRAP,3)) {
+      if (op == MC_DISABLE_CORDWRAP || op == MC_ENABLE_CORDWRAP) {
         data[4] = cordwrap_original_op;
         rewritten = true;
       }
