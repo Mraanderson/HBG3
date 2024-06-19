@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.49"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-06-17"
+#define VERSION "v8.50"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-06-18"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,8 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.50 2024-06-18
+ *  -- Add support "get wlan.mac" for CPWI 2.5.6-beta.
  * Version 8.49 2024-06-17
  *  -- Show GPS coordinates as DDD° MM'SS.ss" C, similar to Celestron hand-controller displays.
  *  -- Fix build when EMULATE_SSAA is false.
@@ -8518,6 +8520,13 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
       if (0 == strcmp(c, "wlan.network.status")) {
         writep(wifi_client_mode ? "2" : "0");
         writep("\r\n");
+        return true;
+      }
+      if (0 == strcmp(c, "wlan.mac")) {
+        char mac[20];
+        sprintf(mac, "%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+          wifi_mac_addr[0], wifi_mac_addr[1], wifi_mac_addr[2], wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5]);
+        writep(mac);
         return true;
       }
       if (0 == strcmp(c, "wlan.info")) {
