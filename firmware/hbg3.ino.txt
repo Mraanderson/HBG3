@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.48"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-05-31"
+#define VERSION "v8.49"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-06-17"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,10 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.49 2024-06-17
+ *  -- Show GPS coordinates as DDD° MM'SS.ss" C, similar to Celestron hand-controller displays.
+ *  -- Fix build when EMULATE_SSAA is false.
+ *  -- Set default ETHERNET_ENABLED back to true, for benefit of hbg3-aio builds.
  * Version 8.48 2024-05-31
  *  -- Some mounts (eg. CPC) return an extra byte in response to certain cordwrap commands. Deal with it!
  * Version 8.47 2024-05-29
@@ -80,7 +84,7 @@
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor. PIN conflict with Ethernet.
-#define ETHERNET_ENABLED          false // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
+#define ETHERNET_ENABLED          true  // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
 
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
 #define COOLICK_PCB_PROJECT       false // When true, build firmware for the Coolick PCB version of the original WIFI+BT+GPS project.
@@ -264,6 +268,7 @@ static byte *ssaa_image_pkt     = NULL;   // allocated on each use
 #define ssaa_image_pkt            NULL
 #define EMULATING_SSAA false
 #endif
+
 #if EMULATE_SSAG
 static bool emulate_ssag        = false;
 #define EMULATING_SSAG emulate_ssag
@@ -5190,8 +5195,8 @@ static long oled_splash_timer    = 0;
 static long oled_button_timer    = 0;  // for longpress timings in various updatefn()'s
 static byte oled_mode            = 0;
 
-static const uint8_t HomeBrew5x14_font[] = {  // two groups of 5-bytes-across for each character. Each byte is vertical pixels.
- 0x0,  0x0,     5,   14, 0x20, 0x61,
+static const uint8_t HomeBrew5x14_font[] = {  // Two groups of 5-bytes-across for each character. Each byte is vertical pixels.
+ 0x0,  0x0,     5,   14, 0x20, 0x61,          // Final entry (code 0x80) is degrees symbol
  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00,
  0x00, 0x3f, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xff, 0x30, 0xff, 0x30, 0x03, 0x3f, 0x03, 0x3f, 0x03,
  0x30, 0xcc, 0xff, 0xcc, 0x0c, 0x0c, 0x0c, 0x3f, 0x0c, 0x03, 0x0f, 0x0f, 0xc0, 0x30, 0x0c, 0x0c, 0x03, 0x00, 0x3c, 0x3c,
@@ -5416,8 +5421,34 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
   return true;
 }
 
+#define OLED_DEGREES 0x80
+static byte oled_degreesym = OLED_DEGREES;
+
+static void gps_dddmmss (byte fix_type, char *tmp, const char *prefix, const char colon, const char compass[2], double f)
+{
+  if (fix_type == no_fix) {
+    snprintf(tmp, OLED_ROW_CHARS, "%s: ---%c -- -- --  -", prefix, oled_degreesym);
+  } else {
+    byte C = compass[0], ddd, mm, ss, ff;
+    unsigned int SS; 
+    if (f < 0) {
+      C = compass[1];
+      f = -f;
+    }
+    // Format decimal degrees ddd.ddddd into DDD°MM'SS.ss" C, similar to Celestron hand-controller displays.
+    ddd = f;                // degrees
+    f   = (f - ddd) * 3600; // remainder (fraction of a degree) in seconds
+    SS  = f;                // seconds 0..3600
+    ff  = (f - SS) * 100;   // remainder (fraction of a second) in decimal
+    mm  = SS / 60;          // minutes 0..59
+    ss  = SS % 60;          // seconds 0..59
+    snprintf(tmp, OLED_ROW_CHARS, "%s%c %3u%c %02u'%02u.%02u\" %c", prefix, colon, ddd, oled_degreesym, mm, ss, ff, C);
+  }
+}
+
 static bool oled_gps_updatefn (byte arg)  // oled_arg_t
 {
+  static const char NS[2] = {'N','S'}, EW[2] = {'E','W'};
   if (!gps_detected)
       return false;
   char tmp[OLED_ROW_CHARS + 1];
@@ -5433,16 +5464,9 @@ static bool oled_gps_updatefn (byte arg)  // oled_arg_t
   else if (fix_type == saved_fix)
     colon = '?';
 
-  if (fix_type != no_fix)
-    snprintf(tmp, OLED_ROW_CHARS, "Latitude%c  %c%9s", colon, ((lat < 0.0) ? 'S' : 'N'), String(fabs(lat), 5).c_str());
-  else
-    snprintf(tmp, OLED_ROW_CHARS, "Latitude:  ----.-----");
+  gps_dddmmss(fix_type, tmp, "Lat", colon, NS, lat);
   oled_set_row(1, tmp);
-
-  if (fix_type != no_fix)
-    snprintf(tmp, OLED_ROW_CHARS, "Longitude%c %c%9s", colon, ((lng < 0.0) ? 'W' : 'E'), String(fabs(lng), 5).c_str());
-  else
-    snprintf(tmp, OLED_ROW_CHARS, "Longitude: ----.-----");
+  gps_dddmmss(fix_type, tmp, "Lon", colon, EW, lng);
   oled_set_row(2, tmp);
 
   int n;
@@ -5872,6 +5896,7 @@ static void oled_print_displays (void)
   char tmp[OLED_ROW_CHARS + 1];
   int orig_mode = oled_mode;
 
+  oled_degreesym = '^';
   SERIAL_PRINTLN("+-----------------------+");
   oled_button_timer = 0;
   for (oled_mode = 0; oled_mode < OLED_NMODES; ++oled_mode) {
@@ -5885,6 +5910,7 @@ static void oled_print_displays (void)
       SERIAL_PRINTLN("+-----------------------+");
     }
   }
+  oled_degreesym = OLED_DEGREES;
   oled_button_timer = 0;
   oled_mode  = orig_mode;
   oled_updatefn[oled_mode](oled_firstcall);
@@ -6935,8 +6961,8 @@ static inline struct pkt_s *bus_get_next_txq_entry (struct bus_s *bus)
       }
       if (pdata[4] == SSAA_CAPTURE_BEGIN)
         p2000_timeout = P2000_SSAA_CAPTURE_TIMEOUT;  // Need longer timeouts until the capture is completed.
-    }
 #endif
+    }
   }
   if (!p->from_rxbuf || p->from_rxbuf != bus->rxbuf)   // always true?
     return p;
