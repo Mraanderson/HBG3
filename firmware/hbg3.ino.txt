@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.51"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-07-13"
+#define VERSION "v8.52"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-07-27"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,12 +36,23 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
- * Version 8.51
+ * Version 8.52 2024-07-27
+ *  -- Nuke mount.reversed.alt --> free up the space, and nobody uses it.
+ *  -- Cancel auxtests on receipt of any serial/p3000 command.
+ *  -- Impose a time-limit on gps auto-baud detection, to reduce overhead when no gps detected.
+ *  -- Force OLED redraw after exit from QR screen: was sometimes leaving bits of QR on the display.
+ *  -- New 'i' command to toggle ignoring/exclusion of MC_GET_POS packets from tracing.
+ *  -- Fixes for BATT_GET_VOLTAGE.
+ *  -- Tidy up implementation/tracing of emulated devices.
+ *  -- New (partial) mount simulator: enable with "set emulate.mount 1"; mostly complete, but no tracking yet.
+ *  -- When available, show measured Dew Input Voltage on the OLED.
+ *  -- Increase dew_aggression temperatures by a degree or so.
+ * Version 8.51 2024-07-13
  *  -- Minor fixes around DEW_RECALIBRATE_ENV_SENSOR.
  *  -- Make suppress.lowbattery also hide such messages from verbose/trace.
  *  -- Don't do Network Time Protocol (NTP) unless a real/fake GPS is configured.
  *  -- Enable tracing 1 or 2 devices at once with the trace command.  Eg. trace dev1 dev2
- *  -- Measure Dew Heater voltage on ADS1115 channel-3: use external 5:1 voltage divider on the input.
+ *  -- Measure Dew Heater voltage on ADS1115 channel-3: use external 4:1 (divide-by-5) resistor network on the input.
  *  -- Read thermistor every 3 seconds instead of every 4 seconds.
  *  -- Show p3000 responses when verbose=1.
  * Version 8.50 2024-06-18
@@ -88,6 +99,7 @@
 #define EMULATE_SSAG              true  // When true, include code for StarSense AutoGuider simulator. Can be turned on/off via NVRAM variable.
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor. PIN conflict with Ethernet.
+#define EMULATE_MOUNT             true  // When true, include code to emulate an Evolution mount.
 #define ETHERNET_ENABLED          true  // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
 
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
@@ -213,10 +225,10 @@ typedef unsigned int  uint;
 
 static char hbg3_version[]      = VERSION;
 static bool fm_detected         = false; // Focus Motor detected, either on the HBG3 or on a bus somewhere.
-static bool mount_reversed_alt  = false; // Use "set mount.reversed.alt Yes" for when OTA is mounted backwards on an ALT/AZM mount.
 static bool auxbus_passive_mode = false;
 static byte auxtest_remaining   = 3;
 static bool verbose             = false;
+static bool ignore_mc_get_pos   = false;  // When true, don't show MC_GET_POS packets for ALT/AZM motor controllers.
 static bool aux_only_tracing    = true;   // By default, don't show packets coming/in out on w2000, bt, or musb.
 static bool aux_ascii_passthru  = false;
 static bool auxbus_raw_tracing  = false;
@@ -265,16 +277,23 @@ static void        nvram_save_int   (const char *name, int val);
 static void        nvram_erase_val  (const char *name);
 
 #if EMULATE_SSAA
-static bool emulate_ssaa        = false;
-static byte *ssaa_image_pkt     = NULL;   // allocated on each use
+static bool emulate_ssaa    = false;
+static byte *ssaa_image_pkt = NULL;   // allocated on each use
 #define EMULATING_SSAA emulate_ssaa
 #else
-#define ssaa_image_pkt            NULL
+#define ssaa_image_pkt NULL
 #define EMULATING_SSAA false
 #endif
 
+#if EMULATE_MOUNT
+static bool emulate_mount = false;
+#define EMULATING_MOUNT emulate_mount
+#else
+#define EMULATING_MOUNT false
+#endif
+
 #if EMULATE_SSAG
-static bool emulate_ssag        = false;
+static bool emulate_ssag = false;
 #define EMULATING_SSAG emulate_ssag
 #else
 #define EMULATING_SSAG false
@@ -390,6 +409,7 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_SSSWI   0xb8
 #define DEV_SSAG    0xb9
 #define DEV_DEWBB   0xbb
+//#define DEV_BC    0xbc  // CFM sends command 0x8f to this on startup
 #define DEV_LEDS    0xbf
 //                  0x3b  // No device should use this ID; fix packet_decoder() if something ever does though.
 //                  0x3c  // No device should use this ID; fix packet_decoder() if something ever does though.
@@ -398,6 +418,11 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_DUMMY   0xe3
 #define DEV_RELAY   0xe4
 #define DEV_FF      0xff
+
+static inline bool is_evo_mount_dev (byte dev)
+{
+  return dev == DEV_AZM || dev == DEV_ALT || dev == DEV_BATT || dev == DEV_PWRCHG || dev == DEV_LEDS || dev == DEV_EVWIFI || dev == DEV_UART;
+}
 
 #define EVOLUTION_MODEL  0x1687
 static uint16_t mount_model = 0x0000;
@@ -485,7 +510,7 @@ struct auxdev_op_s {
 #define MC_SET_POS_BACKLASH            0x10
 #define MC_SET_NEG_BACKLASH            0x11
 #define MC_LEVEL_DONE                  0x12
-#define MC_GOTO_DONE                   0x13  // returns 00 if still slewing, ff when done.
+#define MC_GOTO_DONE                   0x13  // (Aka. MC_SLEW_DONE) returns 00 if still slewing, ff when done.
 #define MC_PEC_STATE_CHANGE            0x14
 #define MC_PECTRAIN_DONE               0x15
 #define MC_CANCEL_PECTRAIN             0x16
@@ -511,7 +536,7 @@ struct auxdev_op_s {
 #define MC_GET_LIMITS                  0x2c
 #define MC_EEPROM_READ                 0x30
 #define MC_EEPROM_WRITE                0x31
-#define MC_PROGRAM_READ                0x32
+#define MC_PROGRAM_READ                0x32  // wrong name?
 #define MC_ENABLE_CORDWRAP             0x38
 #define MC_DISABLE_CORDWRAP            0x39
 #define MC_SET_CORDWRAP_POS            0x3a
@@ -532,6 +557,10 @@ struct auxdev_op_s {
 #define MC_SET_PID_KI                  0x5c
 #define MC_SET_PID_KD                  0x5d
 #define MC_ENABLE_PID_ANALYSIS         0x5f
+#define MC_PROGRAM_ENTER               0x81
+#define MC_PROGRAM_INIT                0x82
+#define MC_PROGRAM_DATA                0x83
+#define MC_PROGRAM_END                 0x84
 #define MC_GET_HARDSWITCH_ENA          0xee
 #define MC_SET_HARDSWITCH_ENA          0xef
 #define MC_GET_CHIPVER                 0xfa
@@ -605,6 +634,10 @@ static const struct auxdev_op_s aux_mc_ops[] = {
   AUX_DEV_OP(MC_SET_PID_KI),
   AUX_DEV_OP(MC_SET_PID_KD),
   AUX_DEV_OP(MC_ENABLE_PID_ANALYSIS),
+  AUX_DEV_OP(MC_PROGRAM_ENTER),
+  AUX_DEV_OP(MC_PROGRAM_INIT),
+  AUX_DEV_OP(MC_PROGRAM_DATA),
+  AUX_DEV_OP(MC_PROGRAM_END),
   AUX_DEV_OP(MC_GET_HARDSWITCH_ENA),
   AUX_DEV_OP(MC_SET_HARDSWITCH_ENA),
   AUX_DEV_OP(MC_GET_CHIPVER),
@@ -731,7 +764,7 @@ static const struct auxdev_op_s aux_ssag_ops[] = {
 #define BATT_GET_VOLTAGE    0x10
 #define BATT_MAX_CURRENT    0x18
 #define LEDS_LEVEL          0x10  // Always returns levels; sets new levels if 1-byte of data supplied.
-#define PWRCHG_GET_MODE     0x10
+#define PWRCHG_MODE         0x10
 #define UART_SET_BAUD       0x51
 #define SET_EVO_WIFI        0x10
 // All devices ops:
@@ -744,7 +777,7 @@ static const struct auxdev_op_s aux_misc_ops[] = {
   AUX_DEV_OP(BATT_GET_VOLTAGE),
   AUX_DEV_OP(BATT_MAX_CURRENT),
   AUX_DEV_OP(LEDS_LEVEL),
-  AUX_DEV_OP(PWRCHG_GET_MODE),
+  AUX_DEV_OP(PWRCHG_MODE),
   AUX_DEV_OP(UART_SET_BAUD),
   AUX_DEV_OP(SET_EVO_WIFI),
   AUX_DEV_OP(DEV_PROGRAM_ENA),
@@ -900,7 +933,7 @@ static const char *get_version_decoder (byte *data)
   byte len = data[1];
   strcpy(ver, Version);
   if (len == 0x07)
-    sprintf(v, "%u.%u.%04u", data[5], data[6], (((uint16_t)data[7]) << 8) | data[8]);
+    sprintf(v, "%u.%u.%u", data[5], data[6], (((uint16_t)data[7]) << 8) | data[8]);
   else if (len == 0x05)
     sprintf(v, "%u.%u", data[5], data[6]);
   else
@@ -908,7 +941,7 @@ static const char *get_version_decoder (byte *data)
   return ver;
 }
 
-static uint32_t get_24bit_value (byte *p)
+static uint32_t get_24bit_uint (byte *p)
 {
   uint32_t val     = p[0];
   val = (val << 8) | p[1];
@@ -916,19 +949,44 @@ static uint32_t get_24bit_value (byte *p)
   return val;
 }
 
-static void print_24bits (byte *data)
+static int32_t get_24bit_int (byte *p)
 {
-  int32_t val    = get_24bit_value(data);
-  int     is_neg = val & 0x800000;
-  int32_t v = val;
-  if (is_neg)
-    v = -(val | 0xff000000);
-  double degrees = v * 360.0 / 0x1000000;
+  int32_t val = get_24bit_uint(p);
+  if (val & 0x00800000)
+    val |= 0xff000000;
+  return val;
+}
+
+
+static byte put_24bit_value (uint32_t i, byte *data)
+{
+  data[0] = (i >> 16) & 0xff;
+  data[1] = (i >>  8) & 0xff;
+  data[2] = (i      ) & 0xff;
+  return 3;
+}
+
+static inline double degrees_from_int32 (int32_t val)
+{
+  bool is_neg = (val < 0);
+  if (val < 0)
+    val = -val;
+  double degrees = val * 360.0 / (1 << 24);
   if (degrees < 0.001)
     degrees = 0;
   if (is_neg && degrees)
     degrees = -degrees;
-  SERIAL_PRINTF("%7.3f", degrees);
+  return degrees;
+}
+
+static inline double degrees_from_24bits (byte *data)
+{
+  return degrees_from_int32(get_24bit_int(data));
+}
+
+static void print_24bits (byte *data)
+{
+  SERIAL_PRINTF("%7.3f", degrees_from_24bits(data));
 }
 
 static const char *op_decoder (byte *data)
@@ -957,6 +1015,7 @@ static const char *op_decoder (byte *data)
       print_24bits(data + 5);
       return NULL;
     }
+  } else if (dst == DEV_AZM) {
     if (op == MC_SET_CORDWRAP_POS) {
       SERIAL_PRINT(" MC_SET_CORDWRAP_POS ");
       print_24bits(data + 5);
@@ -964,32 +1023,43 @@ static const char *op_decoder (byte *data)
     }
   }
   if (op == MC_GET_POS && src == DEV_FOCUS) {
-    SERIAL_PRINTF(" MC_GET_POS %lu", get_24bit_value(data + 5));
+    SERIAL_PRINTF(" MC_GET_POS %lu", get_24bit_uint(data + 5));
     return NULL;
   }
-  if (src == DEV_BATT) {
-    if (op == BATT_MAX_CURRENT) {
+  if (src == DEV_BATT || dst == DEV_BATT) {
+    if (op == BATT_MAX_CURRENT && data[1] == 5) {
       uint bc = ((uint)data[5] << 8) | data[6];
       SERIAL_PRINTF(" BATT_MAX_CURRENT %u.%03uA", bc / 1000, bc % 1000);
       return NULL;
     }
+  }
+  if (src == DEV_BATT) {
     if (op == BATT_GET_VOLTAGE) {
-      const char *state;
+      const char *state1, *state2;
       ulong bv = (((ulong)data[7] << 24) | ((ulong)data[8] << 16) | ((ulong)data[9] << 8) | data[10]) / 1000;
-      switch (data[5] & 3) {
-        case 00: state = "Discharging"; break;
-        case 01: state = "Charging";    break;
-        case 02: state = "Charged";     break;
-        default: state = "ChargeFault"; break;
+      switch (data[5]) {
+        case 0:  state1 = "Discharging" ; break;
+        case 1:  state1 = "Charging"    ; break;
+        case 2:  state1 = "Charged"     ; break;
+        default: state1 = "ChargeFault" ; break;
       }
-      SERIAL_PRINTF(" BATT_GET_VOLTAGE %s %u.%02uV", state, bv / 1000, bv % 1000);
+      switch (data[6]) {
+        case 0:  state2 = "VeryLow"     ; break;
+        case 1:  state2 = "Low"         ; break;
+        case 2:  state2 = "Good"        ; break;
+        default: state2 = "Fault"       ; break;
+      }
+      SERIAL_PRINTF(" BATT_GET_VOLTAGE %s:%s %u.%02uV", state1, state2, bv / 1000, bv % 1000);
       return NULL;
     }
   }
   switch (dst) {
     case DEV_FOCUS:
       if (op == MC_GOTO_FAST) {
-        SERIAL_PRINTF(" MC_GOTO_FAST %lu", get_24bit_value(data + 5));
+        uint32_t pos = get_24bit_uint(data + 5);
+        if (data[1] == 5)
+          pos &= 0x00ffff00;
+        SERIAL_PRINTF(" MC_GOTO_FAST %lu", pos);
         return NULL;
       }
     case DEV_AZM:
@@ -1072,6 +1142,8 @@ static inline bool time_after (ulong a, ulong b) {return ((long)(b - a)) < 0;}
 #define time_before(a,b) time_after((b),(a))
 static inline ulong time_delta (long a, long b) {return (a > b) ? a - b : b - a;}
 
+#define DEVNAME_SIZE 12
+
 // Receive buffers for various interfaces:
 static struct rxbuf_s {
   uint16_t     len;          // for 0x3b packets only
@@ -1083,7 +1155,7 @@ static struct rxbuf_s {
   uint16_t     sslen;        // Starsense expected total bytecount, increased as padding is encountered
   byte         sspadding;    // Starsense current padding count (max 2): exclude from csum
   byte         requestor;    // Used to prevent echoing commands back to originator of the command.
-  char         name[12];
+  char         name[DEVNAME_SIZE];
   struct bus_s *bus;
 } w2000_rxbuf, bt_rxbuf;
 
@@ -1092,10 +1164,11 @@ static struct rxbuf_s {
   static void e2000_tx (bool from_ssaa, byte *data, uint16_t count);
 #endif
 
-static void init_rxbuf (struct rxbuf_s *rxbuf, const char *name)
+static void init_rxbuf (struct rxbuf_s *rxbuf, const char *devname)
 {
   memset(rxbuf, 0, sizeof(*rxbuf));
-  strcpy(rxbuf->name, name);
+  strcpy(rxbuf->name, devname);
+  strcat(rxbuf->name, "_rx");
   routing_remove_sofware_devs();
 }
 
@@ -1128,7 +1201,7 @@ struct txq_s {
   byte            busyin_pin;
   byte            busyout_pin;
   long            busy_timestamp;
-  char            name[12];
+  char            name[DEVNAME_SIZE];
   bool            is_alive;
   uint16_t        last_tx_len;
   byte            last_tx[AUXBUS_SSAA_PKT_MAX];
@@ -1172,10 +1245,11 @@ static void txq_discard_all (struct txq_s *txq)
   }
 }
 
-static void txq_init (struct txq_s *txq, const char *name, HardwareSerial *uart, byte rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
+static void txq_init (struct txq_s *txq, const char *devname, HardwareSerial *uart, byte rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
 {
   memset(txq, 0, sizeof(*txq));
-  strcpy(txq->name, name);
+  strcpy(txq->name, devname);
+  strcat(txq->name, "_tx");
   txq->uart        = uart;
   txq->busyin_pin  = busyin_pin;
   txq->busyout_pin = busyout_pin;
@@ -1200,12 +1274,6 @@ static struct bus_s {
 } auxbus, auxrelay;
 
 static bool auxrelay_detected;  // Gets set when bus_init() is called from setup()
-
-static inline void mkname (char *dst, const char *base, const char *suffix)
-{
-  strcpy(dst, base);
-  strcat(dst, suffix);
-}
 
 static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
 {
@@ -1284,22 +1352,19 @@ static void bus_test (struct bus_s *bus)
   txq->uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, bus->rx_pin, bus->tx_pin);
 }
 
-static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *name, HardwareSerial *uart, int rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
+static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *devname, HardwareSerial *uart, int rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
 {
-  char tname[12];
   memset(bus, 0, sizeof(*bus));
-  bus->name = name;
+  bus->name = devname;
   if (rx_pin == -1 || (do_loopback_test && !bus_detect(busyout_pin, rx_pin, tx_pin)))
     return false;
   bus->rxbuf = (struct rxbuf_s *)malloc(sizeof(struct rxbuf_s));
   bus->tx_pin = tx_pin;
   bus->rx_pin = rx_pin;
-  mkname(tname, name, "_rx");
-  init_rxbuf(bus->rxbuf, tname);
+  init_rxbuf(bus->rxbuf, devname);
   bus->rxbuf->bus = bus;
   bus->txq = (struct txq_s *)malloc(sizeof(struct txq_s));
-  mkname(tname, name, "_tx");
-  txq_init(bus->txq, tname, uart, rx_pin, tx_pin, busyin_pin, busyout_pin);
+  txq_init(bus->txq, devname, uart, rx_pin, tx_pin, busyin_pin, busyout_pin);
   uart->setRxBufferSize((2 * AUXBUS_PKT_MAX) + AUXBUS_SSAA_PKT_MAX);     // Large enough for SSAA packets, plus some
   uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, rx_pin, tx_pin);
   return true;
@@ -1392,13 +1457,18 @@ static void print_packet (const char *prefix1, const char *prefix2, byte *data, 
   const char *opname = NULL;
 
   if (aux_only_tracing) {
-    char c = *prefix1;
+    char c = prefix1[0];
     if ((c == 'w' && 0 == strncmp(prefix1, "w2000_", 6))
      || (c == 'b' && 0 == strncmp(prefix1, "bt_",    3))
 #if ETHERNET_ENABLED
      || (c == 'e' && 0 == strncmp(prefix1, "e2000_", 6))
 #endif
      || (c == 'm' && 0 == strncmp(prefix1, "musb_",  5)))
+      return;
+  }
+  bool regular_pkt = (data[0] == 0x3b) && (data[1] == (len - 3));
+  if (regular_pkt && data[4] == MC_GET_POS) {
+    if (ignore_mc_get_pos && (data[2] == DEV_AZM || data[2] == DEV_ALT || data[3] == DEV_AZM || data[3] == DEV_ALT))
       return;
   }
   if (prefix2 == TIMED_OUT) {
@@ -1424,7 +1494,7 @@ static void print_packet (const char *prefix1, const char *prefix2, byte *data, 
     SERIAL_PRINTF("%02x ", data[i]);
     count += 3;
   }
-  if (data[0] == 0x3b && data[1] == (len - 3)) {
+  if (regular_pkt) {
     static const char tabs[] = "\t\t\t\t\t\t\t\t\t";  // Lighter load on Serial port using tabs!
     uint t = count / 8;
     if (t < strlen(tabs))
@@ -1550,7 +1620,7 @@ static void musb_disconnect (void)
 {
   SERIAL_PRINTLN(__func__);
   musb_txcount = musb_rxcount = 0;
-  init_rxbuf(&musb_rxbuf, "musb_rx");
+  init_rxbuf(&musb_rxbuf, "musb");
   musb_connected = 0;
   musb_last4 = 0;
   musb_uart->updateBaudRate(19200);
@@ -1640,10 +1710,22 @@ static inline byte emulate_begin (const char *devname, byte *data, byte *reply)
   reply[2] = data[3]; // Destination device (local/emulated GPS,DEW,FOCUS,SSAA,SSAG..)
   reply[3] = data[2]; // Originating device (SW,HC5,ESP32..)
   reply[4] = data[4]; // opcode
-  if (TVERBOSE(data))
-    print_packet(devname, NULL, data, data[1] + 3);
+  if (TVERBOSE(data)) {
+    char tname[DEVNAME_SIZE];
+    strcpy(tname, devname);
+    strcat(tname, "_rx");
+    print_packet(tname, NULL, data, data[1] + 3);
+  }
   return reply[1] + 2; // overall length, not including the checksum byte
 }
+
+#define EMULATE_BEGIN2() /* Use this when already have devname */ \
+  byte reply[AUXBUS_PKT_MAX], op = data[4];                       \
+  byte len = emulate_begin(devname, data, reply)
+
+#define EMULATE_BEGIN(_devname)   \
+  const char *devname = _devname; \
+  EMULATE_BEGIN2()
 
 static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte *data, uint16_t len);
 
@@ -2447,15 +2529,12 @@ static void gps_restore_location (void)
 
 static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
-  byte reply[AUXBUS_PKT_MAX], len, op = data[4];
-
+  EMULATE_BEGIN("gps");
 #if NTP_ENABLED
   // TO-DO: pass NTP date/time to the GPS receiver to help it get a fix earlier?
   if (!gps_has_date_time)
     ntp_fast_update_secs = 60;
 #endif /* NTP_ENABLED */
-
-  len = emulate_begin("gps_rx", data, reply);
 
   switch (OP(op,data[1]))
   {
@@ -2564,7 +2643,7 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("GPS OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply("gps_tx", rxbuf, reply, len);
+  emulate_send_reply(devname, rxbuf, reply, len);
 }
 
 static inline byte gps_dump_lbuf (char *lbuf, byte lcnt)
@@ -2580,9 +2659,9 @@ static void gps_receive (void)
 {
   static char lbuf[128];
   static byte lcnt           = 0;
-  static bool baudrate_ok    = false;
   static byte nmea_successes = 0;
   static uint16_t rxcount    = 0;
+  static long gps_autobaud_timeout = 13000;  // Should succeed long before this, or SSHC won't be happy!
 
   while (GPS_UART_AVAILABLE()) {
     char c = GPS_UART_READ();
@@ -2590,8 +2669,8 @@ static void gps_receive (void)
       gps_detected = true;
       SERIAL_PRINTLN("GPS detected.");
     }
-    if (gps.encode(c) && !baudrate_ok && ++nmea_successes > 3) {
-      baudrate_ok = true;
+    if (gps.encode(c) && gps_autobaud_timeout && ++nmea_successes > 3) {
+      gps_autobaud_timeout = 0;
       SERIAL_PRINTF("GPS baud %lu.\r\n", gps_uart_baud);
     }
     if (c != '\r' && c != '\n')
@@ -2600,7 +2679,9 @@ static void gps_receive (void)
       lcnt = gps_dump_lbuf(lbuf, lcnt);
   }
   // Auto-switch baud rate: the BE-xxx series default to 38400 instead of 9600.
-  if (gps_detected && !baudrate_ok) {
+  if (gps_autobaud_timeout) {
+    if (time_after(millis(), gps_autobaud_timeout))
+      gps_autobaud_timeout = 0;
     if ((rxcount > 200 && !nmea_successes) || time_after(millis(), gps_last_baud_change + 1500)) {
       lcnt = gps_dump_lbuf(lbuf, lcnt);
       rxcount = 0;
@@ -2634,15 +2715,397 @@ static void gps_loop (void)
 }
 #endif /* EMULATE_GPS */
 
+/************************** Begin  MOUNT simulator **********************************************/
+#if EMULATE_MOUNT
+static byte mount_dev_handle_request (const char *devname, byte *data, byte len, byte *reply)
+{
+  byte op = data[4];
+  switch (OP(op,data[1]))
+  {
+    case OP(DEV_GET_VERSION,3):
+      reply[len++] =  7;  // Version 7.17.98 (Evolution firmware)
+      reply[len++] = 17;
+      reply[len++] =  0;
+      reply[len++] = 98;
+      break;
+    case OP(DEV_GET_MODEL,3):
+      reply[len++] = EVOLUTION_MODEL >> 8;
+      reply[len++] = EVOLUTION_MODEL & 0xff;
+      break;
+    default:
+      if (!auxbus_raw_tracing)
+        SERIAL_PRINTF("%s_rx: dev=0x%02x OP-0x%02x len=%u (unknown)\r\n", devname, data[3], op, data[1]);
+  }
+  return len;
+}
+
+static void batt_handle_request (struct rxbuf_s *rxbuf, byte *data)
+{
+  const uint32_t voltage = 10760000;  // micro-volts (10.760V)
+  static uint16_t max_current = 2000;  // milliamps
+
+  EMULATE_BEGIN("batt");
+  switch (OP(op,data[1]))
+  {
+    case OP(BATT_MAX_CURRENT,3):
+      reply[len++] = max_current >> 8;
+      reply[len++] = max_current & 0xff;
+      break;
+    case OP(BATT_MAX_CURRENT,5):
+      max_current = data[5];
+      max_current = (max_current << 8) | data[6];
+      break;
+    case OP(BATT_GET_VOLTAGE,3):
+      reply[len++] = 0x00;  // 00=Discharging, 01=Charging
+      reply[len++] = 0x02;  // 02=Good, 03=ChargeFault
+      reply[len++] = (voltage >> 24) & 0xff;
+      reply[len++] = (voltage >> 16) & 0xff;
+      reply[len++] = (voltage >>  8) & 0xff;
+      reply[len++] = (voltage      ) & 0xff;
+      break;
+    default:
+      len = mount_dev_handle_request(devname, data, len, reply);
+  }
+  emulate_send_reply(devname, rxbuf, reply, len);
+}
+
+// Handle the Evo "USB" Power/Charge port:
+static void pwrchg_handle_request (struct rxbuf_s *rxbuf, byte *data)
+{
+  static byte usb_mode = 0;  // 0=Auto, 1=On
+
+  EMULATE_BEGIN("pwrchg");
+  switch (OP(op,data[1]))
+  {
+    case OP(PWRCHG_MODE,3):
+      reply[len++] = usb_mode;
+      break;
+    case OP(PWRCHG_MODE,4):
+      usb_mode = data[5];
+      break;
+    default:
+      len = mount_dev_handle_request(devname, data, len, reply);
+  }
+  emulate_send_reply(devname, rxbuf, reply, len);
+}
+
+static void leds_handle_request (struct rxbuf_s *rxbuf, byte *data)
+{
+  static byte levels[] = {0x25,0x25,0x25};  // PWM values from 00..ff.  0x25 is "level 5".
+  byte i;
+
+  EMULATE_BEGIN("leds");
+  switch (OP(op,data[1]))
+  {
+    case OP(LEDS_LEVEL,4): // GET_LEVEL
+      i = data[5];    // 00=tray,01=wifi,02=logo,03=logo
+      if (i == 3)
+        i = 2;
+      reply[len++] = (i <= 2) ? levels[i] : 0;
+      break;
+    case OP(LEDS_LEVEL,5): // SET_LEVEL
+      i = data[5];    // 00=tray,01=wifi,02=logo,03=wifi+logo
+      if (i < 3)
+        levels[i] = data[6];
+      else if (i == 3)
+        levels[1] = levels[2] = data[6];
+      break;
+    default:
+      len = mount_dev_handle_request(devname, data, len, reply);
+  }
+  emulate_send_reply(devname, rxbuf, reply, len);
+}
+
+static void evwifi_handle_request (struct rxbuf_s *rxbuf, byte *data)
+{
+  EMULATE_BEGIN("evwifi");
+  switch (OP(op,data[1]))
+  {
+    case OP(SET_EVO_WIFI,4):
+      break;
+    default:
+      len = mount_dev_handle_request(devname, data, len, reply);
+  }
+  emulate_send_reply(devname, rxbuf, reply, len);
+}
+
+static void uart_handle_request (struct rxbuf_s *rxbuf, byte *data)
+{
+  EMULATE_BEGIN("uart");
+  switch (OP(op,data[1]))
+  {
+    case OP(UART_SET_BAUD,7):
+      break;
+    default:
+      len = mount_dev_handle_request(devname, data, len, reply);
+  }
+  emulate_send_reply(devname, rxbuf, reply, len);
+}
+
+static struct mc_s {
+  int32_t  pos;
+  int32_t  slew_target;
+  int32_t  slew_rate;
+  int32_t  cordwrap_pos;
+  int32_t  cordwrap_enabled;
+  int8_t   move_speed;
+  byte     program_mode;  // 1==old_style; 2==new_style(Evolution)
+  char     devname[4];
+  long     nexttime;
+} mc_alt, mc_azm;
+
+static void mc_init (void)
+{
+  memset(&mc_azm, 0, sizeof(mc_azm));
+  memset(&mc_alt, 0, sizeof(mc_alt));
+  strcpy(mc_azm.devname, "azm");
+  strcpy(mc_alt.devname, "alt");
+}
+
+#if 0 //FIXME nuke?
+static int32_t mc_move (int32_t pos, int32_t amount)
+{
+  // To-Do: impose slew limits 0..180 for mc_alt motor?
+  if (!amount)
+    return pos;
+  int incr = 1;
+  if (amount < 0) {
+    incr = -1;
+    amount = -amount;
+  }
+  while (amount--) {   // To-Do: not very efficient, be smarter?
+    pos += incr;
+    if (pos == 0x00ffffff)
+      pos = 0;
+  }
+  return pos;
+}
+#endif
+
+static void mc_loop (struct mc_s *mc)
+{
+  if (mc->nexttime && time_before(millis(), mc->nexttime))
+    return;
+  mc->nexttime = 0;
+  if (mc->move_speed) {
+#if 0  //FIXME
+    mc->pos = mc_move(mc->pos, mc->move_speed * 600);
+#else
+    mc->pos = mc->pos + mc->move_speed * 500;
+#endif
+    mc->nexttime = get_timeout(25);
+  } else if (mc->slew_rate) {
+    //FIXME: use shortest path, eg. the short way from +179 to -179 degrees?
+    if (mc->pos > mc->slew_target) {
+      mc->pos -= mc->slew_rate;
+      if (mc->pos < mc->slew_target)
+        mc->pos = mc->slew_target;
+    } else if (mc->pos < mc->slew_target) {
+      mc->pos += mc->slew_rate;
+      if (mc->pos > mc->slew_target)
+        mc->pos = mc->slew_target;
+    }
+    if (mc->pos == mc->slew_target)
+      mc->slew_rate = 0;
+    else
+      mc->nexttime = get_timeout(25);
+  }
+}
+
+enum {
+  MC_PGM_SUCCESS         = 0x02,
+  MC_PGM_ENTERED         = 0x03,
+  MC_PGM_UNEXPECTED_MSG  = 0x05,
+  MC_PGM_VERIFY_FAILED   = 0x06,
+  MC_PGM_BAD_CSUM        = 0x07,
+  MC_PGM_ADDR_RANGE_ERR  = 0x80,
+};
+
+static void mc_handle_program_mode (struct rxbuf_s *rxbuf, byte *data, struct mc_s *mc)
+{
+  EMULATE_BEGIN(mc->devname);
+  byte mlen = data[1];
+  if (mc->program_mode == 1) {
+    switch (OP(op,mlen))
+    {
+      case OP(MC_PROGRAM_INIT,3):
+        reply[len-1] = MC_PGM_SUCCESS;
+        break;
+      case OP(MC_PROGRAM_END,3):
+        mc->program_mode = false;
+        reply[len-1] = MC_PGM_SUCCESS;
+        break;
+      default:
+        if (op != MC_PROGRAM_DATA) {
+          reply[len-1] = MC_PGM_UNEXPECTED_MSG;
+          break;
+        }
+        if (mlen < (3+4) || mlen > (3+10) || ((mlen - 3) & 1)) {
+          reply[len-1] = MC_PGM_ADDR_RANGE_ERR;
+          break;
+        }
+        // MC_PROGRAM_DATA: payload: AAAA DDDD{,DDDD}.. (max 4 DDDD instances)
+        uint16_t addr = (data[5] << 8) | data[6];
+        SERIAL_PRINTF("PGM %04x: %u bytes\r\n", addr, mlen - 5);
+        reply[len-1] = MC_PGM_SUCCESS;
+    }
+  } else if (mc->program_mode == 2) {
+    // After DEV_PROGRAM_ENA, CFM then does UART_SET_BAUD, and then..
+    // New protocol: first byte is msg-size, followed by remainder of msg including csum(?):
+    // 05 00 06 38 c0
+    //   [1200msecs]
+    // 0d 0a              ("\r\n")
+    //   [600msecs
+    // 05 00 06 38 c0     (retry)
+    //   [200msecs]
+    // 06 00 02 02 f5 d8
+    //   [200msecs]
+    // 06 00 02 02 f5 d8  (retry)
+    //   [200msecs]
+    // 06 00 02 02 f5 d8  (retry)
+    //   [200msecs]
+    // ... 
+    // retry-limit exceeded.
+    // This looks a bit like the old GT-mount protocol.
+  }
+  emulate_send_reply(mc->devname, rxbuf, reply, len);
+}
+
+static void mc_handle_request (struct rxbuf_s *rxbuf, byte *data, struct mc_s *mc)
+{
+  EMULATE_BEGIN(mc->devname);
+  switch (OP(op,data[1]))
+  {
+    case OP(MC_SET_POS,6):
+      mc->pos = get_24bit_int(data + 5);
+      break;
+    case OP(MC_GET_POS,3):
+      len += put_24bit_value(mc->pos, reply + len);
+      break;
+    case OP(MC_MOVE_POS,4):
+      mc->slew_rate   = 0;
+      mc->move_speed  = data[5];
+      break;
+    case OP(MC_MOVE_NEG,4):
+      mc->slew_rate   = 0;
+      mc->move_speed  = data[5] ? -data[5] : 0;
+      break;
+    case OP(MC_GOTO_FAST,5):
+    case OP(MC_GOTO_FAST,6):
+      mc->slew_target = get_24bit_int(data + 5);
+      if (data[1] == 5)
+        mc->slew_target &= 0xffffff00;
+      mc->slew_rate   = 9 * 600;
+      mc->move_speed  = 0;
+      break;
+    case OP(MC_GOTO_SLOW,5):
+    case OP(MC_GOTO_SLOW,6):
+      mc->slew_target = get_24bit_int(data + 5);
+      if (data[1] == 5)
+        mc->slew_target &= 0xffffff00;
+      mc->slew_rate   = 9 * 200;
+      mc->move_speed  = 0;
+      break;
+    case OP(MC_GOTO_DONE,4):  // CPWI bug: extra byte here sometimes
+    case OP(MC_GOTO_DONE,3):
+      reply[len++] = mc->slew_rate ? 0x00 : 0xff;
+      break;
+    case OP(MC_SET_POS_BACKLASH,4):
+    case OP(MC_SET_NEG_BACKLASH,4):
+    case OP(MC_SET_APPROACH,4):
+    case OP(MC_SET_CUSTOM_RATE9_ENA,4):
+    case OP(MC_SET_POS_GUIDERATE,5):
+    case OP(MC_SET_POS_GUIDERATE,6):
+    case OP(MC_SET_NEG_GUIDERATE,5):
+    case OP(MC_SET_NEG_GUIDERATE,6):
+    case OP(MC_DISABLE_CORDWRAP,3):
+      mc->cordwrap_enabled = false;
+      break;
+    case OP(MC_ENABLE_CORDWRAP,3):
+      mc->cordwrap_enabled = true;
+      break;
+    case OP(MC_SET_CORDWRAP_POS,6):
+      mc->cordwrap_pos = get_24bit_int(data + 5);
+      break;
+    case OP(MC_GET_CORDWRAP_POS,3):
+      len += put_24bit_value(mc->cordwrap_pos, reply + len);
+      break;
+    case OP(MC_POLL_CORDWRAP,3):
+      reply[len++] = mc->cordwrap_enabled ? 0xff : 0x00;  //FIXME? test
+      break;
+    case OP(MC_GET_POS_BACKLASH,3):
+    case OP(MC_GET_NEG_BACKLASH,3):
+    case OP(MC_GET_APPROACH,3):
+    case OP(MC_GET_CUSTOM_RATE9_ENA,3):
+      reply[len++] = 0x00;
+      break;
+    case OP(MC_GET_CUSTOM_RATE9,3):
+      reply[len++] = 0x0f;
+      reply[len++] = 0xa0;
+      reply[len++] = 0x11;
+      reply[len++] = 0x94;
+      break;
+    case OP(MC_PROGRAM_ENTER,3):
+      mc->program_mode = 1;
+      reply[len-1] = MC_PGM_ENTERED;
+      break;
+    case OP(DEV_PROGRAM_ENA,3):
+      mc->program_mode = 2;
+      break;
+    default:
+      len = mount_dev_handle_request(mc->devname, data, len, reply);
+  }
+  emulate_send_reply(mc->devname, rxbuf, reply, len);
+}
+
+static bool mount_handle_request (struct rxbuf_s *rxbuf, byte *data)
+{
+  byte dev = data[3];
+
+  switch (dev) {
+    case DEV_AZM:
+      if (mc_azm.program_mode)
+        mc_handle_program_mode(rxbuf, data, &mc_azm);
+      else
+        mc_handle_request(rxbuf, data, &mc_azm);
+      return true;  // handled
+    case DEV_ALT:
+      if (mc_alt.program_mode)
+        mc_handle_program_mode(rxbuf, data, &mc_alt);
+      else
+        mc_handle_request (rxbuf, data, &mc_alt);
+      return true;  // handled
+    case DEV_BATT:
+      batt_handle_request(rxbuf, data);
+      return true;  // handled
+    case DEV_PWRCHG:
+      pwrchg_handle_request(rxbuf, data);
+      return true;  // handled
+    case DEV_LEDS:
+      leds_handle_request(rxbuf, data);
+      return true;  // handled
+    case DEV_EVWIFI:
+      evwifi_handle_request(rxbuf, data);
+      return true;  // handled
+    case DEV_UART:
+      uart_handle_request(rxbuf, data);
+      return true;  // handled
+    default:
+      return false; // NOT handled
+  }
+}
+
+#endif /* EMULATE_MOUNT */
+/************************** End  MOUNT simulator ************************************************/
+
 /************************** Begin SSAG StarSense Auto Guider Emulation **************************/
 #if EMULATE_SSAG
 
 static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
   static long cmd_timer = 0;
-  byte reply[AUXBUS_PKT_MAX], len, op = data[4];
 
-  len = emulate_begin("ssag_rx", data, reply);
+  EMULATE_BEGIN("ssag");
   switch (OP(op,data[1]))
   {
     case OP(DEV_GET_VERSION,3): {
@@ -2741,7 +3204,7 @@ static void ssag_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("SSAG OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply("ssag_tx", rxbuf, reply, len);
+  emulate_send_reply(devname, rxbuf, reply, len);
 }
 #endif
 /************************** End   SSAG StarSense Auto Guider Emulation **************************/
@@ -2884,9 +3347,8 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
 
   static enum {ssaa_idle = 1, ssaa_captured = 3, ssaa_finish = 9} ssaa_status = ssaa_idle;
   static byte plate_index = 0;
-  byte reply[AUXBUS_PKT_MAX], len, op = data[4];
 
-  len = emulate_begin("ssaa_rx", data, reply);
+  EMULATE_BEGIN("ssaa");
   switch (OP(op,data[1]))
   {
     case OP(DEV_GET_MODEL,3): {
@@ -2945,12 +3407,12 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
         break;  // Unable to get a plate right now
       reply[len++] = 0x09;
       reply[len++] = ssaa_image_nstars;
-      emulate_send_reply("ssaa_tx", rxbuf, reply, len);
+      emulate_send_reply(devname, rxbuf, reply, len);
       if (ssaa_image_len != 0) {
         if ((plate_index % 3) == 2)
           ssaa_status = ssaa_idle;
         SERIAL_PRINTF("SSAA GET_PLATE %u stars\r\n", ssaa_image_nstars);
-        emulate_send_reply("ssaa_tx", rxbuf, ssaa_image_pkt, ssaa_image_len);
+        emulate_send_reply(devname, rxbuf, ssaa_image_pkt, ssaa_image_len);
         ssaa_image_pkt = NULL;  // bus_tx() will free the memory
       }
       return;
@@ -3002,7 +3464,7 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("SSAA OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply("ssaa_tx", rxbuf, reply, len);
+  emulate_send_reply(devname, rxbuf, reply, len);
 }
 
 #endif /* EMULATE_SSAA */
@@ -3456,9 +3918,9 @@ static inline bool focus_begin_backlash_compensation (byte op, uint amount)
 static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
   static bool slew_done = true;
-  byte reply[AUXBUS_PKT_MAX], len, op = data[4], src = data[2];
+  byte src = data[2];
 
-  len = emulate_begin("focus_rx", data, reply);
+  EMULATE_BEGIN("ssaa");
   switch (OP(op,data[1]))
   {
     case OP(MC_GET_POS,3): {
@@ -3470,16 +3932,18 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
           SERIAL_PRINTF("FOCUS GET_POS: %lu\r\n", p);
         }
       }
-      reply[len++] = p >> 16;
-      reply[len++] = p >>  8;
-      reply[len++] = p;
+      len += put_24bit_value(p, reply + len);
       break;
     }
+    case OP(MC_GOTO_SLOW,5):
     case OP(MC_GOTO_SLOW,6):
+    case OP(MC_GOTO_FAST,5):
     case OP(MC_GOTO_FAST,6): {
       slew_done = false;
       focus_backlash_timeout = 0;
-      focus_target_pos = focus_apply_limits(get_24bit_value(data + 5));
+      focus_target_pos = focus_apply_limits(get_24bit_uint(data + 5));
+      if (data[1] == 5)
+        focus_target_pos &= 0x00ffff00;
       long delta       = focus_target_pos - focus_currentPosition();
       long target      = FOCUS_TO_STEPPER_POS(focus_target_pos);
       stepper_setSpeed(stepper_maxSpeed());
@@ -3488,7 +3952,7 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
         SERIAL_PRINTF("FOCUS GOTO_%s: %lu -> %lu (%+ld)\r\n", (op == MC_GOTO_SLOW) ? "SLOW" : "FAST", focus_currentPosition(), focus_target_pos, delta);
       break;
     }
-    case OP(MC_GOTO_DONE,4):
+    case OP(MC_GOTO_DONE,4):  // CPWI bug: extra byte here sometimes
     case OP(MC_GOTO_DONE,3): {
       if (!slew_done && !stepper_isRunning())
         slew_done = true;
@@ -3597,7 +4061,7 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
       if (!auxbus_raw_tracing)
         SERIAL_PRINTF("FOCUS OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
-  emulate_send_reply("focus_tx", rxbuf, reply, len);
+  emulate_send_reply(devname, rxbuf, reply, len);
   return false;
 }
 
@@ -3771,7 +4235,7 @@ static void nchuck_handle_fm_response (byte *data)
   if (nchuck_debug)
     print_packet(__func__, NULL, data, len + 3);
   if (OP(op,len) == OP(MC_GET_POS,6)) {
-    uint32_t pos = get_24bit_value(data + 5);
+    uint32_t pos = get_24bit_uint(data + 5);
     fm_position_timeout = 0;
     if (fm_preset_pending && !fm_preset_pending->have_position) {
       fm_preset_pending->position = pos;
@@ -3785,7 +4249,7 @@ static void nchuck_handle_fm_response (byte *data)
       fm_goto_begin_moving(pos);
     return;
   }
-  if (OP(op,len) == OP(MC_GOTO_DONE,3) || OP(op,len) == OP(MC_GOTO_DONE,4)) {
+  if (OP(op,len) == OP(MC_GOTO_DONE,3) || OP(op,len) == OP(MC_GOTO_DONE,4)) { // CPWI bug: extra byte here sometimes
     if (data[5] == 0)  // Still slewing?
       return;
     if (fm_goto_stage1) {
@@ -4415,9 +4879,10 @@ static byte   dew_aggression   [DEW_NUMCHANNELS] = { 5,  5};  // 1..10 (NVRAM)
 static byte   dew_manual_pwm   [DEW_NUMCHANNELS] = { 0,  0};  // 0..100 (NVRAM)
 static double dew_temperature  [DEW_NUMCHANNELS] = { 0,  0};  // degrees
 static double dew_max_amperage [DEW_NUMCHANNELS] = { 0,  0};  // kept in NVRAM
-static byte   dew_aggression_to_degreesC [11] = {0, 2, 3, 4, 5, 7, 9, 10, 12, 14, 15};
+static byte   dew_aggression_to_degreesC [11] = {2, 3, 4, 5, 6, 8, 9, 10, 12, 14, 15};
 static bool   thermistor_detected [DEW_NUMCHANNELS] = {false, false};
 static double dew_input_voltage = 12.0000;  // hardcoded, unless ads1115 channel-3 is wired to measure it
+static bool have_dew_input_voltage = false;
 
 static char   dew_oled_rows[4][22] = {{0,},};   // To-Do: get rid of this someday to save RAM.
 
@@ -4472,10 +4937,9 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
   static byte ports_enabled[DEW_NUMCHANNELS + DEW_NUM_12V_PORTS] = {0,};
   static byte led_brightness = 0x7f;
-  byte reply[AUXBUS_PKT_MAX], len, op = data[4], dev = data[3];
 
-  len = emulate_begin("dew_rx", data, reply);
-  if (dev == DEV_DEWBB) {
+  EMULATE_BEGIN("dew");
+  if (data[3] == DEV_DEWBB) {
     switch (OP(op,data[1]))
     {
       case OP(DEV_GET_VERSION,3): {
@@ -4678,7 +5142,7 @@ static void dew_handle_request (struct rxbuf_s *rxbuf, byte *data)
         SERIAL_PRINTF("DEW OP-0x%02x len=%u (unknown)\r\n", op, data[1]);
   }
 done:
-  emulate_send_reply("dew_tx", rxbuf, reply, len);
+  emulate_send_reply(devname, rxbuf, reply, len);
 }
 
 #define SHT3X_I2C_ADDR 0x44
@@ -4876,6 +5340,7 @@ static void ads1115_read_dew_input_voltage (void)
 {
   int16_t pinval = ads1115_read_ADC(3);
   if (pinval >= 0x1000 && pinval <= 0x7000) {
+    have_dew_input_voltage = true;
     double v = (4.096 / (double)0x7fff) * (double)pinval;
     dew_input_voltage = v * 5;  // external 1:5 voltage divider keeps input levels safe for ADS1115
     if (dew_debug)
@@ -5088,7 +5553,10 @@ static void dew_loop (void)
     tenths  = t;
     degrees = t / 10;
     tenths  = abs(tenths - (degrees * 10));
-    sprintf(dew_oled_rows[0], "Dewpoint: %3d.%uC", degrees, tenths);
+    if (have_dew_input_voltage)
+      sprintf(dew_oled_rows[0], "Dewpt: %3d.%uC  %5.2fV", degrees, tenths, dew_input_voltage);
+    else
+      sprintf(dew_oled_rows[0], "Dewpoint: %3d.%uC", degrees, tenths);
     t       = sht3x_temperature * 10.0;
     tenths  = t;
     degrees = t / 10;
@@ -5222,6 +5690,7 @@ static long oled_offtime         = 0;
 static long oled_splash_timer    = 0;
 static long oled_button_timer    = 0;  // for longpress timings in various updatefn()'s
 static byte oled_mode            = 0;
+static bool oled_showing_image   = false;
 
 static const uint8_t HomeBrew5x14_font[] = {  // Two groups of 5-bytes-across for each character. Each byte is vertical pixels.
  0x0,  0x0,     5,   14, 0x20, 0x61,          // Final entry (code 0x80) is degrees symbol
@@ -5310,6 +5779,14 @@ static void oled_clear (byte from_row)
     case 2:  oled_set_row(2, "");
     default: oled_set_row(3, "");
   }
+}
+
+static void oled_set_all_updated (bool updated)
+{
+  oled_data_updated[0] = updated;
+  oled_data_updated[1] = updated;
+  oled_data_updated[2] = updated;
+  oled_data_updated[3] = updated;
 }
 
 static void oled_force_clear (void)
@@ -5458,7 +5935,7 @@ static void gps_dddmmss (byte fix_type, char *tmp, const char *prefix, const cha
     snprintf(tmp, OLED_ROW_CHARS, "%s: ---%c -- -- --  -", prefix, oled_degreesym);
   } else {
     byte C = compass[0], ddd, mm, ss, ff;
-    unsigned int SS; 
+    unsigned int SS;
     if (f < 0) {
       C = compass[1];
       f = -f;
@@ -5726,12 +6203,7 @@ static void oled_send_image (const byte *image, unsigned int image_size)
   }
   oled_cmd(0x20);  // Set MemoryMode to next byte:
   oled_cmd(0x02);  //   use Page addressing mode for text.
-
-  // Prevent oled_loop() from overwriting the image:
-  oled_data_updated[0] = false;
-  oled_data_updated[1] = false;
-  oled_data_updated[2] = false;
-  oled_data_updated[3] = false;
+  oled_set_all_updated(false); // Prevent oled_loop() from overwriting the image:
 }
 
 static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
@@ -5748,6 +6220,7 @@ static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
       oled_set_row(1, "====================");
       oled_set_row(2, "Hold for 10 seconds");
       oled_set_row(3, "  for Factory Reset.");
+      oled_showing_image = false;
     }
     need_redraw = true; // In case button is not held long enough to begin the reset
     return true;
@@ -5765,6 +6238,7 @@ static bool oled_QRcode_updatefn (byte arg)  // oled_arg_t
     need_redraw = false;
     if (oled_type == &Adafruit128x64) {
       oled_send_image(QRcode_image, sizeof(QRcode_image));
+      oled_showing_image = true;
     } else {
       oled_set_row(1, HBG3_NAME " by Mark Lord");
       oled_set_row(2, "https://rtr.ca/hbg3/");
@@ -5903,8 +6377,13 @@ static void oled_loop (void)
 
   if (!oled_turned_off) {
     // Update the in-RAM copy of the display: oled_data[]:
-    while (!oled_updatefn[oled_mode](arg))
+    while (!oled_updatefn[oled_mode](arg)) {
       oled_mode = (oled_mode + 1) % OLED_NMODES;
+      if (oled_showing_image) {
+        oled_showing_image = false;
+        oled_set_all_updated(true); // Force full redraw
+      }
+    }
     if (arg == oled_firstcall)
       arg = oled_normal;
 
@@ -5978,6 +6457,7 @@ static void auxtest_received_msg (struct bus_s *bus, byte *data)
 static inline bool dev_is_emulated (byte dst)
 {
   return (dst == DEV_ESP32)
+      || (EMULATING_MOUNT && is_evo_mount_dev(dst))
 #if EMULATE_GPS
       || (dst == DEV_GPS && gps_detected && !gps_disabled)
 #endif
@@ -6208,7 +6688,7 @@ static bool spoof_challenge_response (struct rxbuf_s *rxbuf)
       uint32_t r = *(uint32_t *)(data + 5);
       if (have_ichallenge) {
         have_ichallenge = false;
-        SERIAL_PRINTF("CR: 0x%08x 0x%08x    0x%08x 0x%08x\r\n", challenge, r, reverse32(challenge), reverse32(r)); 
+        SERIAL_PRINTF("CR: 0x%08x 0x%08x    0x%08x 0x%08x\r\n", challenge, r, reverse32(challenge), reverse32(r));
       }
       byte msg[] = {0x3b, 0x04, DEV_SSSWI, DEV_SSHC, SSSWI_RESPONSE, 0x01, 0x00};  // RESPONSE_OK
       update_checksum(msg);
@@ -6239,7 +6719,7 @@ restart:
   }
   if ((b == 0x3b || b == 0x3c) && rxbuf->len <= 4) {  // Okay, because no devices use 0x3b/0x3c as DEV_id
     // SSAG on relay observed to send 0x3b 0x06, then repeat them with the rest of the packet..
-    print_packet(rxbuf->name, "Collsion", rxbuf->data, rxbuf->len);
+    print_packet(rxbuf->name, "Collision", rxbuf->data, rxbuf->len);
     packet_reset(rxbuf, pkt_fail);
     rxbuf->len = 0;
     goto restart;
@@ -6332,7 +6812,7 @@ restart:
 
 static void bt_setup (void)
 {
-  init_rxbuf(&bt_rxbuf, "bt_rx");
+  init_rxbuf(&bt_rxbuf, "bt");
   if (simple_mode || (musb_selected && musb_rfkill)) {
     bt_enabled = false;
   } else {
@@ -6499,17 +6979,15 @@ static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte
     data[1] = len - 3; // excludes 0x3b, itself, and checksum
     update_checksum(data);
   }
-  if (regular_pkt && data[3] == DEV_ESP32 && TVERBOSE(data))
-    print_packet(devname, NULL, data, data[1] + 3);
+  if (TVERBOSE2(from_ssaa, data)) {
+    char tname[DEVNAME_SIZE];
+    strcpy(tname, devname);
+    strcat(tname, "_tx");
+    print_packet(tname, NULL, data, len);
+  }
   if (!rxbuf) {
     tx_enq(NULL, &auxbus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
   } else {
-    if (!rxbuf->bus && aux_only_tracing && TVERBOSE2(from_ssaa, data)) {
-      // This ensures we always see emulated device transactions in full:
-      aux_only_tracing = false;
-      print_packet(rxbuf->name, NULL, data, len);
-      aux_only_tracing = true;
-    }
     if (rxbuf->bus)
       tx_enq(NULL, rxbuf->bus, from_ssaa ? forward_discard : forward_yes, regular_pkt, data, len);
     else if (rxbuf == &w2000_rxbuf)
@@ -6525,31 +7003,6 @@ static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte
     else
       SERIAL_PRINTF("%s: unknown rxbuf\r\n", __func__);
   }
-}
-
-static void negate_24bit_position (byte *p)
-{
-  /*
-   * 24-bit signed integer, representing a fraction of a "full rotation".
-   * 000000 to 7fffff -->  0 deg to  179.999978542327881 deg  // (0x7fffff * 360 / 0x1000000)
-   * ffffff to 800000 --> -0 deg to -179.999978542327881 deg
-   */
-  uint32_t pos = get_24bit_value(p);
-  pos = 0x1000000 - pos;   // better than decoding it to degrees and back again
-  p[2] = (byte)(pos & 0xff);
-  pos >>= 8;
-  p[1] = (byte)(pos & 0xff);
-  pos >>= 8;
-  p[0] = (byte)(pos & 0xff);
-}
-
-static void negate_16bit_position (byte *p)
-{
-  ulong pos        = p[0];
-  pos = (pos << 8) | p[1];
-  pos = 0x10000 - pos;
-  p[1] = (byte)(pos & 0xff);
-  p[0] = (byte)(pos >> 8);
 }
 
 static byte cordwrap_original_op    = 0;
@@ -6583,10 +7036,6 @@ static uint16_t hack_response_pkt (byte *data, uint16_t len)
       mount_model = (((uint16_t)data[5]) << 8) | data[6];
     goto done;
   }
-  if (src == DEV_EVWIFI && op_len == OP(SET_EVO_WIFI, 3)) {
-    evo_wifi_change_pending = 0;
-    goto done;
-  }
   // StarSense-For-Skywatcher box replies from DEV_SSSWI instead of DEV_AZM: 3b 07 b8 0e fe 01 00 17 90 8d
   if (src == DEV_SSSWI && dst == DEV_SW && op_len == OP(DEV_GET_VERSION,3)) {
     data[2] = DEV_AZM;
@@ -6613,50 +7062,6 @@ static uint16_t hack_response_pkt (byte *data, uint16_t len)
         rewritten = true;
       }
       cordwrap_original_op = 0;
-    }
-  }
-  if (src == DEV_ALT && mount_reversed_alt) {
-    switch (op_len) {
-      case OP(MC_GET_POS,6):
-        negate_24bit_position(data + 5);
-        rewritten = true;
-        break;
-      case OP(MC_SET_POS_GUIDERATE,3):
-        data[4] = MC_SET_NEG_GUIDERATE;
-        rewritten = true;
-        break;
-      case OP(MC_SET_NEG_GUIDERATE,3):
-        data[4] = MC_SET_POS_GUIDERATE;
-        rewritten = true;
-        break;
-      case OP(MC_SET_POS_BACKLASH,3):
-        data[4] = MC_SET_NEG_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_SET_NEG_BACKLASH,3):
-        data[4] = MC_SET_POS_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_MOVE_POS,3):
-        data[4] = MC_MOVE_NEG;
-        rewritten = true;
-        break;
-      case OP(MC_MOVE_NEG,3):
-        data[4] = MC_MOVE_POS;
-        rewritten = true;
-        break;
-      case OP(MC_GET_POS_BACKLASH,4):
-        data[4] = MC_GET_NEG_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_GET_NEG_BACKLASH,4):
-        data[4] = MC_GET_POS_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_GET_APPROACH,4):
-        data[5] = !data[5];
-        rewritten = true;
-        break;
     }
   }
 done:
@@ -6689,13 +7094,14 @@ static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
         rewritten = true;
     }
   }
-  if (dst == DEV_AZM) {
-    // CPWI bug: includes an extra (0x01) byte in MC_GOTO_DONE for focuser at least.
-    if (op_len == OP(MC_GOTO_DONE,4)) {
+  if (op_len == OP(MC_GOTO_DONE,4)) {  // CPWI bug: includes an extra (0x01) byte in MC_GOTO_DONE for focuser at least.
+    if (dst == DEV_AZM || dst == DEV_ALT || dst == DEV_FOCUS) {
       data[1] = 0x03;
       len -= 1;
       rewritten = true;
     }
+  }
+  if (dst == DEV_AZM) {
     // CPWI bug: includes an extra (0x01) byte in MC_POLL_CORDWRAP
     if (op_len == OP(MC_POLL_CORDWRAP,4)) {
       data[1] = 0x03;
@@ -6716,62 +7122,6 @@ static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
         data[4] = MC_ENABLE_CORDWRAP;
         rewritten = true;
       }
-    }
-  }
-  if (dst == DEV_ALT && mount_reversed_alt) {
-    switch (op_len) {
-      case OP(MC_GOTO_SLOW,5):
-      case OP(MC_GOTO_FAST,5):
-        negate_16bit_position(data + 5);
-        rewritten = true;
-        break;
-      case OP(MC_GOTO_SLOW,6):
-      case OP(MC_GOTO_FAST,6):
-        negate_24bit_position(data + 5);
-        rewritten = true;
-        break;
-      case OP(MC_SET_POS,6):
-        negate_24bit_position(data + 5);
-        rewritten = true;
-        break;
-      case OP(MC_SET_POS_GUIDERATE,5):
-      case OP(MC_SET_POS_GUIDERATE,6):
-        data[4] = MC_SET_NEG_GUIDERATE;
-        rewritten = true;
-        break;
-      case OP(MC_SET_NEG_GUIDERATE,5):
-      case OP(MC_SET_NEG_GUIDERATE,6):
-        data[4] = MC_SET_POS_GUIDERATE;
-        rewritten = true;
-        break;
-      case OP(MC_SET_POS_BACKLASH,4):
-        data[4] = MC_SET_NEG_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_SET_NEG_BACKLASH,4):
-        data[4] = MC_SET_POS_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_MOVE_NEG,4):
-        data[4] = MC_MOVE_POS;
-        rewritten = true;
-        break;
-      case OP(MC_MOVE_POS,4):
-        data[4] = MC_MOVE_NEG;
-        rewritten = true;
-        break;
-      case OP(MC_GET_POS_BACKLASH,3):
-        data[4] = MC_GET_NEG_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_GET_NEG_BACKLASH,3):
-        data[4] = MC_GET_POS_BACKLASH;
-        rewritten = true;
-        break;
-      case OP(MC_SET_APPROACH,4):
-        data[5] = !data[5];
-        rewritten = true;
-        break;
     }
   }
 done:
@@ -6932,6 +7282,9 @@ static void esp32_handle_response (struct bus_s *bus, byte *data)
 #if NCHUCK_ENABLED
     nchuck_handle_fm_response(data);
 #endif
+  } else if (src == DEV_EVWIFI) {
+    if (data[1] == 3 && data[4] == SET_EVO_WIFI)
+      evo_wifi_change_pending = 0;
   }
 }
 
@@ -6956,6 +7309,10 @@ static inline struct pkt_s *bus_get_next_txq_entry (struct bus_s *bus)
       esp32_handle_response(bus, pdata);
       goto discard_txq_entry;
     }
+#if EMULATE_MOUNT
+    if (EMULATING_MOUNT && mount_handle_request(p->from_rxbuf, pdata))
+      goto discard_txq_entry;
+#endif
 #if EMULATE_GPS
     if (dst == DEV_GPS && gps_detected && !gps_disabled) {
       gps_handle_request(p->from_rxbuf, pdata);
@@ -7131,7 +7488,7 @@ static char *nvram_vars[] = {
   (char *)"focus.backlash.neg",
   (char *)"focus.microsteps",
   (char *)"nchuck.reverse.alt",
-  (char *)"mount.reversed.alt",
+  (char *) RESERVED,    // was mount.reversed.alt
   (char *)"emulate.ssaa",
   (char *)"emulate.ssag",
   (char *)"dew0.amps",
@@ -7158,6 +7515,7 @@ static char *nvram_vars[] = {
   (char *)"ssag.discard.mc.acks",
   (char *)"dew.force.enabled",
   (char *)"oled.timeout.secs",
+  (char *)"emulate.mount",
   NULL
 };
 
@@ -7178,7 +7536,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // focus.backlash.neg
   "",               // focus.microsteps
   "",               // nchuck.reverse_alt
-  "",               // mount.reversed.alt
+  "",               // RESERVED   was mount.reversed.alt
   "",               // emulate.ssaa
   "",               // emulate.ssag
   "",               // dew0.amps
@@ -7205,6 +7563,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // ssag.discard.mc.acks
   "",               // dew.force.enabled
   "",               // oled.timeout.secs
+  "",               // emulate.mount
   ""                // NULL
 };
 
@@ -7447,6 +7806,11 @@ static void nvram_restore (void)
     min = max = 0;
   focus_set_calibration(min, max);
 #endif /* EMULATE_FOCUS */
+#if EMULATE_MOUNT
+  emulate_mount = nvram_get_bool("emulate.mount");
+  if (emulate_mount)
+    SERIAL_PRINTF("emulate.mount=%u\r\n", emulate_mount);
+#endif
 #if EMULATE_SSAA
   emulate_ssaa = nvram_get_bool("emulate.ssaa");
   if (emulate_ssaa)
@@ -7504,8 +7868,7 @@ static void nvram_restore (void)
   nvram_get_nonblank_val("ota.version.path",  ota_version_path);
 #endif
   ssag_discard_mc_acks = nvram_get_bool("ssag.discard.mc.acks");
-  mount_reversed_alt = nvram_get_bool("mount.reversed.alt");
-  // SkyPortal app looks for these UDP broadcasts. "AMW007" seems to be the critical bit.
+  // The apps look for these UDP broadcasts. "AMW007" is the only critical bit.
   // Insert our MAC address and ADAPTER_VERSION string into the advertisement broadcast string:
   sprintf(advertisement, "{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\n\"version\":\"" ADAPTER_VERSION "%s\"\n}",
     wifi_mac_addr[0], wifi_mac_addr[1], wifi_mac_addr[2], wifi_mac_addr[3], wifi_mac_addr[4], wifi_mac_addr[5], hbg3_version);
@@ -7976,6 +8339,7 @@ static const char help_serial_commands[] =
   "g                 -- Toggle GPS debug on/off\r\n"
   "G                 -- Toggle display of GPS NMEA sentences on/off\r\n"
 #endif
+  "i                 -- Toggle ignoring of MC_GET_POS packets from traces\r\n"
 #if OLED_ENABLED
   "oled              -- Dump contents of the various OLED screens\r\n"
 #endif
@@ -8136,11 +8500,12 @@ static void handle_send_cmd (char *cmd)
 static int p3000_orig_verbose    = -1;
 static int p3000_orig_trace_dev1 = -1;
 static int p3000_orig_trace_dev2 = -1;
- 
+
 static bool handle_serial_commands (char *cmd)
 {
   static const char ssaa_recentre[] = "ssaa_recentre ";
   byte b = *cmd;
+  auxtest_remaining = 0;  // cancel the automatic tests
   if (b == ';' || b == '#') {
     auxbus_raw_timeout = auxbus_raw_count = 0;
   } else if (match_word("cls", &cmd, true)) {
@@ -8160,7 +8525,6 @@ static bool handle_serial_commands (char *cmd)
     for (byte i = 0; i < N_DEVNAMES; ++i)
       SERIAL_PRINTF("0x%02x  %-6s   %s\r\n", devnames[i].dev, devnames[i].name, devnames[i].desc);
   } else if (match_word("test_auxbus", &cmd, true)) {
-    auxtest_remaining = 0;  // cancel the automatic tests
     bus_test(&auxbus);
     if (auxrelay.txq)
       bus_test(&auxrelay);
@@ -8245,6 +8609,9 @@ static bool handle_serial_commands (char *cmd)
     GPS_debug = !GPS_debug;
     SERIAL_PRINTF("GPS_debug(NMEA)=%s\r\n", GPS_debug ? "on" : "off");
 #endif /* EMULATE_GPS */
+  } else if (b == 'i') {
+    ignore_mc_get_pos = !ignore_mc_get_pos;
+    SERIAL_PRINTF("ignore_mc_get_pos=%u\r\n", ignore_mc_get_pos);
   } else if (b == 'm') {
     musb_debug = !musb_debug;
     SERIAL_PRINTF("musb_debug=%u\r\n", musb_debug);
@@ -8259,10 +8626,8 @@ static bool handle_serial_commands (char *cmd)
 #endif
   } else if (b == 'P') {
     auxbus_passive_mode = !auxbus_passive_mode;
-    auxtest_remaining = 0;
     SERIAL_PRINTF("auxbus_passive_mode=%u\r\n", auxbus_passive_mode);
   } else if (b == 'r') {
-    auxtest_remaining = 0;  // cancel the automatic tests
     auxbus_raw_tracing = !auxbus_raw_tracing;
     auxbus_raw_break();
     SERIAL_PRINTF("raw_tracing=%u\r\n", auxbus_raw_tracing);
@@ -8275,7 +8640,6 @@ static bool handle_serial_commands (char *cmd)
 #endif
   } else if (b == 't') {
     SERIAL_PRINTLN("Sending auxtest");
-    auxtest_remaining = 0;  // cancel the automatic tests
     auxtest_send_msg();
   } else if (b == 'b') {
     bt_debug = !bt_debug;
@@ -8535,6 +8899,7 @@ static char help_p3000_commands[] =
 static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
 {
   static bool wlan_ssid_passkey_updated = false;
+  auxtest_remaining = 0;  // cancel the automatic tests
   if (!p3000_debug && writep != SERIAL_WRITE)
     SERIAL_PRINTF("p3000: %s\r\n", cmd);
   if (!*cmd) {
@@ -8679,7 +9044,7 @@ static inline void wifi_got_disconnected (bool *connected, const char *name)
 {
   *connected = false;
   p2000_timeout = P2000_NORMAL_TIMEOUT;
-  init_rxbuf(&w2000_rxbuf, "w2000_rx");
+  init_rxbuf(&w2000_rxbuf, "w2000");
   SERIAL_PRINTF("%09lu %s Disconnected\r\n", millis(), name);
 }
 
@@ -8738,7 +9103,7 @@ static void poll_for_new_w2000_connection (void)
     w2000 = W2000.available();
   if (w2000.connected()) {
     p2000_timeout = P2000_NORMAL_TIMEOUT;
-    init_rxbuf(&w2000_rxbuf, "w2000_rx");
+    init_rxbuf(&w2000_rxbuf, "w2000");
     /* Enable KEEPALIVE messages */
     int flags = 1;
     w2000.setSocketOption(SO_KEEPALIVE, (char *)&flags, sizeof(flags));  // boolean, turns on keepalives
@@ -8748,18 +9113,9 @@ static void poll_for_new_w2000_connection (void)
   } else if (bt_connected) {
     next_bcast = next_msg = 0;
   } else {
-    // SkyPortal app looks for these advertisement broadcasts:
+    // The apps look for these advertisement broadcasts:
     if (!next_bcast || time_after(millis(), next_bcast)) {
       next_bcast = get_timeout(1000);
-      if (0) {  // This message is annoying and no longer needed.
-        if (!verbose) {
-          next_msg = 0;
-        } else if (!next_msg || time_after(millis(), next_msg)) {
-          next_msg = get_timeout(10 * 1000);  // Print message once every 10-seconds
-          if (!auxbus_raw_tracing)
-            SERIAL_PRINTLN("UDP Broadcast");
-        }
-      }
       static AsyncUDP udp_bcast;
       udp_bcast.broadcastTo((uint8_t *)advertisement, strlen(advertisement), (uint16_t)55555);
     }
@@ -8777,7 +9133,10 @@ static void w2000_loop (void)
   } else {
     if (w2000.available()) {
       do {
-        (void)packet_decoder(&w2000_rxbuf, w2000.read());
+        byte b = w2000.read();
+        if (auxbus_raw_tracing && !aux_only_tracing)
+          SERIAL_PRINTF("w2: %02x\r\n", b);
+        (void)packet_decoder(&w2000_rxbuf, b);
       } while (w2000.available());
       w2000_timeout = 0;
     } else if (!w2000_timeout) {
@@ -8832,6 +9191,12 @@ static void non_wifi_loop (void)
   if (auxrelay_detected)
     bus_loop(&auxrelay);
   musb_loop();
+#if EMULATE_MOUNT
+  if (EMULATING_MOUNT) {
+    mc_loop(&mc_azm);
+    mc_loop(&mc_alt);
+  }
+#endif
 #if EMULATE_GPS
   gps_loop();
 #endif /* EMULATE_GPS */
@@ -8896,7 +9261,7 @@ void setup (void)
 
   Wire.begin();            // Prepare the I2C bus for use.  Needed early for OLED and AIO, then for FRAM and NCHUCK.
   Wire.setTimeOut(500);    // This supposedly helps mitigate I2C vs. WiFi issues
-#if OLED_ENABLED 
+#if OLED_ENABLED
   oled_setup();
 #endif
   fram_setup();
@@ -8921,7 +9286,7 @@ void setup (void)
       SerialDebug = hwserial0;
       musb_uart   = &hwserial1;
     }
-    init_rxbuf(&musb_rxbuf, "musb_rx");
+    init_rxbuf(&musb_rxbuf, "musb");
     musb_uart->begin(19200, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN);
     musb_uart->setDebugOutput(false);  // Try and prevent ESP32 system debug messages after boot
     musb_uart->flush(false);
@@ -8942,10 +9307,10 @@ void setup (void)
   nvram_restore();                      // Also calls oled_setup() again if non-default oled_type
   set_blue_led(LED_OFF);
 
-  SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u REVERSED=%u ETH=%s\r\n",
+  SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u ETH=%s\r\n",
          hbg3_version, auxrelay_detected, EMULATE_GPS, BLOCK_CFM_CONNECTIONS,
-         NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, mount_reversed_alt, ETH_TYPE);
-  init_rxbuf(&w2000_rxbuf, "w2000_rx");
+         NCHUCK_ENABLED, EMULATE_FOCUS, OLED_ENABLED, EMULATE_DEW, fram_detected, ETH_TYPE);
+  init_rxbuf(&w2000_rxbuf, "w2000");
   memset(spaces, ' ', sizeof(spaces) - 1);
 #if EMULATE_GPS
   gps_using_swserial = musb_selected || auxrelay_detected;
@@ -8985,6 +9350,10 @@ void setup (void)
     esp32_wifi_off = false;
     set_esp32_wifi_off(true);
   }
+#if EMULATE_MOUNT
+  if (EMULATING_MOUNT)
+    mc_init();
+#endif  /* EMULATE_MOUNT */
 #if NCHUCK_ENABLED
   if (simple_mode) {
     auxtest_remaining = 0;
