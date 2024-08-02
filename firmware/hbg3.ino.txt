@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.52"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-07-27"
+#define VERSION "v8.53"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-07-30"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,12 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.53 2024-07-30
+ *  -- emulate.mount: work around CPWI cordwrap bugs.
+ *  -- Implement responses for MC_[GS]ET_AUTOGUIDE_RATE when using mount.override.
+ *  -- Add nchuck.slew.speeds variable. Eg. "set nchuck.slew.speeds 4,4,5,5,6,4,5,6,7,9"  (five slow, and five fast speeds).
+ *  -- Add mount-id for the Origin.
+ *  -- Add new mount.override variable to change reported mount ID for GET_MODEL.
  * Version 8.52 2024-07-27
  *  -- Nuke mount.reversed.alt --> free up the space, and nobody uses it.
  *  -- Cancel auxtests on receipt of any serial/p3000 command.
@@ -76,12 +82,6 @@
  * Version 8.45 2024-05-02
  *  -- Add ADS1115 ADC support for thermistors. Wire ADC A0 to 3.3V, A1 to Thm0, A2 to Thm1. ADC A3 is not-used.
  *  -- Incorporate a default ADC_LUT[] table.
- * Version 8.44 2024-05-02
- *  -- Add SSSWI_HACKING: intercept Challenge/Response and feed our own data to SSHC.
- * Version 8.43 2024-04-03
- *  -- New boolean var to reverse ALT direction of Nunchuck:  nchuck.reverse.alt
- * Version 8.42 2024-04-02
- *  -- Never turn off GPS; instead let it run and update it's almanac etc..
  *
  * Random note:
  *   For Camera shutter release triggering via RTS:
@@ -276,6 +276,7 @@ static int         nvram_get_int    (const char *name);
 static void        nvram_save_int   (const char *name, int val);
 static void        nvram_erase_val  (const char *name);
 
+static uint16_t    mount_override = 0;  // For overriding result of GET_MODEL
 #if EMULATE_SSAA
 static bool emulate_ssaa    = false;
 static byte *ssaa_image_pkt = NULL;   // allocated on each use
@@ -897,6 +898,7 @@ static const char *get_model_decoder (byte *data)
       case 0x1283: desc = "GT-Series";         break;
       case 0x1485: desc = "AVX";               break;
       case 0x1788: desc = "CGX";               break;
+      case 0x1d8a: desc = "Origin";            break;
       case EVOLUTION_MODEL: desc = "Evolution";break;
       default: {
         switch (model >> 8) {
@@ -2729,8 +2731,8 @@ static byte mount_dev_handle_request (const char *devname, byte *data, byte len,
       reply[len++] = 98;
       break;
     case OP(DEV_GET_MODEL,3):
-      reply[len++] = EVOLUTION_MODEL >> 8;
-      reply[len++] = EVOLUTION_MODEL & 0xff;
+      reply[len++] = mount_model >> 8;
+      reply[len++] = mount_model & 0xff;
       break;
     default:
       if (!auxbus_raw_tracing)
@@ -2849,6 +2851,7 @@ static struct mc_s {
   int32_t  cordwrap_pos;
   int32_t  cordwrap_enabled;
   int8_t   move_speed;
+  byte     autoguide_rate;
   byte     program_mode;  // 1==old_style; 2==new_style(Evolution)
   char     devname[4];
   long     nexttime;
@@ -2860,27 +2863,8 @@ static void mc_init (void)
   memset(&mc_alt, 0, sizeof(mc_alt));
   strcpy(mc_azm.devname, "azm");
   strcpy(mc_alt.devname, "alt");
+  mount_model = mount_override ? mount_override : EVOLUTION_MODEL;
 }
-
-#if 0 //FIXME nuke?
-static int32_t mc_move (int32_t pos, int32_t amount)
-{
-  // To-Do: impose slew limits 0..180 for mc_alt motor?
-  if (!amount)
-    return pos;
-  int incr = 1;
-  if (amount < 0) {
-    incr = -1;
-    amount = -amount;
-  }
-  while (amount--) {   // To-Do: not very efficient, be smarter?
-    pos += incr;
-    if (pos == 0x00ffffff)
-      pos = 0;
-  }
-  return pos;
-}
-#endif
 
 static void mc_loop (struct mc_s *mc)
 {
@@ -2888,14 +2872,10 @@ static void mc_loop (struct mc_s *mc)
     return;
   mc->nexttime = 0;
   if (mc->move_speed) {
-#if 0  //FIXME
-    mc->pos = mc_move(mc->pos, mc->move_speed * 600);
-#else
     mc->pos = mc->pos + mc->move_speed * 500;
-#endif
     mc->nexttime = get_timeout(25);
   } else if (mc->slew_rate) {
-    //FIXME: use shortest path, eg. the short way from +179 to -179 degrees?
+    //To-Do: use shortest path, eg. the short way from +179 to -179 degrees?
     if (mc->pos > mc->slew_target) {
       mc->pos -= mc->slew_rate;
       if (mc->pos < mc->slew_target)
@@ -3018,21 +2998,33 @@ static void mc_handle_request (struct rxbuf_s *rxbuf, byte *data, struct mc_s *m
     case OP(MC_SET_POS_GUIDERATE,6):
     case OP(MC_SET_NEG_GUIDERATE,5):
     case OP(MC_SET_NEG_GUIDERATE,6):
+      break;
+
+    // CPWI mistakenly sends some cordwrap commands to ALT instead of AZM, so force mc_azm settings here:
     case OP(MC_DISABLE_CORDWRAP,3):
-      mc->cordwrap_enabled = false;
+      mc_azm.cordwrap_enabled = false;
       break;
     case OP(MC_ENABLE_CORDWRAP,3):
-      mc->cordwrap_enabled = true;
+      mc_azm.cordwrap_enabled = true;
       break;
     case OP(MC_SET_CORDWRAP_POS,6):
-      mc->cordwrap_pos = get_24bit_int(data + 5);
+      mc_azm.cordwrap_pos = get_24bit_int(data + 5);
       break;
     case OP(MC_GET_CORDWRAP_POS,3):
-      len += put_24bit_value(mc->cordwrap_pos, reply + len);
+      len += put_24bit_value(mc_azm.cordwrap_pos, reply + len);
       break;
     case OP(MC_POLL_CORDWRAP,3):
-      reply[len++] = mc->cordwrap_enabled ? 0xff : 0x00;  //FIXME? test
+      reply[len++] = mc_azm.cordwrap_enabled ? 0xff : 0x00;
       break;
+
+    // The Evolution doesn't have an autoguide port, but emulate one anyway in case mount.override is in-use:
+    case OP(MC_SET_AUTOGUIDE_RATE,4):
+      mc->autoguide_rate = data[5];
+      break;
+    case OP(MC_GET_AUTOGUIDE_RATE,3):
+      reply[len++] = mc->autoguide_rate;
+      break;
+
     case OP(MC_GET_POS_BACKLASH,3):
     case OP(MC_GET_NEG_BACKLASH,3):
     case OP(MC_GET_APPROACH,3):
@@ -4303,11 +4295,34 @@ void send_mc_msg (byte dev, byte cmd, byte speed)
 }
 
 static bool nchuck_reverse_alt = false;
+static byte nchuck_slew_speeds[10] = {4,4,5,5,6, 4,5,6,7,9};
+
+static void nchuck_get_slew_speeds (void)
+{
+  const char *nspeeds = nvram_get_val("nchuck.slew.speeds"), *s = nspeeds;
+  if (!s || !*s)
+    return;
+  byte speeds[10];
+  for (byte i = 0; i < sizeof(speeds); ++i) {
+    while (*s == ' ') ++s;
+    char c = *s++;
+    if (c < '1' || c > '9')
+      goto failed;
+    speeds[i] = c - '0';
+    while (*s == ' ') ++s;
+    c = *s++;
+    if (c != ',' && i != (sizeof(speeds) - 1))
+      goto failed;
+  }
+  memcpy(nchuck_slew_speeds, speeds, sizeof(speeds)); 
+  SERIAL_PRINTF("%s: loaded custom speeds: %s\r\n", __func__, nspeeds);
+  return;
+failed:
+    SERIAL_PRINTF("%s: expected 10 single digits with commas: %s\r\n", __func__, nspeeds);
+}
 
 static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
 {
-  static const uint8_t slew_speeds_slow [5] = {4, 4, 5, 5, 6};  // must be in range 1..9; 0 is STOP
-  static const uint8_t slew_speeds_fast [5] = {4, 5, 6, 7, 9};  // must be in range 1..9; 0 is STOP
   bool reversed = (dev == DEV_ALT) && nchuck_reverse_alt;
   uint8_t cmd = reversed ? MC_MOVE_NEG : MC_MOVE_POS;
 
@@ -4318,7 +4333,7 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
     }
     speed--;  // make into array index from 0..N
     if (dev != DEV_FOCUS) {
-      speed = fast_range ? slew_speeds_fast[speed]  : slew_speeds_slow[speed];
+      speed = nchuck_slew_speeds[speed + (fast_range ? 5 : 0)];
 #if EMULATE_FOCUS
     } else if (stepper_driver != STEPPER_DRIVER_NONE) {
       // HomeBrew Focus Motor uses the full speed range 1..9.
@@ -7016,25 +7031,51 @@ static uint16_t hack_response_pkt (byte *data, uint16_t len)
   byte src = data[2], dst = data[3], op = data[4];
   uint16_t op_len = OP(op,data[1]);
 
-  if (op == DEV_GET_MODEL && (src == DEV_AZM || src == DEV_ALT)) {
-    if (data[1] == 3) { // older firmware on Nexstar-GPS returns no data.
-      data[1] += 1;
-      data[5] = 0x01;
-      len += 1;
-      rewritten = true;
+  if (src == DEV_AZM || src == DEV_ALT) {
+    if (mount_override && op_len == OP(DEV_BAD_OP,4)) {
+      if (data[5] == MC_GET_AUTOGUIDE_RATE) {
+        data[4] = data[5];
+        data[5] = 0;  // autoguide_rate
+        rewritten = true;
+        goto done;
+      }
+      if (data[5] == MC_SET_AUTOGUIDE_RATE) {
+        data[4] = data[5];
+        data[1] -= 1;
+        len -= 1;
+        rewritten = true;
+        goto done;
+      }
     }
-    if (data[1] == 4) {
-      // 1-byte response from newer Nexstar-GPS firmware: {0x3b,0x04,0x10,0x20,0x05,0x01,0xc6}:
-      // Latest CPWI is happy with it now, but older versions were not.
-      // And SkyPortal/SkySafari still expect a 2-byte response.
-      data[1] += 1;
-      data[6] = 0x00;  // append one extra byte to convert 1-byte model to 2-byte model.
-      len += 1;
-      rewritten = true;
+    if (op == DEV_GET_MODEL) {
+      if (data[1] == 3) { // older firmware on Nexstar-GPS returns no data.
+        data[1] += 1;
+        data[5] = 0x01;
+        len += 1;
+        rewritten = true;
+      }
+      if (data[1] == 4) {
+        // 1-byte response from newer Nexstar-GPS firmware: {0x3b,0x04,0x10,0x20,0x05,0x01,0xc6}:
+        // Latest CPWI is happy with it now, but older versions were not.
+        // And SkyPortal/SkySafari still expect a 2-byte response.
+        data[1] += 1;
+        data[6] = 0x00;  // append one extra byte to convert 1-byte model to 2-byte model.
+        len += 1;
+        rewritten = true;
+      }
+      if (data[1] == 5) {
+        if (mount_override) {
+          mount_model = mount_override;
+          data[5] = mount_model >> 8;
+          data[6] = mount_model & 0xff;
+          rewritten = true;
+        } else {
+          // Save mount_model for other uses.  Eg. Evo Wifi on/off.
+          mount_model = (((uint16_t)data[5]) << 8) | data[6];
+        }
+      }
+      goto done;
     }
-    if (data[1] == 5)  // Save mount_model for other uses.  Eg. Evo Wifi on/off.
-      mount_model = (((uint16_t)data[5]) << 8) | data[6];
-    goto done;
   }
   // StarSense-For-Skywatcher box replies from DEV_SSSWI instead of DEV_AZM: 3b 07 b8 0e fe 01 00 17 90 8d
   if (src == DEV_SSSWI && dst == DEV_SW && op_len == OP(DEV_GET_VERSION,3)) {
@@ -7503,7 +7544,7 @@ static char *nvram_vars[] = {
   (char *)"gps.location.lng",
   (char *)"dew0.manual.pwm",
   (char *)"dew1.manual.pwm",
-  (char *) RESERVED,     // was gps.idle.timeout
+  (char *)"nchuck.slew.speeds",
   (char *)"oled.type",
   (char *)"ota.version.path",
   (char *)"auxbus.stopbits",
@@ -7516,6 +7557,7 @@ static char *nvram_vars[] = {
   (char *)"dew.force.enabled",
   (char *)"oled.timeout.secs",
   (char *)"emulate.mount",
+  (char *)"mount.override",
   NULL
 };
 
@@ -7551,7 +7593,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // rgps.location.lng
   "",               // dew0.manual.pwm
   "",               // dew1.manual.pwm
-  "",               // RESERVED   was gps.idle.timeout
+  "",               // nchuck.slew.speeds
   "",               // oled.type
   "",               // ota.version.path
   "",               // auxbus.stopbits
@@ -7564,6 +7606,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // dew.force.enabled
   "",               // oled.timeout.secs
   "",               // emulate.mount
+  "",               // mount.override
   ""                // NULL
 };
 
@@ -7823,8 +7866,13 @@ static void nvram_restore (void)
 #endif
 #if NCHUCK_ENABLED
   nchuck_reverse_alt = nvram_get_bool("nchuck.reverse.alt");
+  nchuck_get_slew_speeds();  // "nchuck.slew.speeds"
 #endif
-
+  int mo = nvram_get_int("mount.override");
+  if (mo > 0) {
+    mount_override = mo;
+    SERIAL_PRINTF("mount.override: 0x%04x\r\n", mount_override);
+  }
 #if EMULATE_GPS
   gps_disabled = nvram_get_bool("gps.disable");
   if (gps_disabled)
@@ -7875,7 +7923,7 @@ static void nvram_restore (void)
   if (verbose)
     SERIAL_PRINTF("UDP advertisement=%s\r\n", advertisement);
 }
-
+    
 static void nvram_save (void)
 {
   if (!nvram_initialized)
