@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.53"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-07-30"
+#define VERSION "v8.54"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-08-01"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,9 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.54 2024-08-01
+ *  -- emulate.mount: add commands needed for simulating CGE-Pro and other mounts.
+ *  -- Get rid of workarounds for CPWI cordwrap: CPWI-2.5.6 sends cordwrap commands to both MCs on purpose.
  * Version 8.53 2024-07-30
  *  -- emulate.mount: work around CPWI cordwrap bugs.
  *  -- Implement responses for MC_[GS]ET_AUTOGUIDE_RATE when using mount.override.
@@ -538,7 +541,7 @@ struct auxdev_op_s {
 #define MC_EEPROM_READ                 0x30
 #define MC_EEPROM_WRITE                0x31
 #define MC_PROGRAM_READ                0x32  // wrong name?
-#define MC_ENABLE_CORDWRAP             0x38
+#define MC_ENABLE_CORDWRAP             0x38  // CPWI uses CORDWRAP to also set slew limits for DEV_ALT
 #define MC_DISABLE_CORDWRAP            0x39
 #define MC_SET_CORDWRAP_POS            0x3a
 #define MC_POLL_CORDWRAP               0x3b  // Ugh. Dumb. Should never have an opcode matching the 0x3b sync byte!!
@@ -903,7 +906,7 @@ static const char *get_model_decoder (byte *data)
       default: {
         switch (model >> 8) {
           case 0x05: desc = "CGE";             break;
-          case 0x06: desc = "Advanced-GT";     break;
+          case 0x06: desc = "ASGT/CG-5";       break;  // Aka. Advanced-GT, ASGT, CG-5, CG-5GT, or CG5
           case 0x09: desc = "CPC";             break;
           case 0x0a: desc = "GT";              break;
           case 0x0d: desc = "CGE-Pro";         break;
@@ -1006,18 +1009,17 @@ static const char *op_decoder (byte *data)
       return get_model_decoder(data);
     return "GET_MODEL";
   }
-  if (op == MC_GET_POS && (src == DEV_AZM || src == DEV_ALT)) {
-    SERIAL_PRINT(" MC_GET_POS ");
-    print_24bits(data + 5);
-    return NULL;
-  }
-  if (src == DEV_AZM) {
+  if (src == DEV_AZM || src == DEV_ALT) {
+    if (op == MC_GET_POS) {
+      SERIAL_PRINT(" MC_GET_POS ");
+      print_24bits(data + 5);
+      return NULL;
+    }
     if (op == MC_GET_CORDWRAP_POS) {
       SERIAL_PRINT(" MC_GET_CORDWRAP_POS ");
       print_24bits(data + 5);
       return NULL;
     }
-  } else if (dst == DEV_AZM) {
     if (op == MC_SET_CORDWRAP_POS) {
       SERIAL_PRINT(" MC_SET_CORDWRAP_POS ");
       print_24bits(data + 5);
@@ -2993,28 +2995,27 @@ static void mc_handle_request (struct rxbuf_s *rxbuf, byte *data, struct mc_s *m
     case OP(MC_SET_POS_BACKLASH,4):
     case OP(MC_SET_NEG_BACKLASH,4):
     case OP(MC_SET_APPROACH,4):
+    case OP(MC_SET_CUSTOM_RATE9,5):
     case OP(MC_SET_CUSTOM_RATE9_ENA,4):
     case OP(MC_SET_POS_GUIDERATE,5):
     case OP(MC_SET_POS_GUIDERATE,6):
     case OP(MC_SET_NEG_GUIDERATE,5):
     case OP(MC_SET_NEG_GUIDERATE,6):
       break;
-
-    // CPWI mistakenly sends some cordwrap commands to ALT instead of AZM, so force mc_azm settings here:
     case OP(MC_DISABLE_CORDWRAP,3):
-      mc_azm.cordwrap_enabled = false;
+      mc->cordwrap_enabled = false;
       break;
     case OP(MC_ENABLE_CORDWRAP,3):
-      mc_azm.cordwrap_enabled = true;
+      mc->cordwrap_enabled = true;
       break;
     case OP(MC_SET_CORDWRAP_POS,6):
-      mc_azm.cordwrap_pos = get_24bit_int(data + 5);
+      mc->cordwrap_pos = get_24bit_int(data + 5);
       break;
     case OP(MC_GET_CORDWRAP_POS,3):
-      len += put_24bit_value(mc_azm.cordwrap_pos, reply + len);
+      len += put_24bit_value(mc->cordwrap_pos, reply + len);
       break;
     case OP(MC_POLL_CORDWRAP,3):
-      reply[len++] = mc_azm.cordwrap_enabled ? 0xff : 0x00;
+      reply[len++] = mc->cordwrap_enabled ? 0xff : 0x00;
       break;
 
     // The Evolution doesn't have an autoguide port, but emulate one anyway in case mount.override is in-use:
@@ -3044,6 +3045,26 @@ static void mc_handle_request (struct rxbuf_s *rxbuf, byte *data, struct mc_s *m
     case OP(DEV_PROGRAM_ENA,3):
       mc->program_mode = 2;
       break;
+
+    // These were added for the CGE-Pro:
+    case OP(MC_IS_USER_LIMIT_ENA,3):
+      reply[len++] = 0;
+      break;
+    case OP(MC_GET_USER_LIMIT_MIN,3):
+    case OP(MC_GET_USER_LIMIT_MAX,3):
+      reply[len++] = 0;
+      reply[len++] = 0;
+      break;
+    case OP(MC_PEC_PEC_PLAYBACK,4):
+    case OP(MC_SET_USER_LIMIT_ENA,4):
+    case OP(MC_SET_USER_LIMIT_MIN,5):
+    case OP(MC_SET_USER_LIMIT_MAX,5):
+    case OP(MC_LEVEL_START,3):
+      break;
+    case OP(MC_LEVEL_DONE,3):
+      reply[len++] = 0xff;
+      break;
+
     default:
       len = mount_dev_handle_request(mc->devname, data, len, reply);
   }
@@ -7021,7 +7042,6 @@ static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte
 }
 
 static byte cordwrap_original_op    = 0;
-static byte cordwrap_original_dev   = 0;
 static long evo_wifi_change_pending = 0;
 
 /* Try and achieve compatibility with older mounts such as the Nexstar GPS NXGPS */
@@ -7083,28 +7103,6 @@ static uint16_t hack_response_pkt (byte *data, uint16_t len)
     rewritten = true;
     goto done;
   }
-  // Handle cordwrap_overrides for CPWI etc.
-  if (src == DEV_AZM) {
-    if (cordwrap_original_dev) {
-      switch (op) {   // Cannot use op_len, as response len varies by mount model!!  Eg. CPC vs Evo.
-        case MC_ENABLE_CORDWRAP:
-        case MC_DISABLE_CORDWRAP:
-        case MC_SET_CORDWRAP_POS:
-        case MC_POLL_CORDWRAP:
-        case MC_GET_CORDWRAP_POS:
-          data[2] = src = cordwrap_original_dev;
-          rewritten = true;
-      }
-      cordwrap_original_dev = 0;
-    }
-    if (cordwrap_original_op) {
-      if (op == MC_DISABLE_CORDWRAP || op == MC_ENABLE_CORDWRAP) {
-        data[4] = cordwrap_original_op;
-        rewritten = true;
-      }
-      cordwrap_original_op = 0;
-    }
-  }
 done:
   if (rewritten) {
     update_checksum(data);
@@ -7121,20 +7119,6 @@ static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
   byte dst = data[3], op = data[4];
   uint16_t op_len = OP(op,data[1]);
 
-  // CPWI bug: sends some cordwrap commands to wrong MC:
-  if (dst == DEV_ALT) {
-    switch (op_len) {
-      case OP(MC_ENABLE_CORDWRAP,3):
-      case OP(MC_DISABLE_CORDWRAP,3):
-      case OP(MC_SET_CORDWRAP_POS,6):
-      case OP(MC_POLL_CORDWRAP,3):
-      case OP(MC_POLL_CORDWRAP,4):
-      case OP(MC_GET_CORDWRAP_POS,3):
-        cordwrap_original_dev = dst;
-        data[3] = dst = DEV_AZM;
-        rewritten = true;
-    }
-  }
   if (op_len == OP(MC_GOTO_DONE,4)) {  // CPWI bug: includes an extra (0x01) byte in MC_GOTO_DONE for focuser at least.
     if (dst == DEV_AZM || dst == DEV_ALT || dst == DEV_FOCUS) {
       data[1] = 0x03;
@@ -7142,7 +7126,7 @@ static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
       rewritten = true;
     }
   }
-  if (dst == DEV_AZM) {
+  if (dst == DEV_AZM || dst == DEV_ALT) {
     // CPWI bug: includes an extra (0x01) byte in MC_POLL_CORDWRAP
     if (op_len == OP(MC_POLL_CORDWRAP,4)) {
       data[1] = 0x03;
@@ -7150,7 +7134,7 @@ static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
       rewritten = true;
     }
     // Handle cordwrap_override for CPWI etc.
-    if (cordwrap_override) {
+    if (dst == DEV_AZM && cordwrap_override) {
       // MC_SET_CORDWRAP_POS also enables CORDWRAP..
       if (cordwrap_override == 1 && (op_len == OP(MC_ENABLE_CORDWRAP,3) || op_len == OP(MC_SET_CORDWRAP_POS,6))) {
         cordwrap_original_op = op;
@@ -7197,7 +7181,7 @@ static void forward_from_bus_to_outside (struct rxbuf_s *rxbuf, byte status, byt
       return;  // Message goes no further
 
     // Handle cordwrap_override for local source, eg. hand-controller.
-    if (cordwrap_override && dst == DEV_AZM) {
+    if (dst == DEV_AZM && cordwrap_override) {
       uint16_t op_len = OP(rxbuf->data[4],rxbuf->data[1]);
       if (cordwrap_override == 1 && (op_len == OP(MC_ENABLE_CORDWRAP,3) || op_len == OP(MC_SET_CORDWRAP_POS,6))) {
         SERIAL_PRINTF("%s: forcing cordwrap off\r\n", __func__);
@@ -7887,11 +7871,11 @@ static void nvram_restore (void)
   const char *cw = nvram_get_val("cordwrap.override");
   if (cw) {
     if (*cw == '0')
-      cordwrap_override = 1;  // cordwrap enabled
+      cordwrap_override = 1;  // AZM cordwrap enabled
     else if (*cw == '1')
-      cordwrap_override = 2;  // cordwrap disabled
+      cordwrap_override = 2;  // AZM cordwrap disabled
     else
-      cordwrap_override = 0;  // no cordwrap override
+      cordwrap_override = 0;  // AZM no cordwrap override
   }
 #if EMULATE_DEW
   dew_enabled |= nvram_get_bool("dew.force.enabled");
