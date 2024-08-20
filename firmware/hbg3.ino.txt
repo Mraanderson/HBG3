@@ -9,8 +9,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.54"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-08-01"
+#define VERSION "v8.55"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-08-06"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +36,12 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.55 2024-08-06
+ *  -- Merge the dual-band WiFi/BLE REALTEK_BW16 project.
+ *  -- LOTS of little fixes as a result of the REALTEK_BW16's fussier build-chain.
+ *  -- Nuke "simple_mode" and associated code.
+ *  -- Rename DEV_SCANR to DEV_SCANER (python AUX bus scanner).
+ *  -- Improve decoding/emulation of BATT_GET_VOLTAGE.
  * Version 8.54 2024-08-01
  *  -- emulate.mount: add commands needed for simulating CGE-Pro and other mounts.
  *  -- Get rid of workarounds for CPWI cordwrap: CPWI-2.5.6 sends cordwrap commands to both MCs on purpose.
@@ -103,6 +109,7 @@
 #define EMULATE_DEW               true  // When true and SHT3x is attached, pretend to be a Celestron 2X Smart Dew Heater Controller.
 #define EMULATE_FOCUS             true  // When true and stepper motor is wired, pretend to be a Celestron Focus Motor. PIN conflict with Ethernet.
 #define EMULATE_MOUNT             true  // When true, include code to emulate an Evolution mount.
+#define MUSB_ENABLED              true  // When true, include support for a mount connection over the USB/Serial link.
 #define ETHERNET_ENABLED          true  // When true and eth.h is present, include support for Ethernet. PIN conflict with Stepper/Focus.
 
 #define ORIGINAL_WIFI_PROJECT     false // When true, build firmware for the original WIFI+BT+GPS project, instead of for the HBG3.
@@ -110,14 +117,9 @@
 
 #define SSSWI_HACKING             false
 
+#include "Arduino.h"
+
 #define NVRAM_VALS_MAX_LEN 31
-#if OTA_ENABLED
-static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
-static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
-static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
-static bool ota_partition_size_okay = false;
-static bool ota_ignore_version = false;
-#endif /* OTA_ENABLED */
 
 // PIN definitions for this project:
 
@@ -128,11 +130,11 @@ static bool ota_ignore_version = false;
 
 #define GPS_TX_PIN                33    // was 22; TX-to-GPS pin.   GPS RX Pin (green) connects here.
 #define GPS_RX_PIN                25    // was 23; RX-from-GPS pin. GPS TX pin (white) connects here.
-#define ESP32_WIFI_MODE_PIN       13    // was 5;  Ground for "Access Point" mode; float high for "Direct Connect"
+#define ESP32_WIFI_MODE_PIN       13    // was  5; Ground for "Access Point" mode; float high for "Direct Connect"
 #define MUSB_SELECT_PIN           15    // Ground to use USB port as Mount-USB
 
-#define READ_WIFI_MODE_PIN()      (digitalRead(ESP32_WIFI_MODE_PIN))
-#define READ_MUSB_SELECT_PIN()    (digitalRead(MUSB_SELECT_PIN))
+#define READ_WIFI_MODE_PIN()      (digitalRead(ESP32_WIFI_MODE_PIN) == LOW)
+#define READ_MUSB_SELECT_PIN()    (digitalRead(MUSB_SELECT_PIN)     == LOW)
 
 #define OLED_BUTTON_PIN           4     // For push-button switch to cycle between OLED data screens and OFF.
 #define BLUE_LED_PIN              2     // ESP32 DevKitV1 built-in (blue) LED
@@ -179,28 +181,88 @@ static bool ota_ignore_version = false;
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
-#include <WiFi.h>
-#include <lwip/sockets.h>
-#include <WiFiClient.h>
-#include <WiFiAP.h>
-#include "AsyncUDP.h"
-#include "FS.h"
-#include "SPIFFS.h"
+
+typedef unsigned long long  u64;
+typedef unsigned long       ulong;
+typedef unsigned int        uint;
+
+static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
+
+#ifdef _VARIANT_ARDUINO_AMEBA_
+  #define REALTEK_BW16 true
+  #include "realtek_bw16.h" // first pass of this file defines PINs and options etc.
+#else
+  #define REALTEK_BW16 false
+  #include <WiFi.h>
+  #include <lwip/sockets.h>
+  #include <WiFiClient.h>
+  #include <WiFiAP.h>
+  #include "AsyncUDP.h"
+  #include "FS.h"
+  #include "SPIFFS.h"
+  #include "BluetoothSerial.h"
+
+  typedef HardwareSerial bus_uart_t;
+  static inline void do_system_reset (void) { ESP.restart(); }
+  static void inline udp_do_broadcast (const char *advertisement)
+  {
+    static AsyncUDP udp_bcast;
+    udp_bcast.broadcastTo((uint8_t *)advertisement, strlen(advertisement), (uint16_t)55555);
+  }
+
+    static void inline SET_RED_LED  (unsigned int value) {}  // Nothing on ESP32; actual LED on REALTEK_BW16
+  //static void inline SET_BLUE_LED (unsigned int value) {}  // Nothing on ESP32; actual LED on REALTEK_BW16
+
+  static inline void DUMMY_BEGIN (void) {}
+  static inline void DUMMY_END   (void) {}
+
+  BluetoothSerial                bt;
+  #define LWIP_SET_NONBLOCK(a,b) do {} while (0)
+  #define BT_REINIT()            do {} while (0)
+  #define BT_RESTART()           do {} while (0)
+  #define BT_SEND()              do {} while (0)
+  #define BT_BEGIN               bt.begin
+  #define BT_END                 bt.end
+  #define BT_CONNECTED           bt.connected
+  #define BT_AVAILABLE           bt.available
+  #define BT_READ                bt.read
+  #define BT_WRITE               bt.write
+
+  #define WIFI_GET_BSSID         WiFi.BSSID
+
+  /*
+   * There is no serial "debug" port if (musb_selected && auxrelay_detected).
+   * Too complex to attempt debug over SoftwareSerial for now.
+   * But one can instead use port 3000 and the "debug" command there instead.
+   */
+  HardwareSerial          *hwserial0 = &Serial;
+  HardwareSerial          hwserial1(1);   // MUSB, auxrelay, GPS, or debug (in that order).
+  bus_uart_t              auxbus_uart(2); // auxbus
+  #define auxrelay_uart   hwserial1
+  HardwareSerial         *SerialDebug = NULL; // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
+  HardwareSerial         *musb_uart;      // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
+  #define SerialDebug_printf SerialDebug->printf
+  #define w3000_printf    w3000.printf
+  #define e3000_printf    e3000.printf
+  #define FLUSH_TXONLY true
+
+#endif /* REALTEK_BW16 */
+
+#if OTA_ENABLED
+static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
+static char ota_update_path  [NVRAM_VALS_MAX_LEN + 1] = "/hbg3/firmware.bin";
+static char ota_version_path [NVRAM_VALS_MAX_LEN + 1] = "/cgi-bin/hbg3_version";
+static bool ota_partition_size_okay = false;
+static bool ota_ignore_version = false;
+#endif /* OTA_ENABLED */
+
 #include <Wire.h>
-#include "BluetoothSerial.h"
 
 #define P2000_NORMAL_TIMEOUT        ( 4 * 1000)    // Close port 2000 connection when idle this long.
 #define P2000_SSAA_CAPTURE_TIMEOUT  (20 * 1000)    // Longer timeout needed during SSAA capture operations.
 
 static long p2000_timeout = P2000_NORMAL_TIMEOUT;  // Gets increased to 15-secs if SSAA is used.
 
-static  bool simple_mode = false;  // In "simple_mode", no auxtest, no WiFi, no BT.
-
-typedef unsigned long long  u64;
-typedef unsigned long       ulong;
-typedef unsigned int        uint;
-
-BluetoothSerial        bt;
 enum                   {BT_IDLE, BT_BOOTLOADER, BT_WAITBAUD, BT_SETBAUD, BT_HSDONE};
 static byte            bt_auxstate  = BT_IDLE;  // state machine for CPWI initial handshake.
 static bool            bt_debug     = false;    // For debugging CPWI initial handshake.
@@ -210,26 +272,15 @@ static long            bt_handshake = 0;        // timer for parts of CPWI initi
 static long            bt_active    = 0;        // BT Session has recent activity: an app is connected.
 static long            esp32_reset_pending  = 0; // Timer for resets of the HBG3
 
-/*
- * There is no serial "debug" port if (musb_selected && auxrelay_detected).
- * Too complex to attempt debug over SoftwareSerial for now.
- * But one can instead use port 3000 and the "debug" command there instead.
- */
-HardwareSerial          *hwserial0 = &Serial;
-HardwareSerial          hwserial1(1);   // MUSB, auxrelay, GPS, or debug (in that order).
-HardwareSerial          auxbus_uart(2); // auxbus
-#define auxrelay_uart   hwserial1
-HardwareSerial         *SerialDebug = NULL; // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
-HardwareSerial         *musb_uart;      // Initialized in setup(): one of hwseria0, hwserial1, or NULL.
-
 typedef unsigned long long u64;
 typedef unsigned long ulong;
 typedef unsigned int  uint;
 
 static char hbg3_version[]      = VERSION;
-static bool fm_detected         = false; // Focus Motor detected, either on the HBG3 or on a bus somewhere.
+static bool fm_detected         = false;  // Focus Motor detected, either on the HBG3 or on a bus somewhere.
 static bool auxbus_passive_mode = false;
 static byte auxtest_remaining   = 3;
+static bool auxtest_waiting     = false;  // Awaiting an auxtest response
 static bool verbose             = false;
 static bool ignore_mc_get_pos   = false;  // When true, don't show MC_GET_POS packets for ALT/AZM motor controllers.
 static bool aux_only_tracing    = true;   // By default, don't show packets coming/in out on w2000, bt, or musb.
@@ -239,8 +290,6 @@ static byte auxbus_raw_count    = 0;
 static long auxbus_raw_timeout  = 0;
 static byte auxbus_stopbits     = 2;      // Default was always 8N2, but 8N1 should work fine and is 10% faster.
 static bool nchuck_debug        = false;  // For extra verbose output to help diagnose Nunchuck issues: enable with 'n' on Serial port.
-static bool gps_detected        = false;  // Don't respond as DEV_GPS unless a GPS is detected
-static bool gps_disabled        = false;  // GPS can be prevented from responding via NVRAM setting
 static bool oled_detected       = false;
 static byte cordwrap_override   = 0;
 static bool auxrelay_ssforward  = false;  // When true, AUXRELAY will forward StarSense Camera packets across the relay.
@@ -261,7 +310,7 @@ static long nvram_save_delay = NVRAM_SAVE_DELAY;
 #if ETHERNET_ENABLED  /* do NOT combine this with the #if above!! */
   #ifndef AIO_H
     #define ETHERNET_SS_PIN 5  // AIO has a different SS_PIN for Ethernet.
-    static inline bool read_ethernet_client_mode_switch (void) { return (READ_WIFI_MODE_PIN() == LOW); }
+    static inline bool read_ethernet_client_mode_switch (void) { return READ_WIFI_MODE_PIN(); }
   #endif
   #include "eth.h"
   static bool p3000_debug_ethernet = false; // Selects between ethernet and wifi for p3000_debug destination.
@@ -306,7 +355,6 @@ static bool emulate_ssag = false;
 #ifndef HBG3_NAME
 #define HBG3_NAME                 "HBG3"
 #endif
-static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
 #define DEFAULT_SSID              "HomeBrew-"
 #define ADAPTER_VERSION           DEFAULT_SSID "AMW007-9.0.0.0, " VERSION_DATE "T12:00:00Z, " HBG3_NAME "-"
 // Celestron reports: "ZENTRI-AMW007-1.2.0.10, 2017-07-28T07:43:27Z, ZentriOS-WL-1.2.0.10, Board:N/A");
@@ -324,8 +372,8 @@ static char       current_ssid[32];
 static char       current_ipaddr[32];
 
 #define SERVER_IPADDRESS  1,2,3,4    // For both WiFi and Ethernet
-static const IPAddress server_static_ip(SERVER_IPADDRESS);
-static const IPAddress server_static_netmask(255,255,255,0);
+static const IPAddress server_static_ip      = IPAddress(SERVER_IPADDRESS);
+static const IPAddress server_static_netmask = IPAddress(255,255,255,0);
 
 static bool bt_enabled = false;
 static enum {bt_protocol_aux, bt_protocol_hc} bt_protocol = bt_protocol_aux;  // "bt_mode" conflicts with v3.0.x libraries
@@ -333,7 +381,7 @@ static enum {bt_protocol_aux, bt_protocol_hc} bt_protocol = bt_protocol_aux;  //
 static inline void SERIAL_WRITE     (const char *s) { if    (SerialDebug)  SerialDebug->write(s);        }
 static inline int  SERIAL_AVAILABLE (void)          { return SerialDebug ? SerialDebug->available() : 0; }
 static inline char SERIAL_READ      (void)          { return SerialDebug ? SerialDebug->read()      : 0; }
-static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  SerialDebug->flush(txonly);   }
+static inline void SERIAL_FLUSH     (void)          { if    (SerialDebug)  SerialDebug->flush(FLUSH_TXONLY); }
 
 // Debug messages use these macros, normally sending to debug uart, but possibly instead to the TCP/IP Port-3000 connection:
 #define E3000_ENDLINE() do { e3000.println(); e3000.flush(); } while (0)
@@ -341,17 +389,17 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
 
 #define SERIAL_ENDLINE() do {                                                              \
   if (p3000_debug) {if (p3000_debug_ethernet) E3000_ENDLINE(); else W3000_ENDLINE();} else \
-  if (SerialDebug) {SerialDebug->println(); SERIAL_FLUSH(true);}                           \
+  if (SerialDebug) {SerialDebug->println(); SERIAL_FLUSH();}                               \
 } while (0)
 
 #define SERIAL_PRINTLN(x) do {                                                               \
   if (p3000_debug) {if (p3000_debug_ethernet) e3000.println(x); else w3000.println(x);} else \
-  if (SerialDebug) {SerialDebug->println(x); SERIAL_FLUSH(true);}                            \
+  if (SerialDebug) {SerialDebug->println(x); SERIAL_FLUSH();}                                \
 } while (0)
 
 #define SERIAL_PRINTF(...) do {                                                                                \
-  if (p3000_debug) {if (p3000_debug_ethernet) e3000.printf(__VA_ARGS__); else w3000.printf(__VA_ARGS__);} else \
-  if (SerialDebug) {SerialDebug->printf(__VA_ARGS__); SERIAL_FLUSH(true);}                                     \
+  if (p3000_debug) {if (p3000_debug_ethernet) e3000_printf(__VA_ARGS__); else w3000_printf(__VA_ARGS__);} else \
+  if (SerialDebug) {SerialDebug_printf(__VA_ARGS__); SERIAL_FLUSH();}                                          \
 } while (0)
 
 #define SERIAL_PRINT(x) do {                                                             \
@@ -367,7 +415,9 @@ static inline void SERIAL_FLUSH     (bool txonly)   { if    (SerialDebug)  Seria
   #define pwm_enable(channel)               do {ledcSetup(channel,PWM_FREQUENCY,PWM_RESOLUTION); ledcAttachPin(dew_pwm_pins[channel],channel);} while (0)
   #define pwm_set_duty_cycle(channel,duty)  ledcWrite(channel,duty)
 #endif
+#if !REALTEK_BW16
 #define Serial  Serial_UNDEFINED  // Prevent using "Serial" by accident
+#endif
 
 static long blue_led_timer = 0;
 
@@ -378,12 +428,6 @@ static inline void set_blue_led (int on_off)
 #ifdef AIO_H
   aio_set_leds(on_off);
 #endif /* AIO_H */
-}
-
-static void set_wifi_info (const char *ssid, IPAddress ip)
-{
-  strcpy(current_ssid, ssid);
-  sprintf(current_ipaddr, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
 // Known devices on AUX bus (6 chars or less for nice formatting):
@@ -397,7 +441,7 @@ static void set_wifi_info (const char *ssid, IPAddress ip)
 #define DEV_FOCUS   0x12
 #define DEV_DEW     0x17
 #define DEV_SW      0x20
-#define DEV_SCANR   0x2f  // Python3 AUX Bus Scanner version 0.9.35+
+#define DEV_SCANER  0x2f  // Python3 AUX Bus Scanner version 0.9.35+
 #define DEV_CFM     0x21
 #define DEV_FUTIL   0x22  // Celestron Focuser Utility, or older versions of the Python3 AUX Bus Scanner software.
 #define DEV_RASW    0x30
@@ -452,7 +496,7 @@ static const struct devnames_s {
   AUXDEV(SW,     "CPWI, SkyPortal, SkySafari etc."),
   AUXDEV(CFM,    "Celestron Firmware Manager"),
   AUXDEV(FUTIL,  "Focuser Utility"),
-  AUXDEV(SCANR,  "AUX Bus Scanner"),
+  AUXDEV(SCANER, "AUX Bus Scanner"),
   AUXDEV(RASW,   "CGX RA Switch"),
   AUXDEV(DECSW,  "CGX DEC Switch"),
   AUXDEV(DECAGP, "CGX DEC AutoGuide Pt"),
@@ -843,15 +887,6 @@ static const char *op_lookup (byte op, const struct auxdev_op_s *dev_ops)
   return NULL;
 }
 
-static const char *get_model_uint16 (byte *data, char *dest)
-{
-  if (data[1] == 0x04)
-    sprintf(dest, "0x%02x", data[5]);
-  else if (data[1] == 0x05)
-    sprintf(dest, "0x%04x", (((uint16_t)data[5]) << 8) | data[6]);
-  return dest;
-}
-
 static const char *get_model_decoder (byte *data)
 {
   static const char Model[] = "Model: ";
@@ -924,7 +959,6 @@ static const char *get_model_decoder (byte *data)
       }
     }
   }
-done:
   if (desc)
     strcat(v, desc);
   return ver;
@@ -934,9 +968,9 @@ static const char *get_version_decoder (byte *data)
 {
   static const char Version[] = "Version: ";
   static char ver[32];
+  strcpy(ver, Version);
   char *v = ver + strlen(Version);
   byte len = data[1];
-  strcpy(ver, Version);
   if (len == 0x07)
     sprintf(v, "%u.%u.%u", data[5], data[6], (((uint16_t)data[7]) << 8) | data[8]);
   else if (len == 0x05)
@@ -946,24 +980,24 @@ static const char *get_version_decoder (byte *data)
   return ver;
 }
 
-static uint32_t get_24bit_uint (byte *p)
+static ulong get_24bit_uint (byte *p)
 {
-  uint32_t val     = p[0];
+  ulong val = p[0];
   val = (val << 8) | p[1];
   val = (val << 8) | p[2];
   return val;
 }
 
-static int32_t get_24bit_int (byte *p)
+static long get_24bit_int (byte *p)
 {
-  int32_t val = get_24bit_uint(p);
+  long val = get_24bit_uint(p);
   if (val & 0x00800000)
     val |= 0xff000000;
   return val;
 }
 
 
-static byte put_24bit_value (uint32_t i, byte *data)
+static byte put_24bit_value (ulong i, byte *data)
 {
   data[0] = (i >> 16) & 0xff;
   data[1] = (i >>  8) & 0xff;
@@ -971,7 +1005,7 @@ static byte put_24bit_value (uint32_t i, byte *data)
   return 3;
 }
 
-static inline double degrees_from_int32 (int32_t val)
+static inline double degrees_from_long (long val)
 {
   bool is_neg = (val < 0);
   if (val < 0)
@@ -986,7 +1020,7 @@ static inline double degrees_from_int32 (int32_t val)
 
 static inline double degrees_from_24bits (byte *data)
 {
-  return degrees_from_int32(get_24bit_int(data));
+  return degrees_from_long(get_24bit_int(data));
 }
 
 static void print_24bits (byte *data)
@@ -1048,19 +1082,18 @@ static const char *op_decoder (byte *data)
         default: state1 = "ChargeFault" ; break;
       }
       switch (data[6]) {
-        case 0:  state2 = "VeryLow"     ; break;
-        case 1:  state2 = "Low"         ; break;
-        case 2:  state2 = "Good"        ; break;
-        default: state2 = "Fault"       ; break;
+        case 0:  state2 = "Low"         ; break;
+        case 1:  state2 = "Medium"      ; break;
+        default: state2 = "High"        ; break;
       }
-      SERIAL_PRINTF(" BATT_GET_VOLTAGE %s:%s %u.%02uV", state1, state2, bv / 1000, bv % 1000);
+      SERIAL_PRINTF(" BATT_GET_VOLTAGE %s:%s %lu.%02luV", state1, state2, bv / 1000, bv % 1000);
       return NULL;
     }
   }
   switch (dst) {
     case DEV_FOCUS:
       if (op == MC_GOTO_FAST) {
-        uint32_t pos = get_24bit_uint(data + 5);
+        ulong pos = get_24bit_uint(data + 5);
         if (data[1] == 5)
           pos &= 0x00ffff00;
         SERIAL_PRINTF(" MC_GOTO_FAST %lu", pos);
@@ -1080,19 +1113,19 @@ static const char *op_decoder (byte *data)
         return op_lookup(op, aux_mc_ops);
       return op_lookup(op, aux_ssag_ops);
   }
-  static uint32_t ssswi_last_challenge = 0;
+  static ulong ssswi_last_challenge = 0;
   if (op == SSSWI_GET_CHALLENGE) {
     if (dst == DEV_SSSWI)
       return "GET_CHALLENGE";
     if (src == DEV_SSSWI) {
-      ssswi_last_challenge = *(uint32_t *)(data + 5);
-      SERIAL_PRINTF(" CHALLENGE 0x%08x", ssswi_last_challenge);
+      ssswi_last_challenge = *(ulong *)(data + 5);
+      SERIAL_PRINTF(" CHALLENGE 0x%08lx", ssswi_last_challenge);
       return NULL;
     }
   } else if (op == SSSWI_RESPONSE) {
     if (dst == DEV_SSSWI) {
-      uint32_t response = *(uint32_t *)(data + 5);
-      SERIAL_PRINTF(" RESPONSE  0x%08x", response);
+      ulong response = *(ulong *)(data + 5);
+      SERIAL_PRINTF(" RESPONSE  0x%08lx", response);
       if (0) SERIAL_PRINTF("\r\nCR: 0x%08lx  0x%08lx", ssswi_last_challenge, response);
       return NULL;
     }
@@ -1114,7 +1147,6 @@ static const char *op_decoder (byte *data)
   return NULL;
 }
 
-static bool dew_debug  = false;
 static byte trace_dev1 = 0;
 static byte trace_dev2 = 0;
 #define TRACING_DEV(dev) ((dev) == trace_dev1 || (dev) == trace_dev2)
@@ -1155,7 +1187,7 @@ static struct rxbuf_s {
   byte         csum;         // current accumulated checksum for either 0x3b or 0x3c (Starsense) packets
   uint16_t     discard_len;  // Used to discard echo-back of forwarded StarSense Camera 0x3c packet
   uint16_t     sscount;      // current Starsense total received count
-  uint32_t     sslen32;      // Starsense length field, (8 * 100) max
+  ulong        sslen32;      // Starsense length field, (8 * 100) max
   uint16_t     sslen;        // Starsense expected total bytecount, increased as padding is encountered
   byte         sspadding;    // Starsense current padding count (max 2): exclude from csum
   byte         requestor;    // Used to prevent echoing commands back to originator of the command.
@@ -1198,7 +1230,7 @@ struct pkt_s {
 #define REGULAR_PKT  true
 
 struct txq_s {
-  HardwareSerial  *uart;
+  bus_uart_t      *uart;
   struct pkt_s    pkts[AUXBUS_TXQ_SIZE];
   byte            head;
   byte            tail;
@@ -1232,7 +1264,8 @@ static void txq_free_pkt (struct txq_s *txq, struct pkt_s *p)
 #endif
   if (p->indirect_data) {
     p->indirect_data = false;
-    byte *pdata = *(byte **)p->data;
+    void *pd = p->data;
+    byte *pdata = *(byte **)pd;
     free(pdata);
   }
   p->len = 0;  // discard/free the txq entry
@@ -1241,6 +1274,7 @@ static void txq_free_pkt (struct txq_s *txq, struct pkt_s *p)
 
 static void txq_discard_all (struct txq_s *txq)
 {
+  auxtest_waiting = false;
   while (true) {
     struct pkt_s *p = &txq->pkts[txq->tail];
     if (p->len == 0)
@@ -1249,8 +1283,9 @@ static void txq_discard_all (struct txq_s *txq)
   }
 }
 
-static void txq_init (struct txq_s *txq, const char *devname, HardwareSerial *uart, byte rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
+static void txq_init (struct txq_s *txq, const char *devname, bus_uart_t *uart, byte rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
 {
+  if (0) tx_pin = tx_pin;  // Keep compiler happy
   memset(txq, 0, sizeof(*txq));
   strcpy(txq->name, devname);
   strcat(txq->name, "_tx");
@@ -1307,6 +1342,15 @@ static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
   return detected;
 }
 
+#if !REALTEK_BW16
+static void bus_uart_begin (struct bus_s *bus)
+{
+  bus_uart_t *uart = bus->txq->uart;
+  uart->setRxBufferSize((2 * AUXBUS_PKT_MAX) + AUXBUS_SSAA_PKT_MAX);     // Large enough for SSAA packets, plus some
+  uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, bus->rx_pin, bus->tx_pin);
+}
+#endif /* !REALTEK_BW16 */
+
 // Possibly useful for debugging hardware faults:
 static void bus_test (struct bus_s *bus)
 {
@@ -1353,10 +1397,10 @@ static void bus_test (struct bus_s *bus)
   SERIAL_PRINTF("%s: Busy  test %s\r\n", bus->name, ok ? "passed" : "failed");
   ok = bus_detect(txq->busyout_pin, bus->rx_pin, bus->tx_pin);
   SERIAL_PRINTF("%s: Tx/Rx test %s\r\n", bus->name, ok ? "passed" : "failed");
-  txq->uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, bus->rx_pin, bus->tx_pin);
+  bus_uart_begin(bus);
 }
 
-static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *devname, HardwareSerial *uart, int rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
+static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *devname, bus_uart_t *uart, int rx_pin, byte tx_pin, byte busyin_pin, byte busyout_pin)
 {
   memset(bus, 0, sizeof(*bus));
   bus->name = devname;
@@ -1369,8 +1413,7 @@ static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *devn
   bus->rxbuf->bus = bus;
   bus->txq = (struct txq_s *)malloc(sizeof(struct txq_s));
   txq_init(bus->txq, devname, uart, rx_pin, tx_pin, busyin_pin, busyout_pin);
-  uart->setRxBufferSize((2 * AUXBUS_PKT_MAX) + AUXBUS_SSAA_PKT_MAX);     // Large enough for SSAA packets, plus some
-  uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, rx_pin, tx_pin);
+  bus_uart_begin(bus);
   return true;
 }
 
@@ -1406,7 +1449,6 @@ static void routing_add_dev (byte dev, struct rxbuf_s *route)
     if (!db->dev && i < empty_slot)
       empty_slot = i;
   }
-add_route:
   if (empty_slot < num_routes) {
     i = empty_slot;
   } else {
@@ -1417,7 +1459,7 @@ add_route:
   struct dev_route_s *db = &routing_table[i];
   db->dev   = dev;
   db->route = route;
-  SERIAL_PRINTF("routing[%u]: %s (%02x) on %s\r\n", i, dev_to_name(dev, false), dev, route ? route->name : "NULL");
+  SERIAL_PRINTF("routing[%u]: %s (0x%02x) on %s\r\n", i, dev_to_name(dev, false), dev, route ? route->name : "NULL");
 }
 
 static void routing_remove_dev (byte dev)
@@ -1430,7 +1472,7 @@ static void routing_remove_dev (byte dev)
        db->route = NULL;
        if (i == (num_routes - 1))
          --num_routes;
-       SERIAL_PRINTF("routing[%u]: %s (%02x) removed from %s\r\n", i, dev_to_name(dev, false), dev, route ? route->name : "NULL");
+       SERIAL_PRINTF("routing[%u]: %s (0x%02x) removed from %s\r\n", i, dev_to_name(dev, false), dev, route ? route->name : "NULL");
        return;
     }
   }
@@ -1467,7 +1509,10 @@ static void print_packet (const char *prefix1, const char *prefix2, byte *data, 
 #if ETHERNET_ENABLED
      || (c == 'e' && 0 == strncmp(prefix1, "e2000_", 6))
 #endif
-     || (c == 'm' && 0 == strncmp(prefix1, "musb_",  5)))
+#if MUSB_ENABLED
+     || (c == 'm' && 0 == strncmp(prefix1, "musb_",  5))
+#endif
+    )
       return;
   }
   bool regular_pkt = (data[0] == 0x3b) && (data[1] == (len - 3));
@@ -1568,8 +1613,9 @@ static void tx_enq (struct rxbuf_s *from_rxbuf, struct bus_s *bus, byte forward,
       }
       memcpy(pdata, data, len);
     }
-    *(byte **)(p->data) = pdata;  // Pass pointer to the real data as first 4-bytes of p->data[]:
-    p->indirect_data = true;      // bus_tx() will free() the buffer after sending.
+    void *pd = p->data;
+    *(byte **)pd = pdata;     // Pass pointer to the real data as first 4-bytes of p->data[]:
+    p->indirect_data = true;  // bus_tx() will free() the buffer after sending.
   }
   p->len = len;
   txq->head++;
@@ -1594,22 +1640,25 @@ static void auxbus_send_msg (byte *data, uint16_t len)
 
 // **** Begin Mount-USB (MUSB) **********************************************************************************************************
 
-static struct rxbuf_s musb_rxbuf;
+static long           musb_switch_timer = 0;
 static bool           musb_selected     = false;
 static bool           musb_rfkill       = true;  // nvram
+
+#if MUSB_ENABLED
+static bool           musb_switch_is_on = false;
+static struct rxbuf_s musb_rxbuf;
 static long           musb_connected    = 0;
-static uint32_t       musb_rxcount      = 0;
-static uint32_t       musb_txcount      = 0;
+static ulong          musb_rxcount      = 0;
+static ulong          musb_txcount      = 0;
 static bool           musb_debug        = false;
 static bool           musb_timestamps   = false;
 static ulong          musb_last4        = 0;
-static long           musb_switch_timer = 0;
-static bool           musb_switch_is_on = false;
+static ulong          musb_baud         = 0;
 
 static void monitor_musb_switch (void)
 {
   bool old = musb_switch_is_on;
-  musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
+  musb_switch_is_on = READ_MUSB_SELECT_PIN();
   if (old != musb_switch_is_on) {
     musb_switch_timer = (musb_switch_is_on == musb_selected) ? 0 : get_timeout(1500);
     SERIAL_PRINTF("MUSB switch changed to %s\r\n", musb_switch_is_on ? "LOW" : "HIGH");
@@ -1620,6 +1669,12 @@ static void monitor_musb_switch (void)
   }
 }
 
+static inline void musb_set_baud (ulong baud)
+{
+  musb_baud = baud;
+  musb_uart->updateBaudRate(musb_baud);
+}
+
 static void musb_disconnect (void)
 {
   SERIAL_PRINTLN(__func__);
@@ -1627,7 +1682,7 @@ static void musb_disconnect (void)
   init_rxbuf(&musb_rxbuf, "musb");
   musb_connected = 0;
   musb_last4 = 0;
-  musb_uart->updateBaudRate(19200);
+  musb_set_baud(19200);
   p2000_timeout = P2000_NORMAL_TIMEOUT;
   SERIAL_PRINTLN("MUSB baud 19200");
 }
@@ -1637,7 +1692,7 @@ static void musb_tx (bool from_ssaa, byte *data, uint16_t count)
   if (musb_selected && musb_connected) {
     musb_uart->write(data, count);
     musb_txcount += count;
-    musb_uart->flush(true); // Necessary for CPWI !!
+    musb_uart->flush(FLUSH_TXONLY); // Necessary for CPWI !!
     if (TVERBOSE2(from_ssaa, data))
       print_packet(__func__, NULL, data, count);
   }
@@ -1665,7 +1720,7 @@ static inline void musb_autobaud (byte b)
   // When CPWI "reconnnects", it stays at 115200 and the data at 19200 is f8 f8 f8 f8..
   if ((musb_last4 & 0x00ffffff) == 0x00e698e0 || musb_last4 == 0xf8f89898) {
     musb_last4 = 0;
-    musb_uart->updateBaudRate(115200);
+    musb_set_baud(115200);
     if (musb_debug)
       SERIAL_ENDLINE();
     SERIAL_PRINTLN("MUSB baud 115200");
@@ -1704,6 +1759,8 @@ static void musb_loop (void)
     }
   }
 }
+
+#endif /* MUSB_ENABLED */
 // **** End Mount-USB (MUSB) **********************************************************************************************************
 
 static inline byte emulate_begin (const char *devname, byte *data, byte *reply)
@@ -1744,6 +1801,9 @@ static byte long_to_4bytes (byte *dest, ulong v)
 }
 
 #if EMULATE_GPS
+
+static bool gps_disabled        = false;  // GPS can be prevented from responding via NVRAM setting
+static bool gps_detected        = false;  // Don't respond as DEV_GPS unless a GPS is detected
 
 #if !NTP_ENABLED
   #define ntp_time_is_valid 0
@@ -1873,7 +1933,7 @@ static bool _gps_is_valid_ (long *timeout)
 struct RawDegrees
 {
      uint16_t deg;
-     uint32_t billionths;
+     ulong    billionths;
      bool     negative;
   public:
      RawDegrees() : deg(0), billionths(0), negative(false) {}
@@ -1904,7 +1964,7 @@ struct GPSDate
      bool is_valid() {return _gps_is_valid_(&validTimeout);}
   private:
      bool     have_newval;
-     uint32_t date, newval;
+     ulong    date, newval;
      long     validTimeout;
      void     commit();
 };
@@ -1921,7 +1981,7 @@ struct GPSTime
      uint8_t  minute();
      uint8_t  second();
      bool     have_newval;
-     uint32_t time, newval;
+     ulong    time, newval;
      long     validTimeout;
      void     commit();
 };
@@ -1931,11 +1991,11 @@ struct GPSInteger
    friend class GPSPlus;
 public:
    GPSInteger() : validTimeout(0), have_newval(0) {}
-   uint32_t value()    {return validTimeout ? val : 0;}
+   ulong    value()    {return validTimeout ? val : 0;}
    bool     is_valid() {return _gps_is_valid_(&validTimeout);}
 private:
    bool     have_newval;
-   uint32_t val, newval;
+   ulong    val, newval;
    long     validTimeout;
    void     commit();
    void     set(const char *term);
@@ -2034,9 +2094,9 @@ static int fromHex(char a)
     return a - '0';
 }
 
-static bool get_digits (const char *term, byte n, uint32_t *ret_p, bool excess_ok)
+static bool get_digits (const char *term, byte n, ulong *ret_p, bool excess_ok)
 {
-  uint32_t t = 0;
+  ulong t = 0;
   for (byte i = 0; i < n; ++i) {
     char c = term[i];
     if (c < '0' || c > '9')
@@ -2049,9 +2109,9 @@ static bool get_digits (const char *term, byte n, uint32_t *ret_p, bool excess_o
   return true;
 }
 
-static bool get_time (const char *term, uint32_t *time)
+static bool get_time (const char *term, ulong *time)
 {
-  uint32_t t1 = 0, t2 = 0;
+  ulong t1 = 0, t2 = 0;
   if (!get_digits(term, 6, &t1, false) || term[6] != '.' || !get_digits(term + 7, 2, &t2, true))
     return false;
   *time = t1 * 100 + t2;
@@ -2061,10 +2121,10 @@ static bool get_time (const char *term, uint32_t *time)
 // Parse degrees in that funny NMEA format DDMM.MMMM
 static void parseDegrees(const char *term, struct RawDegrees &deg)
 {
-  uint32_t leftOfDecimal          = (uint32_t)atol(term);
+  ulong    leftOfDecimal          = (ulong)atol(term);
   uint16_t minutes                = (uint16_t)(leftOfDecimal % 100);
-  uint32_t multiplier             = 10000000UL;
-  uint32_t tenMillionthsOfMinutes = minutes * multiplier;
+  ulong    multiplier             = 10000000UL;
+  ulong    tenMillionthsOfMinutes = minutes * multiplier;
 
   deg.deg = (int16_t)(leftOfDecimal / 100);
   while (isdigit(*term))
@@ -2291,13 +2351,13 @@ bool GPSTime::getHMS (byte dest[3])
     m = minute();
     s = second();
     adjust = (((ulong)(1 + millis())) - (validTimeout - GPS_TIMEOUT)) / 1000lu;
-#if NTP_ENABLED
+#if EMULATE_GPS && NTP_ENABLED
   } else if (ntp_time_is_valid) {
     h = ntp_time.hh;
     m = ntp_time.mm;
     s = ntp_time.ss;
     adjust = (((ulong)(1 + millis())) - ntp_time_is_valid) / 1000lu;
-#endif /* NTP_ENABLED */
+#endif /* EMULATE_GPS && NTP_ENABLED */
   } else {
     dest[2] = dest[1] = dest[0] = 0;
     return false;
@@ -2336,7 +2396,7 @@ void     GPSInteger::set(const char *term) { newval = atol(term); have_newval = 
 
 void GPSInteger::cond_set2 (const char *term)
 {
-  uint32_t v = 0;
+  ulong v = 0;
   if (get_digits(term, 2, &v, false)) {
     if (!have_newval || v > newval) {
       have_newval = true;
@@ -2601,7 +2661,7 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
     case OP(GPS_GET_LAT,3): {
       double lat;
       gps_get_lat_lng(true, &lat, NULL);
-      int32_t ilat = lat + ((lat > 0) ? 0.499999 : -0.499999);
+      long ilat = lat + ((lat > 0) ? 0.499999 : -0.499999);
       uint8_t* latBytePtr = (uint8_t*)&ilat;
       reply[len++] = latBytePtr[2];
       reply[len++] = latBytePtr[1];
@@ -2613,7 +2673,7 @@ static void gps_handle_request (struct rxbuf_s *rxbuf, byte *data)
     case OP(GPS_GET_LNG,3): {
       double lng;
       gps_get_lat_lng(true, NULL, &lng);
-      int32_t ilng = lng + ((lng > 0) ? 0.499999 : -0.499999);
+      long ilng = lng + ((lng > 0) ? 0.499999 : -0.499999);
       uint8_t* lngBytePtr = (uint8_t*)&ilng;
       reply[len++] = lngBytePtr[2];
       reply[len++] = lngBytePtr[1];
@@ -2745,7 +2805,7 @@ static byte mount_dev_handle_request (const char *devname, byte *data, byte len,
 
 static void batt_handle_request (struct rxbuf_s *rxbuf, byte *data)
 {
-  const uint32_t voltage = 10760000;  // micro-volts (10.760V)
+  const ulong voltage = 10760000;   // micro-volts (10.760V)
   static uint16_t max_current = 2000;  // milliamps
 
   EMULATE_BEGIN("batt");
@@ -2760,8 +2820,8 @@ static void batt_handle_request (struct rxbuf_s *rxbuf, byte *data)
       max_current = (max_current << 8) | data[6];
       break;
     case OP(BATT_GET_VOLTAGE,3):
-      reply[len++] = 0x00;  // 00=Discharging, 01=Charging
-      reply[len++] = 0x02;  // 02=Good, 03=ChargeFault
+      reply[len++] = 0x00;  // Charger status: 00=Discharging, 01=Charging, 02=Charged, 03=ChargeFault
+      reply[len++] = 0x02;  // Battery status: 00=Low, 01=Medium, 02=High
       reply[len++] = (voltage >> 24) & 0xff;
       reply[len++] = (voltage >> 16) & 0xff;
       reply[len++] = (voltage >>  8) & 0xff;
@@ -2847,11 +2907,11 @@ static void uart_handle_request (struct rxbuf_s *rxbuf, byte *data)
 }
 
 static struct mc_s {
-  int32_t  pos;
-  int32_t  slew_target;
-  int32_t  slew_rate;
-  int32_t  cordwrap_pos;
-  int32_t  cordwrap_enabled;
+  long     pos;
+  long     slew_target;
+  long     slew_rate;
+  long     cordwrap_pos;
+  long     cordwrap_enabled;
   int8_t   move_speed;
   byte     autoguide_rate;
   byte     program_mode;  // 1==old_style; 2==new_style(Evolution)
@@ -3292,7 +3352,6 @@ start_again:
   uint16_t real_stars  = do_random ? micros() % 100 + 1 : 99;
   uint16_t zero_stars  = do_random ? 0 : 1;
   uint16_t total_stars = real_stars + zero_stars;
-  uint16_t zpadding = 0;
   byte     csum = 0, *p = pkt;
   ulong    len  = total_stars * sizeof(struct star_s);  // 8-bytes per star
 
@@ -3356,7 +3415,6 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
     uint16_t  y_coord;
     uint16_t  y_extra;
   } ssaa_profiles[SSAA_NUM_PROFILES] = {{640,0,480,0}, {640,0,480,0}, {640,0,480,0}};
-  static uint16_t ssaa_x_coord = 640, ssaa_y_coord = 480;
 
   static enum {ssaa_idle = 1, ssaa_captured = 3, ssaa_finish = 9} ssaa_status = ssaa_idle;
   static byte plate_index = 0;
@@ -4102,7 +4160,7 @@ static long             fm_position_timeout    = 0;
 static bool             fm_goto_pending        = false;
 static byte             fm_goto_stage2         = 0;
 static bool             fm_goto_stage1         = false;
-static uint32_t         fm_goto_destination    = 0;
+static ulong            fm_goto_destination    = 0;
 static byte             fm_last_approach_cmd   = MC_MOVE_POS;
 
 static void fm_restore_preset (struct button_s *b)
@@ -4142,18 +4200,18 @@ static void fm_query_slew_done (void)
   AUXBUS_SEND_MSG(DEV_ESP32, DEV_FOCUS, MC_GOTO_DONE);
 }
 
-static void fm_goto_position (byte op, uint32_t pos)
+static void fm_goto_position (byte op, ulong pos)
 {
   if (nchuck_debug)
-    SERIAL_PRINTF("%s: op=0x%02x %ld\r\n", __func__, op);
+    SERIAL_PRINTF("%s: op=0x%02x %lu\r\n", __func__, op, pos);
   AUXBUS_SEND_MSG(DEV_ESP32, DEV_FOCUS, op, (byte)(pos >> 16), (byte)(pos >> 8), (byte)pos);
 }
 
 static long fm_delay_timer = 0;
 
-static void fm_goto_begin_moving (uint32_t current_position)
+static void fm_goto_begin_moving (ulong current_position)
 {
-  uint32_t destination = fm_goto_destination;
+  ulong destination    = fm_goto_destination;
   fm_goto_pending      = false;
   fm_goto_stage1       = true;
   fm_delay_timer       = 0;
@@ -4166,7 +4224,7 @@ static void fm_goto_begin_moving (uint32_t current_position)
   fm_goto_position(MC_GOTO_FAST, destination);
 }
 
-static void fm_goto (uint32_t destination, byte approach)
+static void fm_goto (ulong destination, byte approach)
 {
   if (verbose || nchuck_debug)
     SERIAL_PRINTF("%s: Move to position %lu\r\n", __func__, destination);
@@ -4248,12 +4306,12 @@ static void nchuck_handle_fm_response (byte *data)
   if (nchuck_debug)
     print_packet(__func__, NULL, data, len + 3);
   if (OP(op,len) == OP(MC_GET_POS,6)) {
-    uint32_t pos = get_24bit_uint(data + 5);
+    ulong pos = get_24bit_uint(data + 5);
     fm_position_timeout = 0;
     if (fm_preset_pending && !fm_preset_pending->have_position) {
       fm_preset_pending->position = pos;
       if (nchuck_debug)
-        SERIAL_PRINTF("Current Focus Position: %u\r\n", fm_preset_pending->position);
+        SERIAL_PRINTF("Current Focus Position: %lu\r\n", fm_preset_pending->position);
       fm_preset_pending->have_position = true;
       fm_preset_pending->approach      = fm_last_approach_cmd ? fm_last_approach_cmd : MC_MOVE_POS;
       nchuck_save_preset(fm_preset_pending);
@@ -4383,9 +4441,9 @@ static void nchuck_send_mc_cmd (bool fast_range, uint8_t dev, int speed)
 static byte nchuck_buffer[6];
 static byte nchuck_x_thumb()  {return        nchuck_buffer[0];}
 static byte nchuck_y_thumb()  {return        nchuck_buffer[1];}
-static int  nchuck_x_accel()  {return ((int)(nchuck_buffer[2] << 2) | ((nchuck_buffer[5] >> 2) & 3));}
-static int  nchuck_y_accel()  {return ((int)(nchuck_buffer[3] << 2) | ((nchuck_buffer[5] >> 4) & 3));}
-static int  nchuck_z_accel()  {return ((int)(nchuck_buffer[4] << 2) | ((nchuck_buffer[5] >> 6) & 3));}
+//static int  nchuck_x_accel()  {return ((int)(nchuck_buffer[2] << 2) | ((nchuck_buffer[5] >> 2) & 3));}
+//static int  nchuck_y_accel()  {return ((int)(nchuck_buffer[3] << 2) | ((nchuck_buffer[5] >> 4) & 3));}
+//static int  nchuck_z_accel()  {return ((int)(nchuck_buffer[4] << 2) | ((nchuck_buffer[5] >> 6) & 3));}
 static bool nchuck_z_button() {return (      nchuck_buffer[5]       & 0x01) == 0;}
 static bool nchuck_c_button() {return (     (nchuck_buffer[5] >> 1) & 0x01) == 0;}
 static bool nchuck_detected = false;
@@ -4637,7 +4695,7 @@ static void nchuck_loop (void)
 {
   if (nchuck_focus_only)
     fm_delayed_query_slew_done();
-  static int xp, yp, devx = 0, devy = 0;
+  static int devx = 0, devy = 0;
   if (!nchuck_detect(true) || !nchuck_get_data())
     return;
   int newx, x = nchuck_x_thumb();
@@ -4686,11 +4744,6 @@ static void nchuck_loop (void)
       buttons_down = 0;
       if (mode_change_pending) {
         mode_change_pending = false;
-        if (!simple_mode) {
-          nchuck_focus_only = !nchuck_focus_only;
-          nvram_save_int("focus.only", !!nchuck_focus_only);
-          SERIAL_PRINTF("focus_only=%u\r\n", nchuck_focus_only);
-        }
         set_blue_led(LED_OFF);
       }
     }
@@ -4744,6 +4797,8 @@ static void nchuck_loop (void)
 
 // *** Begin DEW support  ******************************************************************************************
 #if EMULATE_DEW
+
+static bool dew_debug  = false;
 
 #if __has_include("ADC_LUT.h")
   #warning "Including ADC_LUT.h"
@@ -5412,7 +5467,7 @@ static double pinval_to_degreesC (int16_t pinval, int16_t pinmax)
 
 static void dew_read_thermistor (byte channel)
 {
-  static int32_t sums    [DEW_NUMCHANNELS] = {0,};
+  static long    sums    [DEW_NUMCHANNELS] = {0,};
   static byte    samples [DEW_NUMCHANNELS] = {0,};
   int16_t pinval, pinavg, pinmax = ads1115_detected ? ads1115_vref : 4095;
 
@@ -5674,6 +5729,13 @@ static double dew_nvram_restore_amperage (byte channel)
 
 // *** Begin OLED support  ****************************************************************************************************
 #if OLED_ENABLED
+
+static void set_wifi_info (const char *ssid, IPAddress ip)
+{
+  strcpy(current_ssid, ssid);
+  sprintf(current_ipaddr, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+}
+
 #include <SSD1306AsciiWire.h>
 
 static struct oled_type_s {
@@ -5714,7 +5776,7 @@ static void oled_get_type (void)
 static  SSD1306AsciiWire  oled;
 
 #define OLED_ROW_CHARS    22  // only 21 chars are usable.. last byte is only about 2 columns wide
-#define OLED_NMODES       (((byte)EMULATE_DEW) + (2*(byte)EMULATE_GPS) + (byte)EMULATE_FOCUS + ((byte)ETHERNET_ENABLED) + 3)  // Network, OTA, and QRcode are the other modes
+#define OLED_NMODES       (((byte)EMULATE_DEW) + (2*(byte)EMULATE_GPS) + (byte)EMULATE_FOCUS + ((byte)ETHERNET_ENABLED) + ((byte)OTA_ENABLED) + 2)  // Network and QRcode are the other modes
 
 static bool (*oled_updatefn[OLED_NMODES])(byte);  // oled_arg_t
 typedef enum {oled_firstcall, oled_normal, oled_button_pressed, oled_button_timer_expired} oled_arg_t;
@@ -5831,8 +5893,6 @@ static void oled_force_clear (void)
   oled_clear(0);
 }
 
-#if EMULATE_GPS
-
 #if EMULATE_FOCUS
 static bool focus_updatefn (byte arg)  // oled_arg_t
 {
@@ -5920,6 +5980,10 @@ show_position:
 }
 #endif /* EMULATE_FOCUS */
 
+#define OLED_DEGREES 0x80
+static byte oled_degreesym = OLED_DEGREES;
+
+#if EMULATE_GPS
 static bool oled_location_updatefn (byte arg)  // oled_arg_t
 {
   static bool got_action, saving;
@@ -5961,9 +6025,6 @@ static bool oled_location_updatefn (byte arg)  // oled_arg_t
   }
   return true;
 }
-
-#define OLED_DEGREES 0x80
-static byte oled_degreesym = OLED_DEGREES;
 
 static void gps_dddmmss (byte fix_type, char *tmp, const char *prefix, const char colon, const char compass[2], double f)
 {
@@ -6013,12 +6074,12 @@ static bool oled_gps_updatefn (byte arg)  // oled_arg_t
   int n;
   if (gps.date.is_valid())
     n = snprintf(tmp, OLED_ROW_CHARS, "%02d/%02d/%02d UTC ", gps.date.day(), gps.date.month(), gps.date.year() % 100);
-#if NTP_ENABLED
+#if EMULATE_GPS && NTP_ENABLED
   else if (ntp_time_is_valid) {
     ntp_fast_update_secs = 60;
     n = snprintf(tmp, OLED_ROW_CHARS, "%02d/%02d/%02d NTP ", ntp_time.day, ntp_time.month, ntp_time.year % 100);
   }
-#endif /* NTP_ENABLED */
+#endif /* EMULATE_GPS && NTP_ENABLED */
   else
     n = snprintf(tmp, OLED_ROW_CHARS, "%s", "--/--/-- UTC ");
   byte hms[3];
@@ -6102,13 +6163,15 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
     snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", hbg3_ssid);
     oled_set_row(2, tmp);
     oled_clear(3);
+#if MUSB_ENABLED
   } else if (connection[0] == 'U') {
-    snprintf(tmp, OLED_ROW_CHARS, "Mode: USB %lu", (musb_uart->baudRate() / 10) * 10); // show 115201 as 115200.
+    snprintf(tmp, OLED_ROW_CHARS, "Mode: USB %lu", musb_baud);
     oled_set_row(1, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "Wireless is %s", musb_rfkill ? "off" : "on");
     oled_set_row(2, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "%u %u", musb_rxcount, musb_txcount);
     oled_set_row(3, tmp);
+#endif /* MUSB_ENABLED */
   } else if (esp32_wifi_off) {
     oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : "WiFi is off");
 #if ETHERNET_ENABLED
@@ -6305,6 +6368,7 @@ static void oled_turn_on (void)
 static void oled_init_modes (void)
 {
   byte modes = 0;
+  memset(oled_updatefn, 0, sizeof(oled_updatefn));
   #if EMULATE_DEW
     oled_updatefn[modes++] = oled_dewcontrol_updatefn;
   #endif
@@ -6324,7 +6388,8 @@ static void oled_init_modes (void)
   #endif
   oled_updatefn[modes++] = oled_QRcode_updatefn;
   if (modes != OLED_NMODES)
-    SERIAL_PRINTF("ERROR/BUG: %s: modes=%u/%u\r\n", modes, OLED_NMODES);
+    SERIAL_PRINTF("ERROR/BUG: %s: modes=%u/%u\r\n", __func__, modes, OLED_NMODES);
+  SERIAL_PRINTF("%s: modes=%u/%u\r\n", __func__, modes, OLED_NMODES);
 }
 
 static void oled_setup (void)
@@ -6414,7 +6479,9 @@ static void oled_loop (void)
   if (!oled_turned_off) {
     // Update the in-RAM copy of the display: oled_data[]:
     while (!oled_updatefn[oled_mode](arg)) {
-      oled_mode = (oled_mode + 1) % OLED_NMODES;
+      do {
+        oled_mode = (oled_mode + 1) % OLED_NMODES;
+      } while (!oled_updatefn[oled_mode]);
       if (oled_showing_image) {
         oled_showing_image = false;
         oled_set_all_updated(true); // Force full redraw
@@ -6444,7 +6511,7 @@ static void oled_print_displays (void)
   oled_button_timer = 0;
   for (oled_mode = 0; oled_mode < OLED_NMODES; ++oled_mode) {
     bool (*updatefn)(byte) = oled_updatefn[oled_mode];
-    if (updatefn != oled_QRcode_updatefn && updatefn(oled_firstcall)) {
+    if (updatefn && updatefn != oled_QRcode_updatefn && updatefn(oled_firstcall)) {
       for (byte r = 0; r < 4; ++r) {
         memcpy(tmp, oled_data[r], OLED_ROW_CHARS);
         tmp[OLED_ROW_CHARS - 1] = '\0';  // Final char on each row is only 2-columns wide, not visible.
@@ -6512,6 +6579,7 @@ static void auxtest_send_msg (void)
 {
   byte msg[] = {0x3b, 0x03, DEV_ESP32, DEV_AZM, DEV_GET_VERSION, 0x00};
   update_checksum(msg);
+  auxtest_waiting = true;
   tx_enq(NULL, &auxbus, wifi_relay_mode ? forward_yes : forward_auxtest, REGULAR_PKT, msg, sizeof(msg));
 }
 
@@ -6539,8 +6607,8 @@ static void handle_uart_set_baud (struct rxbuf_s *rxbuf)
     } else if (rxbuf->data[1] == 3 && rxbuf->data[2] == DEV_UART) {
       if (txq->pending_baud) {
         txq->uart->updateBaudRate(txq->pending_baud);
+        SERIAL_PRINTF("auxbus BAUD now %lu\r\n", txq->pending_baud);
         txq->pending_baud = 0;
-        SERIAL_PRINTF("auxbus BAUD now %lu\r\n", txq->uart->baudRate());
       }
     }
   }
@@ -6626,7 +6694,7 @@ static byte decode_ssaa_0x3c (struct rxbuf_s *rxbuf, byte b)
       if ((rxbuf->sslen32 % 8) || rxbuf->sslen32 > (100 * 8)) {  // Max 100 stars, 8-bytes each
         if (verbose || TRACING_DEV(DEV_SSAA)) {
           auxbus_raw_break();
-          SERIAL_PRINTF("Starsense: sslen32=%lu/%lu FAIL\r\n", rxbuf->sslen32, (100 * 8));
+          SERIAL_PRINTF("Starsense: sslen32=%lu/%u FAIL\r\n", rxbuf->sslen32, (100 * 8));
         }
         ret = pkt_fail;
         break;
@@ -6677,9 +6745,9 @@ static bool ssag_discard_mc_acks = false;
 
 #if SSSWI_HACKING
 
-static uint32_t reverse32 (uint32_t n)
+static ulong reverse32 (ulong n)
 {
-  uint32_t r = 0;
+  ulong r = 0;
   if (0) {
     for (byte b = 0; b < 32; ++b) {
       if ((n & (1<<b)) != 0)
@@ -6695,14 +6763,14 @@ static uint32_t reverse32 (uint32_t n)
 }
 
 static bool have_ichallenge = false;
-static uint32_t ichallenge = 0;
-static uint32_t nchallenge   = 0;
+static ulong ichallenge = 0;
+static ulong nchallenge   = 0;
 
 static bool spoof_challenge_response (struct rxbuf_s *rxbuf)
 {
   byte *data = rxbuf->data;
   byte src = data[2], dst = data[3], op = data[4];
-  static uint32_t challenge;
+  static ulong challenge;
   if (op == SSSWI_GET_CHALLENGE) {
     if (src == DEV_SSHC) {
       if (have_ichallenge)
@@ -6721,10 +6789,10 @@ static bool spoof_challenge_response (struct rxbuf_s *rxbuf)
   if (op == SSSWI_RESPONSE) {
     if (src == DEV_SSHC) {
       if (verbose) print_packet(rxbuf->name, NULL, rxbuf->data, rxbuf->len);
-      uint32_t r = *(uint32_t *)(data + 5);
+      ulong r = *(ulong *)(data + 5);
       if (have_ichallenge) {
         have_ichallenge = false;
-        SERIAL_PRINTF("CR: 0x%08x 0x%08x    0x%08x 0x%08x\r\n", challenge, r, reverse32(challenge), reverse32(r));
+        SERIAL_PRINTF("CR: 0x%08lx 0x%08lx    0x%08lx 0x%08lx\r\n", challenge, r, reverse32(challenge), reverse32(r));
       }
       byte msg[] = {0x3b, 0x04, DEV_SSSWI, DEV_SSHC, SSSWI_RESPONSE, 0x01, 0x00};  // RESPONSE_OK
       update_checksum(msg);
@@ -6846,14 +6914,18 @@ restart:
   return tx_enq_from_rxbuf(rxbuf, pkt_complete);
 }
 
+#if REALTEK_BW16
+  #include "realtek_bw16.h" // second pass of this file defines functions etc.
+#endif
+
 static void bt_setup (void)
 {
   init_rxbuf(&bt_rxbuf, "bt");
-  if (simple_mode || (musb_selected && musb_rfkill)) {
+  if (musb_selected && musb_rfkill) {
     bt_enabled = false;
   } else {
     bt_enabled = true;
-    bt.begin(hbg3_ssid);
+    BT_BEGIN(hbg3_ssid);
   }
   if (bt_debug)
     SERIAL_PRINTF("bt_enabled=%u\r\n", bt_enabled);
@@ -6863,7 +6935,7 @@ static inline void bt_restart (void)
 {
   if (bt_enabled) {
     bt_enabled = false;
-    bt.end();
+    BT_END();
     if (bt_debug)
       SERIAL_PRINTLN("bt_enabled=0");
   }
@@ -6881,13 +6953,15 @@ static inline void _bt_set_state (byte state, const char *name)
 
 static inline bool bt_check_connection (void)
 {
-  bool connected = bt_enabled ? bt.connected() : false;
+  bool connected = bt_enabled ? BT_CONNECTED() : false;
   if (connected != bt_connected) {
     SERIAL_PRINTF("BT: %sCONNECTED mode %s\r\n", connected ? "" : "DIS", (bt_protocol == bt_protocol_aux) ? "AUX" : "HC");
     bt_connected  = connected;
     bt_active     = 0;
     bt_handshake  = 0;
     bt_ready      = false;
+    //SET_BLUE_LED(connected ? 8 : 0);
+    BT_REINIT();
     p2000_timeout = P2000_NORMAL_TIMEOUT;
     BT_SET_STATE(BT_IDLE);
     if (connected)
@@ -6901,7 +6975,7 @@ static inline bool bt_check_connection (void)
 static inline void bt_tx (bool from_ssaa, byte *data, uint16_t count)
 {
   if (bt_connected) {
-    bt.write(data, count);
+    BT_WRITE(data, count);
     //bt.flush();   // breaks bt operation
     if (TVERBOSE2(from_ssaa, data))
       print_packet(__func__, NULL, data, count);
@@ -6911,7 +6985,7 @@ static inline void bt_tx (bool from_ssaa, byte *data, uint16_t count)
 /*
  * Bluetooth in v7.16 used to work most of the time with CPWI.
  * But ever since the code was updated to use the bt.connected() function,
- * it has been failing for (only) CPWI. Older code used bt.available() instead.
+ * it began failing for (only) CPWI. Older code used bt.available() instead.
  *
  * MS-Windows though seems to behave better when we do use bt.connected(),
  * but CPWI now fails unless we emulate the hand-controller handshake with it.
@@ -6938,7 +7012,7 @@ static inline void bt_tx_byte (byte b)
 static void bt_aux_rx (void)
 {
   static int len;
-  byte b = bt.read();
+  byte b = BT_READ();
   if (bt_handshake && bt_debug)
     SERIAL_PRINTF("bt_RX %02x\r\n", b);
   if (!bt_handshake || b == 0x3b) {
@@ -6963,17 +7037,22 @@ static void bt_aux_rx (void)
 
 static inline void bt_aux_loop (void)
 {
-  if (bt.available()) {
+  if (BT_AVAILABLE()) {
+    //SET_BLUE_LED(1023);
     do {
       bt_aux_rx();
-    } while (bt.available());
+    } while (BT_AVAILABLE());
+    //SET_BLUE_LED(8);
     bt_active = get_timeout(p2000_timeout);
     return;
   }
   if (!bt_check_connection())
     return;
-  if (bt_active && time_after(millis(), bt_active))
+  if (bt_active && time_after(millis(), bt_active)) {
     bt_active = 0;
+    if (bt_debug)
+      SERIAL_PRINTLN("bt activity time-out");
+  }
   if (bt_handshake && time_after(millis(), bt_handshake)) {
     bt_handshake = get_timeout(BT_HS_TIMEOUT);
     if (bt_auxstate == BT_BOOTLOADER) {
@@ -6981,15 +7060,15 @@ static inline void bt_aux_loop (void)
       do {
         bt_tx_byte(0xfa);
         delay(200);  // MUST be an inline delay() or Bluetooth doesn't work.
-      } while (!bt.available() && ++failsafe < 5);
-      if (bt.available())
+      } while (!BT_AVAILABLE() && ++failsafe < 5);
+      if (BT_AVAILABLE())
         BT_SET_STATE(BT_WAITBAUD);
     } else if (bt_auxstate == BT_HSDONE) {
       byte failsafe = 0;
       do {
         bt_tx_byte(0x80);
         delay(200);  // MUST be an inline delay() or Bluetooth doesn't work.
-      } while (!bt.available() && ++failsafe < 5);
+      } while (!BT_AVAILABLE() && ++failsafe < 5);
     } else if (bt_auxstate == BT_SETBAUD) {
       BT_SET_STATE(BT_IDLE);  // timed-out
     }
@@ -6999,7 +7078,9 @@ static inline void bt_aux_loop (void)
 static void w2000_tx (bool from_ssaa, byte *data, uint16_t count)
 {
   if (!esp32_wifi_off && w2000.connected()) {
+    SET_RED_LED(1023);
     w2000.write(data, count);
+    SET_RED_LED(8);
     //w2000.flush();  // breaks wifi operation with CPWI
     if (TVERBOSE2(from_ssaa, data))
       print_packet("w2000_tx", NULL, data, count);
@@ -7034,8 +7115,10 @@ static void emulate_send_reply (const char *devname, struct rxbuf_s *rxbuf, byte
     else if (ethernet_detected && rxbuf == &e2000_rxbuf)
       e2000_tx(from_ssaa, data, len);
 #endif /* ETHERNET_ENABLED */
+#if MUSB_ENABLED
     else if (rxbuf == &musb_rxbuf)
       musb_tx(from_ssaa, data, len);
+#endif /* MUSB_ENABLED */
     else
       SERIAL_PRINTF("%s: unknown rxbuf\r\n", __func__);
   }
@@ -7149,7 +7232,6 @@ static inline uint16_t hack_command_pkt (byte *data, uint16_t len)
       }
     }
   }
-done:
   if (rewritten) {
     update_checksum(data);
     if (TVERBOSE(data))
@@ -7221,14 +7303,16 @@ static void forward_from_bus_to_outside (struct rxbuf_s *rxbuf, byte status, byt
   }
 #endif /* ETHERNET_ENABLED */
 
+#if MUSB_ENABLED
   if (musb_selected) {
     // Echo packet to Mount-USB, unless it came from there:
     if (!regular_pkt || src != musb_rxbuf.requestor)
       musb_tx(from_ssaa, data, len);
   }
+#endif /* MUSB_ENABLED */
 }
 
-static inline uint16_t discard_rx (HardwareSerial *uart, uint16_t discard_len)
+static inline uint16_t discard_rx (bus_uart_t *uart, uint16_t discard_len)
 {
   while (discard_len && uart->available()) {
     --discard_len;
@@ -7248,7 +7332,7 @@ static inline void txq_set_is_alive (struct txq_s *txq, bool is_alive, const cha
 // Buffering Starsense Camera packet data is surprisingly complex and difficult:
 static void bus_rx (struct bus_s *bus)
 {
-  HardwareSerial *uart = bus->txq->uart;
+  bus_uart_t *uart = bus->txq->uart;
   struct rxbuf_s *rxbuf = bus->rxbuf;
 
   while (uart->available()) {
@@ -7300,7 +7384,8 @@ static void esp32_handle_response (struct bus_s *bus, byte *data)
 {
   byte src = data[2];
 
-  if ((src == DEV_AZM || src == DEV_SSSWI) && data[4] == DEV_GET_VERSION) {
+  if (auxtest_waiting && (src == DEV_AZM || src == DEV_SSSWI) && data[4] == DEV_GET_VERSION) {
+    auxtest_waiting = false;
     auxtest_received_msg(bus, data);
   } else if (src == DEV_FOCUS) {
     fm_detected = true;  // redundant: process_packet() already sets this
@@ -7431,8 +7516,14 @@ static inline bool claim_bus_for_tx (struct bus_s *bus)
 
 static inline void bus_tx (struct txq_s *txq, byte *data, uint16_t len)
 {
+#if REALTEK_BW16
+  long flushed = get_timeout(2 + ((len + 1) / 2));  // Calculate how long until all bits transmitted
   txq->uart->write(data, len);
-  txq->uart->flush(true);                   // flush tx only
+  while (time_before(millis(), flushed));  // Allow enough time for everything to be sent out
+#else
+  txq->uart->write(data, len);
+  txq->uart->flush(FLUSH_TXONLY);
+#endif /* REALTEK_BW16 */
   txq_deassert_busyout(txq);
 }
 
@@ -7752,20 +7843,13 @@ static bool nvram_get_bool (const char *name)
   return (0 == strcmp(name, "wlan.dhcp.enabled"));  // the only bool that defaults to "1"
 }
 
-static void nvram_restore (void)
+#if REALTEK_BW16
+  #include "realtek_bw16.h" // third pass of this file defines nvram functions etc.
+
+#else /* REALTEK_BW16 */
+
+static void nvram_flash_restore (void)
 {
-  if (nvram_initialized)
-      return;
-  memcpy(nvram_vals, nvram_vals_defaults, sizeof(nvram_vals)); // In case restored vals[] is smaller than new size of vals[]
-  if (FRAM_USE_FOR_NVRAM && fram_detected) {
-    fram_read(FRAM_NVRAM_OFFSET, &nvram_signature, sizeof(nvram_signature));
-    if (strcmp(nvram_signature.sig, VARS_SIGNATURE) || nvram_signature.vsize > sizeof(nvram_vals)) {
-      SERIAL_PRINTF("read(FRAM): signature mismatch: Sig='%s' vsize=%lu\r\n", nvram_signature.sig, nvram_signature.vsize);
-    } else {
-      fram_read(FRAM_NVRAM_OFFSET + sizeof(nvram_signature), nvram_vals, nvram_signature.vsize);
-      nvram_initialized = true;
-    }
-  } else {
     bool ret = SPIFFS.begin(false, "/spiffs", 2);  // Max 2 open files at a time
     if (!ret) {
       SERIAL_PRINTLN("Formatting SPIFFS -- please wait on BLUE LED");
@@ -7794,12 +7878,44 @@ static void nvram_restore (void)
       }
       vf.close();
     }
+}
+
+static void nvram_flash_save (void)
+{
+    File vf = SPIFFS.open(NVRAM_PATH, FILE_WRITE);
+    if (!vf) {
+      SERIAL_PRINTLN("open(" NVRAM_PATH "[W]) failed");
+      return;
+    }
+    vf.write((byte *)&nvram_signature, sizeof(nvram_signature));
+    vf.write((byte *)nvram_vals, sizeof(nvram_vals));
+    vf.close();
+}
+#endif /* REALTEK_BW16 */
+
+static void nvram_read_from_storage (void)
+{
+  memcpy(nvram_vals, nvram_vals_defaults, sizeof(nvram_vals)); // In case restored vals[] is smaller than new size of vals[]
+  if (FRAM_USE_FOR_NVRAM && fram_detected) {
+    fram_read(FRAM_NVRAM_OFFSET, &nvram_signature, sizeof(nvram_signature));
+    if (strcmp(nvram_signature.sig, VARS_SIGNATURE) || nvram_signature.vsize > sizeof(nvram_vals)) {
+      SERIAL_PRINTF("read(FRAM): signature mismatch: Sig='%s' vsize=%u\r\n", nvram_signature.sig, nvram_signature.vsize);
+    } else {
+      fram_read(FRAM_NVRAM_OFFSET + sizeof(nvram_signature), nvram_vals, nvram_signature.vsize);
+      nvram_initialized = true;
+    }
+  } else {
+    nvram_flash_restore();
   } /* FRAM_USE_FOR_NVRAM */
   if (!nvram_initialized) {
     nvram_load_defaults();
     nvram_save();
   }
   nvram_clear_reserved_slots();
+}
+
+static void nvram_restore_settings (void)
+{
 #if OLED_ENABLED
   oled_get_type();
   {
@@ -7816,7 +7932,9 @@ static void nvram_restore (void)
     strcpy(hbg3_ssid, ssid);
   else
     default_ssid(hbg3_ssid);
+#if MUSB_ENABLED
   musb_rfkill = !nvram_get_bool("musb.rfenable");
+#endif /* MUSB_ENABLED */
   suppress_lowbattery = nvram_get_bool("suppress.lowbattery");
   byte tmp = nvram_get_int("auxbus.stopbits");
   if (tmp == 1 || tmp == 2)
@@ -7907,7 +8025,7 @@ static void nvram_restore (void)
   if (verbose)
     SERIAL_PRINTF("UDP advertisement=%s\r\n", advertisement);
 }
-    
+
 static void nvram_save (void)
 {
   if (!nvram_initialized)
@@ -7916,18 +8034,11 @@ static void nvram_save (void)
   strcpy(nvram_signature.sig, VARS_SIGNATURE);
   nvram_signature.vsize = sizeof(nvram_vals);
   if (FRAM_USE_FOR_NVRAM && fram_detected) {
-    SERIAL_PRINTF("Sig='%s'  vsize=%lu\r\n", nvram_signature.sig, nvram_signature.vsize);
+    SERIAL_PRINTF("Sig='%s'  vsize=%u\r\n", nvram_signature.sig, nvram_signature.vsize);
     fram_write(FRAM_NVRAM_OFFSET, &nvram_signature, sizeof(nvram_signature));
     fram_write(FRAM_NVRAM_OFFSET + sizeof(nvram_signature), nvram_vals, sizeof(nvram_vals));
   } else {
-    File vf = SPIFFS.open(NVRAM_PATH, FILE_WRITE);
-    if (!vf) {
-      SERIAL_PRINTLN("open(" NVRAM_PATH "[W]) failed");
-      return;
-    }
-    vf.write((byte *)&nvram_signature, sizeof(nvram_signature));
-    vf.write((byte *)nvram_vals, sizeof(nvram_vals));
-    vf.close();
+    nvram_flash_save();
   }
 }
 
@@ -7943,19 +8054,29 @@ static bool IP_fromString(IPAddress ip, const char *s)
   return false;
 }
 
+#if !REALTEK_BW16
+static bool wifi_config_server_mode (const char *passkey)
+{
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(hbg3_ssid, passkey);
+  delay(100);  // This delay here is critical: wait for SYSTEM_EVENT_AP_START before setting IP config
+  WiFi.softAPConfig(server_static_ip, server_static_ip, server_static_netmask);
+  return true;
+}
+#endif /* !REALTEK_BW16 */
+
 static void wifi_begin_server_mode (void)
 {
   SERIAL_PRINTLN(__func__);
   const char *passkey = nvram_get_val("softap.passkey");
   wifi_relay_mode = false;
   SERIAL_PRINTF("esp32_wifi ON, softAP, ssid=%s, passkey=%s\r\n", hbg3_ssid, passkey);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(hbg3_ssid, passkey);
-  delay(100);  // This delay here is critical: wait for SYSTEM_EVENT_AP_START before setting IP config
-  WiFi.softAPConfig(server_static_ip, server_static_ip, server_static_netmask);
+  if (wifi_config_server_mode(passkey)) {
 #if OLED_ENABLED
-  set_wifi_info(hbg3_ssid, server_static_ip);
+    set_wifi_info(hbg3_ssid, server_static_ip);
 #endif
+  }
+  BT_RESTART();
 }
 
 static inline bool autodetect_wifi_relay_mode (const char *ssid)
@@ -7966,7 +8087,7 @@ static inline bool autodetect_wifi_relay_mode (const char *ssid)
   static const char Celestron[] = "Celestron-";
   return (0 == strncmp(ssid, Default, strlen(Default)) || 0 == strncmp(ssid, Celestron, strlen(Celestron)));
 #else
-  return false;
+  return false && ssid; // (false) keep compiler happy
 #endif
 }
 
@@ -7978,34 +8099,46 @@ static bool wifi_begin_client_mode (void)
   const char *ssid     = nvram_get_val("wlan.ssid");
   const char *passkey  = nvram_get_val("wlan.passkey");
   bool        use_dhcp = nvram_get_bool("wlan.dhcp.enabled");
+  IPAddress IP, NMASK, GW, DNS;
   if (!ssid[0]) {
     wifi_client_mode_override = true;
     SERIAL_PRINTLN("wifi_client_mode_override: wlan.ssid not set yet");
     return false;  /* cannot be a client unless we know which AP to connect to! */
   }
-  WiFi.mode(WIFI_STA);
   if (!use_dhcp) {
     const char *ip     = nvram_get_val("wlan.static.ip");
     const char *nmask  = nvram_get_val("wlan.static.netmask");
     const char *gw     = nvram_get_val("wlan.static.gateway");
     const char *dns    = nvram_get_val("wlan.static.dns");
-    IPAddress IP, NMASK, GW, DNS;
-    if (!*ip || !*nmask || !*gw || !*dns)
+    if (!*ip || !*nmask || !*gw || !*dns) {
+      use_dhcp = true;
       SERIAL_PRINTLN("static IP config failed; using DHCP");
-    else if (IP_fromString(IP,ip) && IP_fromString(NMASK,nmask) && IP_fromString(GW,gw) && IP_fromString(DNS,dns))
-      WiFi.config(IP, DNS, GW, NMASK);
-    else
+    } else if (!IP_fromString(IP,ip) || !IP_fromString(NMASK,nmask) || !IP_fromString(GW,gw) || !IP_fromString(DNS,dns)) {
+      use_dhcp = true;
       SERIAL_PRINTLN("static IP config failed2; using DHCP");
+    }
   }
+#if REALTEK_BW16
+  if (use_dhcp)
+    WiFi.enable_dhcp();
+#else
+  WiFi.mode(WIFI_STA);
+#endif
+  if (!use_dhcp)
+    WiFi.config(IP, DNS, GW, NMASK);
 #if OLED_ENABLED
   set_wifi_info(ssid, WiFi.localIP());
 #endif
   wifi_relay_mode = autodetect_wifi_relay_mode(ssid);
   long timeout = get_timeout(5 * 60 * 1000);   // 5-minute failsafe timeout
+#if !REALTEK_BW16
   WiFi.setMinSecurity((passkey && *passkey) ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN);
+#endif
   non_wifi_loop();
-  WiFi.begin(ssid, (passkey && *passkey) ? passkey : NULL);
+  WiFi.begin((char *)ssid, (passkey && *passkey) ? passkey : NULL);  // REALTEK_BW16 blocks here until connected
+#if !REALTEK_BW16
   WiFi.setAutoReconnect(true);
+#endif
   while (WiFi.status() != WL_CONNECTED) {
     non_wifi_loop();   // Keep other things working while we're stuck here waiting for WiFi
     if (time_after(millis(), timeout)) {
@@ -8015,10 +8148,12 @@ static bool wifi_begin_client_mode (void)
     }
   }
   SERIAL_PRINTF("\r\nWiFi connected to %s, IP address: ", ssid);
-  SERIAL_PRINTLN(WiFi.localIP().toString().c_str());
+  SERIAL_PRINT(WiFi.localIP());
+  SERIAL_PRINTLN("");
 #if OLED_ENABLED
   set_wifi_info(ssid, WiFi.localIP());
 #endif
+  BT_RESTART();
   return true;
 }
 
@@ -8026,7 +8161,7 @@ static bool is_wifi_client_mode_requested (void)
 {
   static byte old_want_client = 0xa5;
   byte want_client = false;
-  want_client = (READ_WIFI_MODE_PIN() == LOW);
+  want_client = READ_WIFI_MODE_PIN();
   if (want_client != old_want_client) {
     wifi_client_mode_override = false;
     old_want_client = want_client;
@@ -8042,15 +8177,22 @@ static void set_esp32_wifi_off (bool want_off)
   if (esp32_wifi_off == want_off)
     return;  /* all okay as-is */
   esp32_wifi_off = want_off;
-#if NTP_ENABLED
+#if EMULATE_GPS && NTP_ENABLED
   ntp_time_is_valid = 0;
-#endif
+#endif /* EMULATE_GPS && NTP_ENABLED */
+  W3000.end();
+  W2000.end();
   if (want_off) {
     wifi_relay_mode = false;
     SERIAL_PRINTLN("esp32_wifi OFF");
     if (wifi_client_mode)
+#if REALTEK_BW16
+      WiFi.disconnect();
+    //wifi_off();  // This also kills BLE; Ugh.
+#else
       WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+#endif /* REALTEK_BW16 */
   } else {
     wifi_client_mode = is_wifi_client_mode_requested();
     SERIAL_PRINTF("esp32_wifi ON, %s mode\r\n", wifi_client_mode ? "Client" : "Server");
@@ -8058,8 +8200,12 @@ static void set_esp32_wifi_off (bool want_off)
       wifi_client_mode = wifi_begin_client_mode();
     if (!wifi_client_mode)
       wifi_begin_server_mode();
+    DUMMY_BEGIN();  // REALTEK_BW16 bug: first begin() returns fd==0, which doesn't work.
     W2000.begin();  // Start listening for application connections on wifi
     W3000.begin();  // Start listening for management commands
+    DUMMY_END();
+    LWIP_SET_NONBLOCK(W2000, _sock_ser);
+    LWIP_SET_NONBLOCK(W3000, _sock_ser);
   }
 }
 
@@ -8126,18 +8272,14 @@ static void manage_esp32_wifi (bool want_off)
 
 static void manage_wifi_onoff (void)
 {
-  if (simple_mode) {
-    manage_esp32_wifi(true);
-  } else {
-    // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
-    bool others_active = (bt_connected || musb_selected);
+  // Turn WiFi off when using Bluetooth or Mount-USB; turn it back on if activity there lapses.
+  bool others_active = (bt_connected || musb_selected);
 #if ETHERNET_ENABLED
-    others_active |= ethernet_detected && e2000.connected();
+  others_active |= ethernet_detected && e2000.connected();
 #endif
-    manage_esp32_wifi(others_active && musb_rfkill);
-    others_active |= (!esp32_wifi_off && w2000.connected());
-    manage_evo_wifi(others_active);
-  }
+  manage_esp32_wifi(others_active && musb_rfkill);
+  others_active |= (!esp32_wifi_off && w2000.connected());
+  manage_evo_wifi(others_active);
 }
 
 // **** Begin OTA Firmware Update **************************************************************************************
@@ -8186,11 +8328,13 @@ static void ota_show_progress (size_t progress, size_t total)
     if (oled_detected)
       oled_show_progress(percent, progress, total);
   #endif
+#if MUSB_ENABLED
   monitor_musb_switch();
+#endif /* MUSB_ENABLED */
 }
 
 // Update firmware from existing stream: this type is triggered by pressing buttons.
-static bool firmware_update_from_stream (uint32_t clength)
+static bool firmware_update_from_stream (ulong clength)
 {
   if (!Update.begin(clength)) {
     SERIAL_PRINTLN("Not enough space to begin OTA");
@@ -8239,7 +8383,7 @@ static void ota_exit (const char *msg)
   e3000.stop();   // Close e3000 connection, if any
 #endif
   delay(100);
-  ESP.restart();
+  do_system_reset();
 }
 
 static ulong ota_clength = 0;
@@ -8375,8 +8519,10 @@ static const char help_serial_commands[] =
 #if OLED_ENABLED
   "oled              -- Dump contents of the various OLED screens\r\n"
 #endif
+#if MUSB_ENABLED
   "m                 -- Toggle MUSB debug on/off\r\n"
   "M                 -- Toggle MUSB timestamps on/off\r\n"
+#endif
   "P                 -- Toggle passive_mode on/off\r\n"
 #if NCHUCK_ENABLED
   "n                 -- Toggle Nunchuck debug on/off\r\n"
@@ -8535,9 +8681,9 @@ static int p3000_orig_trace_dev2 = -1;
 
 static bool handle_serial_commands (char *cmd)
 {
-  static const char ssaa_recentre[] = "ssaa_recentre ";
+  static const char ssaa_recentre[] = "ssaa_recentre";
   byte b = *cmd;
-  auxtest_remaining = 0;  // cancel the automatic tests
+  auxtest_remaining = auxtest_waiting = 0;  // cancel the automatic tests
   if (b == ';' || b == '#') {
     auxbus_raw_timeout = auxbus_raw_count = 0;
   } else if (match_word("cls", &cmd, true)) {
@@ -8549,8 +8695,12 @@ static bool handle_serial_commands (char *cmd)
     oled_print_displays();
 #endif
   } else if (match_word("free", &cmd, true)) {
+#if REALTEK_BW16
+    SERIAL_PRINTF("free_heap=%lu\r\n", os_get_free_heap_size_arduino());
+#else
     SERIAL_PRINTF("free_heap=%lu, min_free=%lu, largest_free=%lu\r\n", esp_get_free_heap_size(),
       heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT), heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+#endif /* REALTEK_BW16 */
   } else if (match_word("devs", &cmd, true)) {
      SERIAL_PRINTF("%4s  %-6s   %s\r\n", "Addr", "Name  ", "Description");
      SERIAL_PRINTF("%4s  %-6s   %s\r\n", "====", "======", "====================");
@@ -8578,7 +8728,7 @@ static bool handle_serial_commands (char *cmd)
       trace_dev1 = DEV_FF;
       trace_dev2 = DEV_FF;
     } else {
-      if (p3000_debug & p3000_orig_trace_dev1 == -1) {
+      if (p3000_debug && p3000_orig_trace_dev1 == -1) {
         p3000_orig_trace_dev1 = trace_dev1;
         p3000_orig_trace_dev2 = trace_dev2;
       }
@@ -8606,13 +8756,13 @@ static bool handle_serial_commands (char *cmd)
       have_ichallenge = true;
     }
 #endif  /* SSSWI_HACKING */
-  } else if (match_word("ssaa_recentre", &cmd, false)) {
+  } else if (match_word(ssaa_recentre, &cmd, false)) {
     char *endp = NULL;
     ulong profile = strtoul(cmd, &endp, 10);
     if (profile > 2 || (!*cmd || *endp)) {
       SERIAL_PRINTF("%s: expected profile number 0-2\r\n", ssaa_recentre);
     } else {
-      SERIAL_PRINTF("%s: Setting centre point for profile %u to 640,480\r\n", ssaa_recentre, profile);
+      SERIAL_PRINTF("%s: Setting centre point for profile %lu to 640,480\r\n", ssaa_recentre, profile);
       AUXBUS_SEND_MSG(DEV_ESP32, DEV_SSAA, SSAA_SET_PROFILE, (byte)640,(640>>8), 0x00,0x00,(byte)480, (480>>8), 0x00,0x00, (byte)profile);
     }
   } else if (cmd[1] != 0) {
@@ -8644,6 +8794,7 @@ static bool handle_serial_commands (char *cmd)
   } else if (b == 'i') {
     ignore_mc_get_pos = !ignore_mc_get_pos;
     SERIAL_PRINTF("ignore_mc_get_pos=%u\r\n", ignore_mc_get_pos);
+#if MUSB_ENABLED
   } else if (b == 'm') {
     musb_debug = !musb_debug;
     SERIAL_PRINTF("musb_debug=%u\r\n", musb_debug);
@@ -8651,6 +8802,7 @@ static bool handle_serial_commands (char *cmd)
     musb_timestamps = !musb_timestamps;
     musb_debug = musb_timestamps;
     SERIAL_PRINTF("musb_timestamps=%u\r\n", musb_debug);
+#endif /* MUSB_ENABLED */
 #if NCHUCK_ENABLED
   } else if (b == 'n') {
     nchuck_debug = !nchuck_debug;
@@ -8677,7 +8829,7 @@ static bool handle_serial_commands (char *cmd)
     bt_debug = !bt_debug;
     SERIAL_PRINTF("bt_debug=%u\r\n", bt_debug);
   } else if (b == 'v') {
-    if (p3000_debug & p3000_orig_verbose == -1)
+    if (p3000_debug && p3000_orig_verbose == -1)
       p3000_orig_verbose = verbose;
     verbose = !verbose;
     SERIAL_PRINTF("verbose=%u\r\n", verbose);
@@ -8715,7 +8867,7 @@ static void send_ascii_passthru (char *cmd)
   }
   txq_assert_busyout(txq);
   txq->uart->println(cmd);
-  txq->uart->flush(true);                 // flush tx only
+  txq->uart->flush(FLUSH_TXONLY);
   txq_deassert_busyout(txq);
 }
 
@@ -8741,7 +8893,7 @@ static void serial_loop (void)
     }
     if (c != '\n')
       SERIAL_PRINT(c);  // echo-back
-    if (cx == 0 && c == ' ' || c == '\t')
+    if (cx == 0 && (c == ' ' || c == '\t'))
       continue;
     if (c != '\r' && c != '\n') {
       if (cx < (sizeof(cmd) - 2))
@@ -8751,10 +8903,8 @@ static void serial_loop (void)
     if (cx) {
       cmd[cx] = '\0';
       cx = 0;
-      if (c != '\n') {
-        SERIAL_PRINT('\n');
-        SERIAL_FLUSH(true);
-      }
+      SERIAL_PRINT('\n');
+      SERIAL_FLUSH();
       if (aux_ascii_passthru) {
         send_ascii_passthru(cmd);
         char *cmdp = cmd;
@@ -8767,7 +8917,7 @@ static void serial_loop (void)
         send_ascii_passthru(cmd);
       } else {
         if (handle_p3000_commands(cmd, SERIAL_WRITE) || handle_serial_commands(cmd)) {
-          SERIAL_FLUSH(true);
+          SERIAL_FLUSH();
           return;
         }
         SERIAL_PRINTLN("Huh?");
@@ -8810,7 +8960,9 @@ static const char *get_connection_type (void)
 {
   const char *connection;
        if (bt_connected)      connection = "BT";
+#if MUSB_ENABLED
   else if (musb_connected)    connection = "USB";
+#endif
   else if (w2000.connected()) connection = "WiFi";
 #if ETHERNET_ENABLED
   else if (ethernet_detected && e2000.connected())
@@ -8874,10 +9026,12 @@ static void status_command (void (*writep)(const char *))
     sprintf(tmp, "Mode: Bluetooth %s, SSID: %s; ", (bt_protocol == bt_protocol_aux) ? "AUX" : "USB", hbg3_ssid);
     writep(tmp);
   }
+#if MUSB_ENABLED
   if (connection[0] == 'U') {
-    sprintf(tmp, "Mode: USB %lu; ", (musb_uart->baudRate() / 10) * 10); // show 115201 as 115200.
+    sprintf(tmp, "Mode: USB %lu; ", musb_baud);
     writep(tmp);
   }
+#endif /* MUSB_ENABLED */
   if (esp32_wifi_off) {
     writep((musb_selected && musb_rfkill) ? "Wireless is off\r\n" : "WiFi is off\r\n");
   } else {
@@ -8895,15 +9049,13 @@ static void status_command (void (*writep)(const char *))
     writep(tmp);
   }
 #endif  /* TXQ_MONITOR_SIZE */
-#if NTP_ENABLED
+#if EMULATE_GPS && NTP_ENABLED
   SERIAL_PRINTF("gps_has_saved_location=%u fix_type=%u gps_get_lat_lng=%u\r\n", gps_has_saved_location(), gps_get_fix_type(), gps_get_lat_lng(false, NULL, NULL));
   if (ntp_time_is_valid)
     SERIAL_PRINTF("NTP Time: %02u/%02u/%04u UTC %02u:%02u:%02u\r\n", ntp_time.day, ntp_time.month, ntp_time.year, ntp_time.hh, ntp_time.mm, ntp_time.ss);
   else
     SERIAL_PRINTLN("NTP Time: not available yet");
-#else
-    SERIAL_PRINTLN("NTP Time: not included");
-#endif /* NTP_ENABLED */
+#endif /* EMULATE_GPS && NTP_ENABLED */
 }
 
 static char help_p3000_commands[] =
@@ -8931,7 +9083,7 @@ static char help_p3000_commands[] =
 static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
 {
   static bool wlan_ssid_passkey_updated = false;
-  auxtest_remaining = 0;  // cancel the automatic tests
+  auxtest_remaining = auxtest_waiting = 0;  // cancel the automatic tests
   if (!p3000_debug && writep != SERIAL_WRITE)
     SERIAL_PRINTF("p3000: %s\r\n", cmd);
   if (!*cmd) {
@@ -9001,8 +9153,8 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
         char tmp[128];
         const char *ssid = nvram_get_val("wlan.ssid");
         uint8_t bssid[6] = {0,0,0,0,0,0}, *b = bssid;
-        if (wifi_client_mode && WiFi.isConnected())
-          b = WiFi.BSSID();
+        if (wifi_client_mode && WiFi.status() == WL_CONNECTED)
+          b = WIFI_GET_BSSID();
         sprintf(tmp, "state: %s\r\nSSID: %s\r\nBSSID: %02x:%02x:%02x:%02x:%02x:%02x\r\nchannel: 0\r\ndatarate: 0\r\n",
                 wifi_client_mode ? "up" : "down", ssid, b[0], b[1], b[2], b[3], b[4], b[5]);
         writep(tmp);
@@ -9103,6 +9255,7 @@ static void poll_for_new_w3000_connection (void)
 {
   w3000 = W3000.available();
   if (w3000 && w3000.connected()) {
+    LWIP_SET_NONBLOCK(w3000, _sock);
     (void)p3000_decoder(0, NULL, NULL); // reset the decoder
     w3000.write("> ");
   }
@@ -9134,13 +9287,9 @@ static void poll_for_new_w2000_connection (void)
   else
     w2000 = W2000.available();
   if (w2000.connected()) {
+    LWIP_SET_NONBLOCK(w2000, _sock);
     p2000_timeout = P2000_NORMAL_TIMEOUT;
     init_rxbuf(&w2000_rxbuf, "w2000");
-    /* Enable KEEPALIVE messages */
-    int flags = 1;
-    w2000.setSocketOption(SO_KEEPALIVE, (char *)&flags, sizeof(flags));  // boolean, turns on keepalives
-    flags = 3000;
-    w2000.setOption(TCP_KEEPALIVE, &flags);  // set keepalives to 3000msecs interval
     next_bcast = next_msg = 0;
   } else if (bt_connected) {
     next_bcast = next_msg = 0;
@@ -9148,8 +9297,7 @@ static void poll_for_new_w2000_connection (void)
     // The apps look for these advertisement broadcasts:
     if (!next_bcast || time_after(millis(), next_bcast)) {
       next_bcast = get_timeout(1000);
-      static AsyncUDP udp_bcast;
-      udp_bcast.broadcastTo((uint8_t *)advertisement, strlen(advertisement), (uint16_t)55555);
+      udp_do_broadcast(advertisement);
     }
   }
 }
@@ -9162,14 +9310,19 @@ static void w2000_loop (void)
 
   if (!wifi_port_is_connected(w2000, &connected, poll_for_new_w2000_connection, "w2000")) {
     w2000_timeout = 0;
+    SET_RED_LED(1);
   } else {
+    if (old_connected != connected)
+      SET_RED_LED(8);
     if (w2000.available()) {
+      SET_RED_LED(1023);
       do {
         byte b = w2000.read();
         if (auxbus_raw_tracing && !aux_only_tracing)
           SERIAL_PRINTF("w2: %02x\r\n", b);
         (void)packet_decoder(&w2000_rxbuf, b);
       } while (w2000.available());
+      SET_RED_LED(0);
       w2000_timeout = 0;
     } else if (!w2000_timeout) {
       w2000_timeout = get_timeout(wifi_relay_mode ? (5 * 1000) : p2000_timeout);
@@ -9190,7 +9343,7 @@ static void auxtest_loop (void)
   if (!auxtest_timer) {
     if (auxtest_remaining > 0) {
       if (millis() > 15000)
-        auxtest_remaining = 0;
+        auxtest_remaining = auxtest_waiting = 0;
       else
         auxtest_timer = get_timeout(1000);
     }
@@ -9222,7 +9375,9 @@ static void non_wifi_loop (void)
     bt_aux_loop();
   if (auxrelay_detected)
     bus_loop(&auxrelay);
+#if MUSB_ENABLED
   musb_loop();
+#endif
 #if EMULATE_MOUNT
   if (EMULATING_MOUNT) {
     mc_loop(&mc_azm);
@@ -9248,51 +9403,45 @@ static void non_wifi_loop (void)
 #ifdef BT_USB_H
   bt_usb_loop();
 #endif
+  BT_SEND();
 #if ETHERNET_ENABLED
   if (ethernet_detected)
     ethernet_loop();
 #endif
+#if MUSB_ENABLED
   monitor_musb_switch();
+#endif /* MUSB_ENABLED */
   if (esp32_reset_pending && time_after(millis(), esp32_reset_pending))
-    ESP.restart();
+    do_system_reset();
 }
 
 void loop (void)
 {
-#if NTP_ENABLED
+#if EMULATE_GPS && NTP_ENABLED
   if (wifi_client_mode && !wifi_client_mode_override)
     ntp_loop();
-#endif /* NTP_ENABLED */
+#endif /* EMULATE_GPS && NTP_ENABLED */
   non_wifi_loop();
   manage_wifi_onoff();
   w2000_loop();
   w3000_loop();
 }
 
-static void detect_simple_mode (void)
-{
-#ifndef AIO_H
-  /*
-   * Simple mode is selected with a 50K-pulldown and 100K-pullup on the ESP32_WIFI_MODE_PIN (no switch wired).
-   * Normally this would read 2200+ with nothing, or 0 (zero) when a switch is activated.
-   * With the resistors and no switch, it reads around 1280, give or take.
-   */
-  int val = analogRead(ESP32_WIFI_MODE_PIN);
-  //SERIAL_PRINTF("%s: analogRead(ESP32_WIFI_MODE_PIN): %d\r\n", __func__, val);
-  simple_mode = (val > 1000 && val < 1400);
-#endif
-}
-
 void setup (void)
 {
   // Get the buses configured first:
-                      bus_init(&auxbus,   false, "auxbus", &auxbus_uart,   AUXBUS_RX_PIN,   AUXBUS_TX_PIN,   AUXBUS_BUSYIN_PIN,   AUXBUS_BUSYOUT_PIN);
+  bus_init(&auxbus, false, "auxbus", &auxbus_uart, AUXBUS_RX_PIN, AUXBUS_TX_PIN, AUXBUS_BUSYIN_PIN, AUXBUS_BUSYOUT_PIN);
+#if ! REALTEK_BW16
   auxrelay_detected = bus_init(&auxrelay, true,  "relay",  &auxrelay_uart, AUXRELAY_RX_PIN, AUXRELAY_TX_PIN, AUXRELAY_BUSYIN_PIN, AUXRELAY_BUSYOUT_PIN);
+#endif /* REALTEK_BW16 */
   DEV_ESP32 = auxrelay_detected ? DEV_RELAY : DEV_HBG3;
   hbg3_version[0] = auxrelay_detected ? 'r' : 'v';
 
   Wire.begin();            // Prepare the I2C bus for use.  Needed early for OLED and AIO, then for FRAM and NCHUCK.
+#if ! REALTEK_BW16
   Wire.setTimeOut(500);    // This supposedly helps mitigate I2C vs. WiFi issues
+  hwserial0->end();
+#endif
 #if OLED_ENABLED
   oled_setup();
 #endif
@@ -9305,12 +9454,11 @@ void setup (void)
     pinMode(MUSB_SELECT_PIN, INPUT_PULLUP);
     delay(5);
   }
-  hwserial0->end();
-  musb_selected = musb_switch_is_on = (READ_MUSB_SELECT_PIN() == LOW);
-  if (!musb_selected) {
-    musb_uart   = NULL;
-    SerialDebug = hwserial0;
-  } else {
+  SerialDebug = hwserial0;
+#if MUSB_ENABLED
+  musb_uart   = NULL;
+  musb_selected = musb_switch_is_on = READ_MUSB_SELECT_PIN();
+  if (musb_selected) {
     if (EMULATE_GPS || auxrelay_detected) {
       SerialDebug = NULL;
       musb_uart   = hwserial0;
@@ -9323,20 +9471,35 @@ void setup (void)
     musb_uart->setDebugOutput(false);  // Try and prevent ESP32 system debug messages after boot
     musb_uart->flush(false);
   }
+#endif /* MUSB_ENABLED */
+#define SERIAL_DEBUG_BAUD 115200
   if (SerialDebug) {
-    #define SERIAL_DEBUG_BAUD 115200
+#if REALTEK_BW16
+    SerialDebug->begin(SERIAL_DEBUG_BAUD);
+#else
     SerialDebug->begin(SERIAL_DEBUG_BAUD, SERIAL_8N1, USB_RX_PIN, USB_TX_PIN); // The USB pins are the main debug/command port:
     SerialDebug->flush(false);
+#endif /*REALTEK_BW16 */
   }
+  SERIAL_PRINTF("Test1 '%4s' '%-4s' '%-4u' '%4u' '%-04u' '%04u'\r\n", "x", "y", 12, 34, 56, 78);
 
-  detect_simple_mode();
   if (ESP32_WIFI_MODE_PIN != -1)
     pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
 
   pinMode(BLUE_LED_PIN, OUTPUT);
   set_blue_led(LED_ON);
-  WiFi.macAddress(wifi_mac_addr);       // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore().
-  nvram_restore();                      // Also calls oled_setup() again if non-default oled_type
+  #ifdef RED_LED_PIN
+    pinMode(RED_LED_PIN, OUTPUT);
+    SET_RED_LED(1);
+  #endif /* RED_LED_PIN */
+#if REALTEK_BW16
+  WiFi.status();                        // forces WiFi object to be initialized, so that we can read the MAC address
+#else
+  WiFi.persistent(false);
+#endif
+  WiFi.macAddress(wifi_mac_addr);       // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore_settings().
+  nvram_read_from_storage();
+  nvram_restore_settings();             // Also calls oled_setup() again if non-default oled_type
   set_blue_led(LED_OFF);
 
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u ETH=%s\r\n",
@@ -9374,27 +9537,31 @@ void setup (void)
   dew_setup();  // MUST come after stepper_setup() and ethernet_setup(), to resolve pin conflicts.
 #endif
   bt_setup();
-  WiFi.persistent(false);
-  if (!simple_mode && is_wifi_client_mode_requested()) {
+#if !REALTEK_BW16
+  if (is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
     wifi_begin_server_mode();
     delay(50);
     esp32_wifi_off = false;
     set_esp32_wifi_off(true);
   }
+#endif /* !REALTEK_BW16 */
 #if EMULATE_MOUNT
   if (EMULATING_MOUNT)
     mc_init();
 #endif  /* EMULATE_MOUNT */
 #if NCHUCK_ENABLED
-  if (simple_mode) {
-    auxtest_remaining = 0;
-    nchuck_focus_only = ('0' != *nvram_get_val("focus.only"));  // default to focus-only mode
-    SERIAL_PRINTF("\r\nSimple mode selected: disabling WiFi+BT+auxtest; focus_only=%u\r\n", nchuck_focus_only);
-  } else {
-    nchuck_focus_only = ('1' == *nvram_get_val("focus.only"));  // default to focus+slew mode
-  }
+  nchuck_focus_only = ('1' == *nvram_get_val("focus.only"));  // default to focus+slew mode
   if (nchuck_focus_only)
     fm_request_position(__func__, false);
 #endif
+  if (0) { // Keep compiler happy
+    double d = nvram_get_float(NULL);
+    nvram_save_float(NULL, d);
+    nvram_save_int(NULL, 0);
+    nvram_get_nonblank_val(NULL, NULL);
+    emulate_send_reply(NULL, NULL, NULL, 0);
+    long_to_4bytes(NULL, 0);
+    put_24bit_value(0, NULL);
+  }
 }
