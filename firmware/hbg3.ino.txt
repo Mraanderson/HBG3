@@ -3,14 +3,15 @@
  *
  * Copyright(c) 2020-2024 by Mark Lord <mlord@pobox.com>.
  * This code is free for personal use/modification/whatever.
+ * It is explicitly forbidden to upload any code from this project to GitHub.
  *
  * This is a versatile add-on for the Celestron AUX bus.
  * Basic functionality includes WiFi, Bluetooth, and USB connectivity.
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.56"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-08-11"
+#define VERSION "v8.58"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-10-12"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -36,6 +37,17 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.58 2024-10-12
+ *  -- Fixed missing "wlan.channel" variable on ESP32/HBG3/AIO.
+ * Version 8.57 2024-10-12
+ *  -- Scan for least-busy channel for WiFi (ESP32).
+ *  -- Show wifi channel number on OLED.
+ *  -- Fixed test_auxbus command.
+ *  -- Fixed auxbus.stopbits=2.
+ *  -- Nunchuck handling changed.
+ *  -- BW16 I2C gets stuck when Nunchuck is hot-unplugged; worked around it, but might still happen.
+ *  -- Tweaks for newer version of RTL8720/BW16 module with different connections to HBG3 PCB.
+ *  -- Cosmetic GPS code tweaks to keep newer compilers happy.
  * Version 8.56 2024-08-11
  *  -- Add config flags to completely include/exclude FRAM and I2C code.
  *  -- Tweaks to print_packet().
@@ -148,9 +160,6 @@
 #define USB_RX_PIN                3     // Internal pad; no associated pin
 #define USB_TX_PIN                1     // Internal pad; no associated pin
 
-#define LED_ON                   HIGH  // Some boards want LOW here; 30-pin DevKit-v1 wants HIGH.
-#define LED_OFF                  (((LED_ON) == HIGH) ? LOW : HIGH)  // Do NOT edit tihs line
-
 #define AUXRELAY_RX_PIN           34    // from AUX relay bus RX pin
 #define AUXRELAY_TX_PIN           14    // to   AUX relay bus TX pin
 #define AUXRELAY_BUSYIN_PIN       26    // from AUX relay bus BUSY pin (could be same pin as BUSYOUT on older hardware)
@@ -198,12 +207,18 @@ static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
 #ifdef _VARIANT_ARDUINO_AMEBA_
   #define REALTEK_BW16 true
   #include "realtek_bw16.h" // first pass of this file defines PINs and options etc.
+#else
+  #define REALTEK_BW16 false
+#endif
+
+#ifndef LED_ON
+#define LED_ON  (HIGH)  // Some boards want LOW here; 30-pin DevKit-v1 wants HIGH.
+#define LED_OFF (((LED_ON) == HIGH) ? LOW : HIGH)  // Do NOT edit tihs line
 #endif
 
 #define I2C_ENABLED (FRAM_ENABLED | NCHUCK_ENABLED | OLED_ENABLED | EMULATE_DEW)
 
-#ifndef _VARIANT_ARDUINO_AMEBA_
-  #define REALTEK_BW16 false
+#if !REALTEK_BW16
   #include <WiFi.h>
   #include <lwip/sockets.h>
   #include <WiFiClient.h>
@@ -220,11 +235,6 @@ static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
     static AsyncUDP udp_bcast;
     udp_bcast.broadcastTo((uint8_t *)advertisement, strlen(advertisement), (uint16_t)55555);
   }
-
-  enum {BT_LED_OFF = 0, BT_LED_SESSION = 0, BT_LED_IDLE = 0, BT_LED_ACTIVE = 0};
-  enum {WIFI_LED_OFF = 0, WIFI_LED_IDLE = 0, WIFI_LED_ACTIVE = 0};
-  static void inline SET_BT_LED   (unsigned int level) {}  // Nothing on ESP32; actual LED on REALTEK_BW16
-  static void inline SET_WIFI_LED (unsigned int level) {}  // Nothing on ESP32; actual LED on REALTEK_BW16
 
   static inline void DUMMY_BEGIN (void) {}
   static inline void DUMMY_END   (void) {}
@@ -259,7 +269,7 @@ static char hbg3_ssid[NVRAM_VALS_MAX_LEN + 16] = {0,};
   #define e3000_printf    e3000.printf
   #define FLUSH_TXONLY true
 
-#endif /* REALTEK_BW16 */
+#endif /* !REALTEK_BW16 */
 
 #if OTA_ENABLED
 static char ota_update_server[NVRAM_VALS_MAX_LEN + 1] = "rtr.ca";
@@ -1174,17 +1184,37 @@ static byte trace_dev2 = 0;
 // auxbus_rx: 3b 04 10 0d 50 00 8f    // AZM unsolicited data to HC
 // auxbus_rx: 3b 03 0d 10 50 90       // HC replying to AZM
 
-static bool         esp32_wifi_off = true;
+static bool         esp32_wifi_off   = true;
+static bool         wifi_is_scanning = false;
 static char         advertisement[128];
 static WiFiServer   W2000(2000);  /* Listen on port 2000 for SkyPortal connections */
 static WiFiServer   W3000(3000);  /* Listen on port 3000 for management/debug commands */
 
+static int  wlan_channel              = 0;
 static bool wifi_relay_mode           = false;  // true: AUX bus relay over WiFi
 static bool wifi_client_mode          = false;  // true=client; false=SoftAP
 static bool wifi_client_mode_override = false;  // true=client; false=whichever
 
+#ifndef NUM_WIFI_CHANNELS
+static uint8_t wifi_channels[] = {1,2,3,4,5,6,7,8,9,10,11};  // Sadly, no way to know if 12,13 are permitted locally or not
+#define NUM_WIFI_CHANNELS (sizeof(wifi_channels))
+#define DEFAULT_WIFI_CHANNEL 1
+#endif
+
+static bool wifi_is_channel_supported (int channel)
+{
+  if (channel <= 0 || channel > 0xff)
+    return false;
+  byte ch = channel;
+  for (byte i = 0; i < sizeof(wifi_channels); ++i) {
+    if (ch == wifi_channels[i])
+      return true;
+  }
+  return false;
+}
+
 // get a non-zero timeout:
-static inline long get_timeout (uint msecs)
+static inline long get_timeout (unsigned long msecs)
 {
   long timeout = millis() + msecs;
   return timeout ? timeout : 1;
@@ -1316,10 +1346,10 @@ static void txq_init (struct txq_s *txq, const char *devname, bus_uart_t *uart, 
   txq->tx_pin      = tx_pin;
   pinMode(busyin_pin, INPUT);
   if (busyout_pin == busyin_pin) {
-    pinMode(rx_pin, INPUT);           // get rid of internal pull-up for this scenario only
+    pinMode(rx_pin, INPUT);           // (esp32) get rid of internal pull-up for this scenario only
   } else {
     pinMode(busyout_pin, OUTPUT);
-    digitalWrite(busyout_pin, HIGH);  // Tri-state BUSYOUT
+    txq_deassert_busyout(txq);
   }
 }
 
@@ -1337,14 +1367,19 @@ static bool auxrelay_detected;  // Gets set when bus_init() is called from setup
 static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
 {
   bool detected = false;
-
+#if REALTEK_BW16
+  set_pin_to_gpio(rx_pin);  // Realtek/Arduino bug: pinMode() doesn't reset function back to GPIO from UART
+  set_pin_to_gpio(tx_pin);  // Realtek/Arduino bug: pinMode() doesn't reset function back to GPIO from UART
+#endif
+  pinMode(rx_pin, INPUT);
+  pinMode(tx_pin, OUTPUT);
+#if REALTEK_BW16
+  set_pull_resistor(rx_pin, true, false, false);  // true for hacked HBG3 PCB; false for unmodified
+#endif
+  pinMode(busyout_pin, OUTPUT);
+  digitalWrite(busyout_pin, LOW);
   for (byte attempts = 3; !detected && attempts--;) {
     detected = true;
-    delay(50);
-    pinMode(rx_pin, INPUT);
-    pinMode(tx_pin, OUTPUT);
-    pinMode(busyout_pin, OUTPUT);
-    digitalWrite(busyout_pin, LOW);
     byte test = 0xa5;
     while (test != 0) {
       int bit = (test & 1) ? HIGH : LOW;
@@ -1362,14 +1397,19 @@ static bool bus_detect (byte busyout_pin, byte rx_pin, byte tx_pin)
   return detected;
 }
 
-#if !REALTEK_BW16
 static void txq_uart_begin (struct txq_s *txq)
 {
   bus_uart_t *uart = txq->uart;
+  const byte stopbits = (auxbus_stopbits == 2) ? SERIAL_8N2 : SERIAL_8N1;
+#if REALTEK_BW16
+  uart->begin(19200, stopbits);
+  set_pull_resistor(txq->rx_pin,     true, false, false);  // true for hacked HBG3 PCB; false for unmodified
+  set_pull_resistor(txq->busyin_pin, true, false, false);  // true for hacked HBG3 PCB; false for unmodified
+#else
   uart->setRxBufferSize((2 * AUXBUS_PKT_MAX) + AUXBUS_SSAA_PKT_MAX);     // Large enough for SSAA packets, plus some
-  uart->begin(19200, (auxbus_stopbits == 1) ? SERIAL_8N1 : SERIAL_8N2, txq->rx_pin, txq->tx_pin);
+  uart->begin(19200, stopbits, txq->rx_pin, txq->tx_pin);
+#endif /* REALTEK_BW16 */
 }
-#endif /* !REALTEK_BW16 */
 
 // Possibly useful for debugging hardware faults:
 static void bus_test (struct bus_s *bus)
@@ -1377,29 +1417,18 @@ static void bus_test (struct bus_s *bus)
   struct txq_s *txq = bus->txq;
   bool ok = false;
 
-  // Don't attempt test on older single-BUSY designs
   if (!txq) {
     SERIAL_PRINTF("%s: not present.\r\n", bus->name);
     return;
   }
+  // Don't attempt test on older single-BUSY designs
   if (txq->busyin_pin == txq->busyout_pin) {
     SERIAL_PRINTF("%s: busyin==busyout, cannot test this.\r\n", bus->name);
     return;
   }
   txq->uart->end();
-  pinMode(txq->busyout_pin, OUTPUT);
-  digitalWrite(txq->busyout_pin, HIGH);  // not-asserted
-  pinMode(txq->busyin_pin, INPUT);
-  delay(100);
   for (byte attempt = 1; !ok && attempt < 3; ++attempt) {
-    pinMode(txq->busyout_pin, INPUT);  // tri-stated
-    delay(1); // was 10
     ok = true;
-    if (digitalRead(txq->busyin_pin) != HIGH) {
-      SERIAL_PRINTF("%s: %u: BusyIn not HIGH when BusyOut tri-stated\r\n", bus->name, attempt);
-      ok = false;
-    }
-    pinMode(txq->busyout_pin, OUTPUT);
     digitalWrite(txq->busyout_pin, LOW);  // asserted
     delay(1);
     if (digitalRead(txq->busyin_pin) != LOW) {
@@ -1413,10 +1442,11 @@ static void bus_test (struct bus_s *bus)
       ok = false;
     }
   }
-  pinMode(txq->busyout_pin, INPUT);  // tri-stated
   SERIAL_PRINTF("%s: Busy  test %s\r\n", bus->name, ok ? "passed" : "failed");
   ok = bus_detect(txq->busyout_pin, txq->rx_pin, txq->tx_pin);
   SERIAL_PRINTF("%s: Tx/Rx test %s\r\n", bus->name, ok ? "passed" : "failed");
+  pinMode(txq->busyout_pin, OUTPUT);  // because bus_detect messes it up
+  txq_deassert_busyout(txq);
   txq_uart_begin(txq);
 }
 
@@ -1431,7 +1461,6 @@ static bool bus_init (struct bus_s *bus, bool do_loopback_test, const char *devn
   bus->rxbuf->bus = bus;
   bus->txq = (struct txq_s *)malloc(sizeof(struct txq_s));
   txq_init(bus->txq, devname, uart, rx_pin, tx_pin, busyin_pin, busyout_pin);
-  txq_uart_begin(bus->txq);
   return true;
 }
 
@@ -1975,7 +2004,7 @@ struct GPSDate
 {
   friend class GPSPlus;
   public:
-     GPSDate() : validTimeout(0), have_newval(0) {}
+     GPSDate() : have_newval(0), validTimeout(0) {}
      uint16_t year();
      uint8_t  month();
      uint8_t  day();
@@ -1991,7 +2020,7 @@ struct GPSTime
 {
   friend class GPSPlus;
   public:
-     GPSTime() : validTimeout(0), have_newval(0) {}
+     GPSTime() : have_newval(0), validTimeout(0) {}
      bool     getHMS(byte *dest);
      bool     is_valid() {return _gps_is_valid_(&validTimeout);}
   private:
@@ -2008,7 +2037,7 @@ struct GPSInteger
 {
    friend class GPSPlus;
 public:
-   GPSInteger() : validTimeout(0), have_newval(0) {}
+   GPSInteger() : have_newval(0), validTimeout(0) {}
    ulong    value()    {return validTimeout ? val : 0;}
    bool     is_valid() {return _gps_is_valid_(&validTimeout);}
 private:
@@ -2477,6 +2506,7 @@ static const char *GPS_UART_NAME (void) { return gps_using_swserial ? "swserial0
 
 static void GPS_UART_BEGIN (ulong speed)
 {
+  if (0) GPS_UART_WRITE(0);  // Keep compiler happy
   if (gps_using_swserial) {
     swserial0.begin(speed, SWSERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN, false, SWSERIAL_bufCapacity);
   } else {
@@ -4483,10 +4513,13 @@ static bool nchuck_blink_led = false;
 #define NCHUCK_MIDDLE_SAMPLES  (750 / NCHUCK_POLL_INTERVAL)
 #define NCHUCK_I2C_ADDR        0x52
 
-static void nchuck_request_data (void)
+static bool nchuck_still_connected (void)
 {
-  if (!nchuck_detected || (nchuck_detected = i2c_detect_device(NCHUCK_I2C_ADDR)))
-    return;
+  if (!nchuck_detected)
+    return false;
+  nchuck_detected = i2c_detect_device(NCHUCK_I2C_ADDR);
+  if (nchuck_detected)
+    return true;
   // Stop movements when Nunchuck is unplugged mid-operation:
   SERIAL_PRINTLN("Nunchuck unplugged");
   if (nchuck_blink_led) {
@@ -4502,6 +4535,7 @@ static void nchuck_request_data (void)
     nchuck_send_mc_cmd(1, DEV_ALT, 0);
   }
   nchuck_send_mc_cmd(0, DEV_FOCUS, 0);
+  return false;
 }
 
 static bool nchuck_get_data (void)
@@ -4511,14 +4545,19 @@ static bool nchuck_get_data (void)
   if (time_before(now, nextpoll))
     return false;
   nextpoll = now + NCHUCK_POLL_INTERVAL;
+  if (!nchuck_still_connected())
+    return false;
   Wire.requestFrom(NCHUCK_I2C_ADDR, sizeof(nchuck_buffer));
-  byte bytecount;
-  for (bytecount = 0; bytecount < sizeof(nchuck_buffer) && Wire.available(); bytecount++) {
+  int bytes_available = Wire.available();
+  if (bytes_available != sizeof(nchuck_buffer)) {
+    SERIAL_PRINTF("%s: xfer_count=%d/%d\r\n", __func__, bytes_available, sizeof(nchuck_buffer));
+    return false;
+  }
+  for (byte bytecount = 0; bytecount < bytes_available ; bytecount++) {
     byte b = Wire.read();
     nchuck_buffer[bytecount] = b;
   }
-  nchuck_request_data();  // for next time
-  return (bytecount == sizeof(nchuck_buffer));
+  return true;
 }
 
 static byte nchuck_cdata[16];  // Nunchuck calibration data
@@ -4676,9 +4715,7 @@ static bool nchuck_detect (bool blink_led)
     SERIAL_PRINTF("\r\n");
   }
   delay(50);
-  nchuck_request_data();
-  delay(50);
-  return nchuck_detected;
+  return nchuck_still_connected();
 }
 
 /*
@@ -6079,6 +6116,7 @@ static void gps_dddmmss (byte fix_type, char *tmp, const char *prefix, const cha
 static bool oled_gps_updatefn (byte arg)  // oled_arg_t
 {
   static const char NS[2] = {'N','S'}, EW[2] = {'E','W'};
+  arg = arg; // Keep compiler happy
   if (!gps_detected)
       return false;
   char tmp[OLED_ROW_CHARS + 1];
@@ -6201,7 +6239,7 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
     oled_set_row(3, tmp);
 #endif /* MUSB_ENABLED */
   } else if (esp32_wifi_off) {
-    oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : "WiFi is off");
+    oled_set_row(1, (musb_selected && musb_rfkill) ? "Wireless is off" : (wifi_is_scanning ? "WiFi: Scanning" : "WiFi: Off"));
 #if ETHERNET_ENABLED
     if (ethernet_detected) {
       snprintf(tmp, OLED_ROW_CHARS,   "Eth: DHCP %s", ethernet_client_mode ? "Client" : "Server");
@@ -6212,10 +6250,12 @@ static bool oled_connectstatus_updatefn (byte arg)  // oled_arg_t
 #endif /* ETHERNET_ENABLED */
      oled_clear(2);
   } else {
-    const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
+    const char *mode;
     if (WIFIRELAY_ENABLED && wifi_relay_mode)
       mode = "Relay";
-    snprintf(tmp, OLED_ROW_CHARS, "WiFi: %s%s", mode, wifi_client_mode_override ? "*" : "");
+    else
+      mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPnt" : "DirectCon";
+    snprintf(tmp, OLED_ROW_CHARS, "WiFi: %s:%u %s", mode, current_wifi_channel(), wifi_client_mode_override ? "*" : "");
     oled_set_row(1, tmp);
     snprintf(tmp, OLED_ROW_CHARS, "SSID: %s", current_ssid);
     oled_set_row(2, tmp);
@@ -6988,7 +7028,6 @@ static inline bool bt_check_connection (void)
     bt_active     = 0;
     bt_handshake  = 0;
     bt_ready      = false;
-    SET_BT_LED(connected ? BT_LED_SESSION : BT_LED_OFF);
     BT_REINIT();
     p2000_timeout = P2000_NORMAL_TIMEOUT;
     BT_SET_STATE(BT_IDLE);
@@ -6998,7 +7037,6 @@ static inline bool bt_check_connection (void)
       bt_restart();
   } else if (bt_active && time_after(millis(), bt_active)) {
     bt_active = 0;
-    SET_BT_LED(connected ? BT_LED_SESSION : BT_LED_OFF);
     if (bt_debug)
       SERIAL_PRINTLN("bt activity time-out");
   }
@@ -7071,11 +7109,9 @@ static void bt_aux_rx (void)
 static inline void bt_aux_loop (void)
 {
   if (BT_AVAILABLE()) {
-    SET_BT_LED(BT_LED_ACTIVE);
     do {
       bt_aux_rx();
     } while (BT_AVAILABLE());
-    SET_BT_LED(BT_LED_IDLE);
     bt_active = get_timeout(p2000_timeout);
     return;
   }
@@ -7106,9 +7142,7 @@ static inline void bt_aux_loop (void)
 static void w2000_tx (bool from_ssaa, byte *data, uint16_t count)
 {
   if (!esp32_wifi_off && w2000.connected()) {
-    SET_WIFI_LED(WIFI_LED_ACTIVE);
     w2000.write(data, count);
-    SET_WIFI_LED(WIFI_LED_IDLE);
     //w2000.flush();  // breaks wifi operation with CPWI
     if (TVERBOSE2(from_ssaa, data))
       print_packet("w2000_tx", NULL, data, count);
@@ -7661,6 +7695,7 @@ static char *nvram_vars[] = {
   (char *)"oled.timeout.secs",
   (char *)"emulate.mount",
   (char *)"mount.override",
+  (char *)"wlan.channel",
   NULL
 };
 
@@ -7710,6 +7745,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // oled.timeout.secs
   "",               // emulate.mount
   "",               // mount.override
+  "",               // wlan.channel
   ""                // NULL
 };
 
@@ -7966,6 +8002,9 @@ static void nvram_restore_settings (void)
 #if MUSB_ENABLED
   musb_rfkill = !nvram_get_bool("musb.rfenable");
 #endif /* MUSB_ENABLED */
+  wlan_channel = nvram_get_int("wlan.channel");
+  if (!wifi_is_channel_supported(wlan_channel))
+    wlan_channel = 0;
   suppress_lowbattery = nvram_get_bool("suppress.lowbattery");
   byte tmp = nvram_get_int("auxbus.stopbits");
   if (tmp == 1 || tmp == 2)
@@ -8089,23 +8128,23 @@ static bool IP_fromString(IPAddress ip, const char *s)
 }
 
 #if !REALTEK_BW16
-static bool wifi_config_server_mode (const char *passkey)
+static bool wifi_config_server_mode (byte channel, const char *passkey)
 {
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(hbg3_ssid, passkey);
+  WiFi.softAP(hbg3_ssid, passkey, channel);
   delay(100);  // This delay here is critical: wait for SYSTEM_EVENT_AP_START before setting IP config
   WiFi.softAPConfig(server_static_ip, server_static_ip, server_static_netmask);
   return true;
 }
 #endif /* !REALTEK_BW16 */
 
-static void wifi_begin_server_mode (void)
+static void wifi_begin_server_mode (byte channel)
 {
   SERIAL_PRINTLN(__func__);
   const char *passkey = nvram_get_val("softap.passkey");
   wifi_relay_mode = false;
   SERIAL_PRINTF("esp32_wifi ON, softAP, ssid=%s, passkey=%s\r\n", hbg3_ssid, passkey);
-  if (wifi_config_server_mode(passkey)) {
+  if (wifi_config_server_mode(channel, passkey)) {
 #if OLED_ENABLED
     set_wifi_info(hbg3_ssid, server_static_ip);
 #endif
@@ -8161,7 +8200,8 @@ static bool wifi_begin_client_mode (void)
   if (!use_dhcp)
     WiFi.config(IP, DNS, GW, NMASK);
 #if OLED_ENABLED
-  set_wifi_info(ssid, WiFi.localIP());
+  const uint8_t zeros[4] = {0,0,0,0};
+  set_wifi_info(ssid, zeros);
 #endif
   wifi_relay_mode = autodetect_wifi_relay_mode(ssid);
   long timeout = get_timeout(5 * 60 * 1000);   // 5-minute failsafe timeout
@@ -8169,8 +8209,10 @@ static bool wifi_begin_client_mode (void)
   WiFi.setMinSecurity((passkey && *passkey) ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN);
 #endif
   non_wifi_loop();
-  WiFi.begin((char *)ssid, (passkey && *passkey) ? passkey : NULL);  // REALTEK_BW16 blocks here until connected
-#if !REALTEK_BW16
+  int ret = WiFi.begin((char *)ssid, (passkey && *passkey) ? passkey : NULL);  // REALTEK_BW16 blocks here until connected
+#if REALTEK_BW16
+  SERIAL_PRINTF("%s: WiFi.begin() ret=%d\r\n", __func__, ret);
+#else
   WiFi.setAutoReconnect(true);
 #endif
   while (WiFi.status() != WL_CONNECTED) {
@@ -8206,17 +8248,129 @@ static bool is_wifi_client_mode_requested (void)
   return want_client;
 }
 
+#if REALTEK_BW16
+  static uint8_t current_wifi_channel (void)
+  {
+    extern int wifi_get_channel(int *channel);
+    if (wifi_client_mode) {
+      int ch = 0;
+      wifi_get_channel(&ch);  // this works only for client mode, not server (AP) mode
+      return ch;
+    }
+    return wlan_channel ? wlan_channel : DEFAULT_WIFI_CHANNEL;  // Fix this once scanning is implemented
+  }
+#else
+  #include <esp_wifi.h>
+  static uint8_t current_wifi_channel (void)
+  {
+    uint8_t primaryChan; 
+    wifi_second_chan_t secondChan; 
+    esp_wifi_get_channel(&primaryChan, &secondChan);
+    return primaryChan;
+  }
+#endif
+
+#if !REALTEK_BW16
+static void ch_load_incr (byte *load, byte incr)
+{
+  unsigned int new_load = *load;
+  new_load += incr;
+  *load = (new_load > 255) ? 255 : new_load;
+}
+
+// Choose least loaded WiFi channel from scan results:
+static byte esp32_choose_channel (int scan_count)
+{
+  byte ch_loads[NUM_WIFI_CHANNELS] = {0,};
+  if (scan_count == 0)
+    return DEFAULT_WIFI_CHANNEL;
+  for (int i = 0; i < scan_count; ++i) {
+    byte ch = WiFi.channel(i);
+    int32_t rssi = WiFi.RSSI(i);  // RSSI should always be a negative value here
+    SERIAL_PRINTF("WiFi scan: [%u] ch=%u rssi=%d\r\n", i, ch, rssi);
+    rssi = (rssi < 0) ? -rssi : 0;
+    if (rssi > 128)
+      rssi = 128;
+    rssi = (128 - rssi) / 2;  // bigger values indicate more load/interference
+    for (byte c = 0; c < NUM_WIFI_CHANNELS; ++c) {
+      if (ch == wifi_channels[c]) {
+        ch_load_incr(&ch_loads[c], rssi);
+        if (c > 0) {
+          ch_load_incr(&ch_loads[c - 1], rssi / 2);
+          if (c > 1) {
+            ch_load_incr(&ch_loads[c - 2], rssi / 4);
+            if (c > 2) {
+              ch_load_incr(&ch_loads[c - 3], rssi / 8);
+              if (c > 3)
+                ch_load_incr(&ch_loads[c - 4], rssi / 16);
+            }
+          }
+        }
+        if (c < (NUM_WIFI_CHANNELS - 1)) {
+          ch_load_incr(&ch_loads[c + 1], rssi / 2);
+          if (c < (NUM_WIFI_CHANNELS - 2)) {
+            ch_load_incr(&ch_loads[c + 2], rssi / 4);
+            if (c < (NUM_WIFI_CHANNELS - 3)) {
+              ch_load_incr(&ch_loads[c + 3], rssi / 8);
+              if (c < (NUM_WIFI_CHANNELS - 4))
+                ch_load_incr(&ch_loads[c + 4], rssi / 16);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (1) {
+    SERIAL_PRINTF("WiFi scan channel loads:");
+    for (byte c = 0; c < NUM_WIFI_CHANNELS; ++c)
+      SERIAL_PRINTF(" %u:%u", wifi_channels[c], ch_loads[c]);
+    SERIAL_PRINTLN();
+  }
+  byte best_c = 0, best_load = ch_loads[best_c];
+  for (byte c = 1; c < NUM_WIFI_CHANNELS; ++c) {
+    byte load = ch_loads[c];
+    if (load < best_load) {
+      best_load = load;
+      best_c = c;
+    }
+  }
+  return wifi_channels[best_c];
+}
+
+// Asynchronous channel scan, done before starting server mode:
+static int wifi_scan_for_channel (void)
+{
+  if (wlan_channel)
+    return wlan_channel;  // Return user-specified channel, rather than scanning for best channel
+  if (!wifi_is_scanning) {
+    wifi_is_scanning = true;
+    WiFi.scanNetworks(true, false, false, 400);
+    SERIAL_PRINTLN("WiFi scan started.");
+    return 0;
+  }
+  int scan_count = WiFi.scanComplete();
+  if (scan_count == WIFI_SCAN_RUNNING)
+    return 0;
+  wifi_is_scanning = false;
+  if (scan_count == WIFI_SCAN_FAILED)
+    scan_count = 0;
+  byte channel = esp32_choose_channel(scan_count);
+  WiFi.scanDelete();
+  return channel;
+}
+#endif /* !REALTEK_BW16 */
+
 static void set_esp32_wifi_off (bool want_off)
 {
   if (esp32_wifi_off == want_off)
     return;  /* all okay as-is */
-  esp32_wifi_off = want_off;
 #if EMULATE_GPS && NTP_ENABLED
   ntp_time_is_valid = 0;
 #endif /* EMULATE_GPS && NTP_ENABLED */
   W2000.end();
   W3000.end();
   if (want_off) {
+    esp32_wifi_off = true;
     wifi_relay_mode = false;
     SERIAL_PRINTLN("esp32_wifi OFF");
     if (wifi_client_mode)
@@ -8229,11 +8383,22 @@ static void set_esp32_wifi_off (bool want_off)
 #endif /* REALTEK_BW16 */
   } else {
     wifi_client_mode = is_wifi_client_mode_requested();
-    SERIAL_PRINTF("esp32_wifi ON, %s mode\r\n", wifi_client_mode ? "Client" : "Server");
-    if (wifi_client_mode)
+    if (wifi_client_mode) {
+      SERIAL_PRINTLN("esp32_wifi ON, client mode");
       wifi_client_mode = wifi_begin_client_mode();
-    if (!wifi_client_mode)
-      wifi_begin_server_mode();
+      if (wifi_client_mode)
+        esp32_wifi_off = false;
+    }
+    if (!wifi_client_mode) {
+      byte channel = wifi_scan_for_channel();
+      if (!channel)
+        return; // scan in progress
+      esp32_wifi_off = false;
+      SERIAL_PRINTLN("esp32_wifi ON, server mode");
+      wifi_begin_server_mode(channel);
+    }
+    //WiFi.printDiag(*SerialDebug);  // uncomment for extra esp32 WiFi debug info
+    SERIAL_PRINTF("wifi_channel=%d\r\n", current_wifi_channel());
     DUMMY_BEGIN();
     W3000.begin();  // Start listening for management commands
     W2000.begin();  // Start listening for application connections on wifi
@@ -8742,7 +8907,7 @@ static bool handle_serial_commands (char *cmd)
       SERIAL_PRINTF("0x%02x  %-6s   %s\r\n", devnames[i].dev, devnames[i].name, devnames[i].desc);
   } else if (match_word("test_auxbus", &cmd, true)) {
     bus_test(&auxbus);
-    if (auxrelay.txq)
+    if (auxrelay_detected)
       bus_test(&auxrelay);
   } else if (match_word("baud", &cmd, false)) {
     char *endp = NULL;
@@ -8784,7 +8949,7 @@ static bool handle_serial_commands (char *cmd)
     char *endp = NULL;
     ulong c = strtoul(cmd, &endp, 16);
     if (!*cmd || *endp) {
-      SERIAL_PRINTF("%s: expected 32-bit challenge\r\n");
+      SERIAL_PRINTF("%s: expected 32-bit challenge\r\n", ssaa_recentre);
     } else {
       ichallenge = c;
       have_ichallenge = true;
@@ -9067,12 +9232,15 @@ static void status_command (void (*writep)(const char *))
   }
 #endif /* MUSB_ENABLED */
   if (esp32_wifi_off) {
-    writep((musb_selected && musb_rfkill) ? "Wireless is off\r\n" : "WiFi is off\r\n");
+    writep((musb_selected && musb_rfkill) ? "Wireless is off" : (wifi_is_scanning ? "WiFi: Scanning" : "WiFi: Off"));
+    writep("\r\n");
   } else {
-    const char *mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPoint" : "DirectConnect";
+    const char *mode;
     if (WIFIRELAY_ENABLED && wifi_relay_mode)
       mode = "Relay";
-    sprintf(tmp, "WiFi=%s%s, SSID=%s, IP=%s\r\n", mode, wifi_client_mode_override ? "*" : "", current_ssid, current_ipaddr);
+    else
+      mode = (wifi_client_mode && !wifi_client_mode_override) ? "AccessPnt" : "DirectCon";
+    sprintf(tmp, "WiFi=%s:%u%s, SSID=%s, IP=%s\r\n", mode, current_wifi_channel(), wifi_client_mode_override ? "*" : "", current_ssid, current_ipaddr);
     writep(tmp);
   }
 #if TXQ_MONITOR_SIZE
@@ -9189,8 +9357,8 @@ static bool handle_p3000_commands (char *cmd, void (*writep)(const char *))
         uint8_t bssid[6] = {0,0,0,0,0,0}, *b = bssid;
         if (wifi_client_mode && WiFi.status() == WL_CONNECTED)
           b = WIFI_GET_BSSID();
-        sprintf(tmp, "state: %s\r\nSSID: %s\r\nBSSID: %02x:%02x:%02x:%02x:%02x:%02x\r\nchannel: 0\r\ndatarate: 0\r\n",
-                wifi_client_mode ? "up" : "down", ssid, b[0], b[1], b[2], b[3], b[4], b[5]);
+        sprintf(tmp, "state: %s\r\nSSID: %s\r\nBSSID: %02x:%02x:%02x:%02x:%02x:%02x\r\nchannel: %u\r\ndatarate: 0\r\n",
+                wifi_client_mode ? "up" : "down", ssid, b[0], b[1], b[2], b[3], b[4], b[5], current_wifi_channel());
         writep(tmp);
         return true;
       }
@@ -9342,23 +9510,17 @@ static void w2000_loop (void)
 {
   static long w2000_timeout = 0;
   static bool connected = false;
-  bool old_connected = connected;
 
   if (!wifi_port_is_connected(&w2000, &connected, poll_for_new_w2000_connection, "w2000")) {
     w2000_timeout = 0;
-    SET_WIFI_LED(WIFI_LED_OFF);
   } else {
-    if (old_connected != connected)
-      SET_WIFI_LED(WIFI_LED_IDLE);
     if (w2000.available()) {
-      SET_WIFI_LED(WIFI_LED_ACTIVE);
       do {
         byte b = w2000.read();
         if (auxbus_raw_tracing && !aux_only_tracing)
           SERIAL_PRINTF("w2: %02x\r\n", b);
         (void)packet_decoder(&w2000_rxbuf, b);
       } while (w2000.available());
-      SET_WIFI_LED(WIFI_LED_IDLE);
       w2000_timeout = 0;
     } else if (!w2000_timeout) {
       w2000_timeout = get_timeout(wifi_relay_mode ? (5 * 1000) : p2000_timeout);
@@ -9476,9 +9638,15 @@ void setup (void)
 
 #if I2C_ENABLED
   Wire.begin();            // Prepare the I2C bus for use.  Needed early for OLED and AIO, then for FRAM and NCHUCK.
-#endif
-#if ! REALTEK_BW16
+#if REALTEK_BW16
+  set_pull_resistor(PA25, false, false, false); // I2C SCL
+  set_pull_resistor(PA26, false, false, false); // I2C SDA
+#else
   Wire.setTimeOut(500);    // This supposedly helps mitigate I2C vs. WiFi issues
+#endif
+#endif /* I2C_ENABLED */
+
+#if !REALTEK_BW16
   hwserial0->end();
 #endif
 #if OLED_ENABLED
@@ -9523,15 +9691,9 @@ void setup (void)
 #endif /*REALTEK_BW16 */
   }
 
-  if (ESP32_WIFI_MODE_PIN != -1)
-    pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
-
   pinMode(BLUE_LED_PIN, OUTPUT);
   set_blue_led(LED_ON);
-  #ifdef WIFI_LED_PIN
-    pinMode(WIFI_LED_PIN, OUTPUT);
-    SET_WIFI_LED(WIFI_LED_OFF);
-  #endif /* WIFI_LED_PIN */
+
 #if REALTEK_BW16
   WiFi.status();                        // forces WiFi object to be initialized, so that we can read the MAC address
 #else
@@ -9540,6 +9702,15 @@ void setup (void)
   WiFi.macAddress(wifi_mac_addr);       // read WiFi MAC into wifi_mac_addr[6], BEFORE calling nvram_restore_settings().
   nvram_read_from_storage();
   nvram_restore_settings();             // Also calls oled_setup() again if non-default oled_type
+
+  // Start the bus UARTs here, after reading auxbus.stopbits from nvram
+  txq_uart_begin(auxbus.txq);
+  if (auxrelay_detected)
+    txq_uart_begin(auxrelay.txq);
+
+  if (ESP32_WIFI_MODE_PIN != -1)
+    pinMode(ESP32_WIFI_MODE_PIN, INPUT_PULLUP);
+
   set_blue_led(LED_OFF);
 
   SERIAL_PRINTF(HBG3_NAME "-%s: AUXRELAY=%u GPS=%u BLOCK_CFM=%u NCHUCK=%u FOCUS=%u OLED=%u DEW=%u FRAM=%u ETH=%s\r\n",
@@ -9551,7 +9722,7 @@ void setup (void)
   gps_using_swserial = musb_selected || auxrelay_detected;
   SERIAL_PRINTF("GPS uart is %s\r\n", GPS_UART_NAME());
   GPS_UART_BEGIN(9600);
-  gps.invalidate();   // Tell GPS it has no valid data
+  gps.invalidate();   // Tell GPS library it has no valid data
 #endif /* EMULATE_GPS */
   SERIAL_PRINTF("OLED %sdetected\r\n", oled_detected ? "" : "not ");
 
@@ -9580,7 +9751,7 @@ void setup (void)
 #if !REALTEK_BW16
   if (is_wifi_client_mode_requested()) {
     // Workaround for client mode not always working at start-up:
-    wifi_begin_server_mode();
+    wifi_begin_server_mode(DEFAULT_WIFI_CHANNEL);
     delay(50);
     esp32_wifi_off = false;
     set_esp32_wifi_off(true);
