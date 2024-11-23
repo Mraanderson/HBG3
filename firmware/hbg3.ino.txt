@@ -10,23 +10,11 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.58"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-10-12"
+#define VERSION "v8.60"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-10-27"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
- *  -- Or do it the hard way:
- *  -- Install Arduino Legacy IDE v1.8.xx from https://www.arduino.cc/en/software (scroll down!)
- *  -- Install ESP32 support into Arduino IDE: https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html
- *  -- First, select Board="ESP32 Dev Module".
- *  -- Now choose Partition Scheme="Minimal SPIFFS.."
- *  -- and also CPU Frequency = 160Mhz (WiFi/BT).
- *  -- Use Tools-->Manage-Libraries to install EspSoftwareSerial library.
- *  -- For EMULATE_FOCUS=true, use Tools-->Manage-Libraries to install AccelStepper library.
- *  -- For EMULATE_FOCUS=true, use Tools-->Manage-Libraries to install FastAccelStepper library.
- *  -- For OLED_ENABLED=true, install SSD1306AsciiWire library from https://github.com/greiman/SSD1306Ascii/
- *
- * Tools-->Board-->Boards_Manager: ensure the esp32 support is 2.1.x or higher, but not 3.x.x.
  *
  * For Mount-USB and Arduino IDE:
  * >>> MS-Windows Driver installation is required for the onboard CP210x USB-Serial chip:
@@ -37,6 +25,11 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.60 2024-10-27
+ *  -- Revert Nunchuck changes from v8.57: not compatible with some older Nunchucks.
+ * Version 8.59 2024-10-20
+ *  -- Fix reading of switches on All-In-One (AIO). Was broken for a while.
+ *  -- Make it easier to test with a slower I2C clock using I2C_MAX_CLOCK macro.
  * Version 8.58 2024-10-12
  *  -- Fixed missing "wlan.channel" variable on ESP32/HBG3/AIO.
  * Version 8.57 2024-10-12
@@ -280,6 +273,7 @@ static bool ota_ignore_version = false;
 #endif /* OTA_ENABLED */
 
 #include <Wire.h>
+#define I2C_MAX_CLOCK  (800000ul)   // Normally 800000ul; try 400000ul if having OLED issues
 
 #define P2000_NORMAL_TIMEOUT        ( 4 * 1000)    // Close port 2000 connection when idle this long.
 #define P2000_SSAA_CAPTURE_TIMEOUT  (20 * 1000)    // Longer timeout needed during SSAA capture operations.
@@ -4513,13 +4507,10 @@ static bool nchuck_blink_led = false;
 #define NCHUCK_MIDDLE_SAMPLES  (750 / NCHUCK_POLL_INTERVAL)
 #define NCHUCK_I2C_ADDR        0x52
 
-static bool nchuck_still_connected (void)
+static void nchuck_request_data (void)
 {
-  if (!nchuck_detected)
-    return false;
-  nchuck_detected = i2c_detect_device(NCHUCK_I2C_ADDR);
-  if (nchuck_detected)
-    return true;
+  if (!nchuck_detected || (nchuck_detected = i2c_detect_device(NCHUCK_I2C_ADDR)))
+    return;
   // Stop movements when Nunchuck is unplugged mid-operation:
   SERIAL_PRINTLN("Nunchuck unplugged");
   if (nchuck_blink_led) {
@@ -4535,7 +4526,6 @@ static bool nchuck_still_connected (void)
     nchuck_send_mc_cmd(1, DEV_ALT, 0);
   }
   nchuck_send_mc_cmd(0, DEV_FOCUS, 0);
-  return false;
 }
 
 static bool nchuck_get_data (void)
@@ -4545,19 +4535,14 @@ static bool nchuck_get_data (void)
   if (time_before(now, nextpoll))
     return false;
   nextpoll = now + NCHUCK_POLL_INTERVAL;
-  if (!nchuck_still_connected())
-    return false;
   Wire.requestFrom(NCHUCK_I2C_ADDR, sizeof(nchuck_buffer));
-  int bytes_available = Wire.available();
-  if (bytes_available != sizeof(nchuck_buffer)) {
-    SERIAL_PRINTF("%s: xfer_count=%d/%d\r\n", __func__, bytes_available, sizeof(nchuck_buffer));
-    return false;
-  }
-  for (byte bytecount = 0; bytecount < bytes_available ; bytecount++) {
+  byte bytecount;
+  for (bytecount = 0; bytecount < sizeof(nchuck_buffer) && Wire.available(); bytecount++) {
     byte b = Wire.read();
     nchuck_buffer[bytecount] = b;
   }
-  return true;
+  nchuck_request_data();  // for next time
+  return (bytecount == sizeof(nchuck_buffer));
 }
 
 static byte nchuck_cdata[16];  // Nunchuck calibration data
@@ -4715,7 +4700,9 @@ static bool nchuck_detect (bool blink_led)
     SERIAL_PRINTF("\r\n");
   }
   delay(50);
-  return nchuck_still_connected();
+  nchuck_request_data();
+  delay(50);
+  return nchuck_detected;
 }
 
 /*
@@ -5459,7 +5446,7 @@ static bool ads1115_detected = false;
 
 static void ads1115_setup (void)
 {
-  Wire.setClock(800000ul);
+  Wire.setClock(I2C_MAX_CLOCK);
   Wire.beginTransmission(ADS1115_I2C_ADDR);
   ads1115_detected = (Wire.endTransmission() == 0);
   SERIAL_PRINTF("ADS1115 %sfound!\r\n", ads1115_detected ? "" : "not ");
@@ -5700,7 +5687,7 @@ static void dew_loop (void)
     return;
   }
   if (ads1115_detected) {
-    Wire.setClock(800000ul);
+    Wire.setClock(I2C_MAX_CLOCK);
     ads1115_read_dew_input_voltage();
   }
   if (OLED_ENABLED) {
@@ -6341,7 +6328,7 @@ static const byte QRcode_image[] = {
 
 static void oled_cmd (uint8_t command)
 {
-  Wire.setClock(800000ul);
+  Wire.setClock(I2C_MAX_CLOCK);
   Wire.beginTransmission(OLED_I2C_ADDR);
   Wire.write(0x00);        // Select "Command" mode
   Wire.write(command);     // The actual command byte
@@ -6360,7 +6347,7 @@ static void oled_send_image (const byte *image, unsigned int image_size)
   oled_cmd(0x00);     //  Low:    0
   oled_cmd(0x07);     //  High:   7
   const byte burst_size = 32;
-  Wire.setClock(800000ul);
+  Wire.setClock(I2C_MAX_CLOCK);
   for (byte burst = 0; burst < (image_size / burst_size); burst++) {
     Wire.beginTransmission(OLED_I2C_ADDR);
     Wire.write(0x40);      // Select "Data" mode
