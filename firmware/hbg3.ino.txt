@@ -10,8 +10,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.60"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-10-27"
+#define VERSION "v8.61"               /* MUST begin with 'v' */
+#define VERSION_DATE "2024-10-28"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -25,6 +25,9 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.61 2024-10-28
+ *  -- OLED: Speed up first redraw after splash screen.
+ *  -- OLED: Don't show "WiFi: Off" while actually connecting to an Access Point.
  * Version 8.60 2024-10-27
  *  -- Revert Nunchuck changes from v8.57: not compatible with some older Nunchucks.
  * Version 8.59 2024-10-20
@@ -6460,7 +6463,7 @@ static void oled_setup (void)
     oled.setFont((oled_type->lcdHeight == 32) ? System5x7 : HomeBrew5x14_font);
 
     // Show splash screen briefly at start-up:
-    oled_splash_timer = get_timeout(1300);
+    oled_splash_timer = get_timeout(1200);
     oled_QRcode_updatefn(oled_firstcall);
   }
 }
@@ -6472,6 +6475,7 @@ static void oled_loop (void)
   static byte oled_row_num = 0;
   static long button_low, button_debounce = 0, next_update = 0;
   static int button = HIGH;
+  bool was_splash = false;
 
   if (!oled_detected)
     return;
@@ -6480,6 +6484,7 @@ static void oled_loop (void)
       return;
     oled_splash_timer = 0;
     oled.clear();
+    was_splash = true;
   }
 
   bool autoblank = oled_timeout_secs && !button_debounce;
@@ -6545,13 +6550,17 @@ static void oled_loop (void)
     if (arg == oled_firstcall)
       arg = oled_normal;
 
-    // Update the physical OLED display, but only one row at a time, so as not to unduly hog the CPU:
-    byte first_row = oled_row_num;
-    bool wrote;
-    do {
-      wrote = oled_write_row(oled_row_num);
-      oled_row_num = (oled_row_num + 1) % 4;
-    } while (!wrote && oled_row_num != first_row);
+    if (was_splash) {
+      oled_refresh_all();
+    } else {
+      // Update the physical OLED display, but only one row at a time, so as not to unduly hog the CPU:
+      byte first_row = oled_row_num;
+      bool wrote;
+      do {
+        wrote = oled_write_row(oled_row_num);
+        oled_row_num = (oled_row_num + 1) % 4;
+      } while (!wrote && oled_row_num != first_row);
+    }
   }
   next_update = get_timeout(35);  // Could be faster, perhaps?
 }
@@ -8371,10 +8380,11 @@ static void set_esp32_wifi_off (bool want_off)
   } else {
     wifi_client_mode = is_wifi_client_mode_requested();
     if (wifi_client_mode) {
+      esp32_wifi_off = false;
       SERIAL_PRINTLN("esp32_wifi ON, client mode");
       wifi_client_mode = wifi_begin_client_mode();
-      if (wifi_client_mode)
-        esp32_wifi_off = false;
+      if (!wifi_client_mode)
+        esp32_wifi_off = true;
     }
     if (!wifi_client_mode) {
       byte channel = wifi_scan_for_channel();
