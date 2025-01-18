@@ -10,8 +10,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.61"               /* MUST begin with 'v' */
-#define VERSION_DATE "2024-10-28"
+#define VERSION "v8.63"               /* MUST begin with 'v' */
+#define VERSION_DATE "2025-01-03"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -25,6 +25,12 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.63 2025-01-03
+ *  -- i2c_detect_device: Increase FRAM detection interval to 50ms based on report by user "masi".
+ * Version 8.62 2024-11-26
+ *  -- Ensure OLED is ON for ota_update command.
+ *  -- Decode model name for Evolution mounts with ancient firmware (7.11.6165).
+ *  -- SSAA: treat padding byte values other than 0x02 as "NO padding".
  * Version 8.61 2024-10-28
  *  -- OLED: Speed up first redraw after splash screen.
  *  -- OLED: Don't show "WiFi: Off" while actually connecting to an Access Point.
@@ -494,7 +500,8 @@ static inline bool is_evo_mount_dev (byte dev)
   return dev == DEV_AZM || dev == DEV_ALT || dev == DEV_BATT || dev == DEV_PWRCHG || dev == DEV_LEDS || dev == DEV_EVWIFI || dev == DEV_UART;
 }
 
-#define EVOLUTION_MODEL  0x1687
+#define EVOLUTION_MODEL       0x1687
+#define EVOOLDFW_MODEL        0x1685
 static uint16_t mount_model = 0x0000;
 
 static byte DEV_ESP32;  // Either DEV_HBG3 or DEV_RELAY or DEV_HBDB, from setup()
@@ -962,6 +969,7 @@ static const char *get_model_decoder (byte *data)
       case 0x1788: desc = "CGX";               break;
       case 0x1d8a: desc = "Origin";            break;
       case EVOLUTION_MODEL: desc = "Evolution";break;
+      case EVOOLDFW_MODEL : desc = "EvoOldFW" ;break;
       default: {
         switch (model >> 8) {
           case 0x05: desc = "CGE";             break;
@@ -3400,7 +3408,7 @@ start_again:
   byte     csum = 0, *p = pkt;
   ulong    len  = total_stars * sizeof(struct star_s);  // 8-bytes per star
 
-  while ((len & 0xff00) == 0x3b00) { // 0x3b not permitted in length field, so make it longer with extra zeroes at the end
+  while ((len & 0xff00) == 0x3b00) { // 0x3b not permitted in length field, so make pkt longer with extra zeroes at the end
     len += sizeof(struct star_s);
     zero_stars++;
   }
@@ -3414,7 +3422,7 @@ start_again:
       else
         goto start_again;
       len -= sizeof(struct star_s);
-    } while ((len & 0xff00) == 0x3b00); // 0x3b not permitted in length field, so make it longer with extra zeroes at the end
+    } while ((len & 0xff00) == 0x3b00); // 0x3b not permitted in length field, so make pkt longer with extra zeroes at the end
     total_stars = real_stars + zero_stars;
   }
   *p++  = 0x3c;       // Protocol identifier
@@ -3588,7 +3596,8 @@ static void ssaa_handle_request (struct rxbuf_s *rxbuf, byte *data)
 /************************** End   SSAA StarSense Auto Align Accessory/Camera Simulator *****************/
 
 #if I2C_ENABLED
-#define FRAM_I2C_ADDR       0x50
+#define FRAM_I2C_ADDR          0x50
+#define NCHUCK_I2C_ADDR        0x52
 
 static bool i2c_detect_device (byte addr)
 {
@@ -3596,10 +3605,11 @@ static bool i2c_detect_device (byte addr)
   Wire.beginTransmission(addr);
 #if FRAM_ENABLED
   if (addr == FRAM_I2C_ADDR)
-    delay(40);         // Some FRAM chips need at least 37msecs of delay here.
+    delay(50);         // Some FRAM chips need more than 40msecs of delay here.
   else
 #endif
-    Wire.write(0x00);  // Some models of Nunchuck require this here for successful detection.
+  //if (addr == NCHUCK_I2C_ADDR)  //FIXME test this!
+  Wire.write(0x00);  // Some models of Nunchuck require this here for successful detection.
   return (Wire.endTransmission() == 0);
 }
 #endif  /* I2C_ENABLED */
@@ -4508,7 +4518,6 @@ static bool nchuck_blink_led = false;
 
 #define NCHUCK_POLL_INTERVAL   25 /* milli-seconds */
 #define NCHUCK_MIDDLE_SAMPLES  (750 / NCHUCK_POLL_INTERVAL)
-#define NCHUCK_I2C_ADDR        0x52
 
 static void nchuck_request_data (void)
 {
@@ -6772,20 +6781,30 @@ static byte decode_ssaa_0x3c (struct rxbuf_s *rxbuf, byte b)
       break;
     default:
       if (rxbuf->sspadding) {
-        rxbuf->sspadding--;
-        rxbuf->csum -= b;  // padding is excluded from csum calculation
-        if (b != 0x02) {   // Sanity check.. doesn't actually have to be 0x02
-          if (verbose || TRACING_DEV(DEV_SSAA)) {
-            auxbus_raw_break();
-            SERIAL_PRINTF("Starsense: %u/%u bad padding 0x%02x FAIL\r\n", rxbuf->sscount, rxbuf->sslen, b);
-          }
-          ret = pkt_fail;
+        if (b == 0x02) {     // Sanity check: User grailer captured a trace showing 3b without the 02 02 padding added.
+          rxbuf->sspadding--;
+          rxbuf->csum -= b;  // padding is excluded from csum calculation
+          break;
         }
-        break;
+        if (verbose || TRACING_DEV(DEV_SSAA)) {
+          auxbus_raw_break();
+          SERIAL_PRINTF("Starsense: (+%u)%u/%u no padding(?) 0x%02x\r\n", rxbuf->sspadding, rxbuf->sscount, rxbuf->sslen, b);
+        }
+        if (rxbuf->sspadding == 1)  // already skipped a 0x02 byte?
+          rxbuf->csum += 0x02;      // put it back into the checksum
+        rxbuf->sspadding = 0;
+        rxbuf->sslen -= 2;
+        if (rxbuf->sscount > rxbuf->sslen) {  // Ensure bad data doesn't mess things up
+          auxbus_raw_break();
+          SERIAL_PRINTF("Starsense: Bad sscount after no-pad adjust: %u/%u\r\n", rxbuf->sscount, rxbuf->sslen);
+          ret = pkt_fail;
+          break;
+        }
+        // Fall thru for new 0x3b check
       }
       if (b == 0x3b) {
-        rxbuf->sspadding = 2;
-        rxbuf->sslen += 2;
+        rxbuf->sspadding = 2;  // Normally 0x3b data has two 0x02 bytes inserted after it, as padding.
+        rxbuf->sslen += rxbuf->sspadding;
         if (verbose || TRACING_DEV(DEV_SSAA)) {
           auxbus_raw_break();
           SERIAL_PRINTF("Starsense: %u/%u (+2 padding)\r\n", rxbuf->sscount, rxbuf->sslen);
@@ -8642,6 +8661,7 @@ static void ota_fetch_update (void)
     bus_free(&auxrelay);
   bus_free(&auxbus);
 
+  oled_turn_on();
   ota_show_progress(0, 0);  // Initialize the display
   ota_fetch_file(ota_update_server, ota_version_path, ota_update_path);
   // Note: server responds with a (hex) bytecount line as well as the actual data..
