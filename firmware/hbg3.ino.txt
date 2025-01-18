@@ -10,8 +10,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.64"               /* MUST begin with 'v' */
-#define VERSION_DATE "2025-01-11"
+#define VERSION "v8.65"               /* MUST begin with 'v' */
+#define VERSION_DATE "2025-01-14"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -25,6 +25,8 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.65 2025-01-14
+ *  -- Fix two-button toggle for nchuck_focus_only mode: broken since v8.55.
  * Version 8.64 2025-01-11
  *  -- Add new emulate.focus boolean variable, to force-enable a STEP/DIR motor (whether present or not).
  *  -- Fix HomeBrew Focus Motor logging to use "focus_*" rather than "ssaa_*".
@@ -4815,6 +4817,9 @@ static void nchuck_loop (void)
       buttons_down = 0;
       if (mode_change_pending) {
         mode_change_pending = false;
+        nchuck_focus_only = !nchuck_focus_only;
+        nvram_save_int("focus.only", !!nchuck_focus_only);
+        SERIAL_PRINTF("focus_only=%u\r\n", nchuck_focus_only);
         set_blue_led(LED_OFF);
       }
     }
