@@ -10,8 +10,8 @@
  * Plus Nunchuck, GPS, Smart DewControl, Focus Motor, wireless Relay, emulators, standalone mode..
  *   ..and so much more.   See https://rtr.ca/hbg3/
  */
-#define VERSION "v8.63"               /* MUST begin with 'v' */
-#define VERSION_DATE "2025-01-03"
+#define VERSION "v8.64"               /* MUST begin with 'v' */
+#define VERSION_DATE "2025-01-11"
 /*
  * Arduino IDE configuration for this project:
  *  -- Install pre-configured Arduino IDE with all needed libraries from https://rtr.ca/hbg3/
@@ -25,6 +25,10 @@
  *
  * Recent ChangeLog is below. Complete Version History is at https://rtr.ca/hbg3/history.html
  *
+ * Version 8.64 2025-01-11
+ *  -- Add new emulate.focus boolean variable, to force-enable a STEP/DIR motor (whether present or not).
+ *  -- Fix HomeBrew Focus Motor logging to use "focus_*" rather than "ssaa_*".
+ *  -- emulate.mount: Allow MC_POLL_CORDWRAP command to be 4 bytes instead of the correct 3 bytes.
  * Version 8.63 2025-01-03
  *  -- i2c_detect_device: Increase FRAM detection interval to 50ms based on report by user "masi".
  * Version 8.62 2024-11-26
@@ -3128,6 +3132,7 @@ static void mc_handle_request (struct rxbuf_s *rxbuf, byte *data, struct mc_s *m
       len += put_24bit_value(mc->cordwrap_pos, reply + len);
       break;
     case OP(MC_POLL_CORDWRAP,3):
+    case OP(MC_POLL_CORDWRAP,4):
       reply[len++] = mc->cordwrap_enabled ? 0xff : 0x00;
       break;
 
@@ -3684,7 +3689,8 @@ static bool fram_read (uint16_t addr, void *datap, uint16_t len)
 #define FOCUS_LIMIT_MIN                ((ulong)((FOCUS_ZERO_POS) - (FOCUS_MAX_TRAVEL)))
 #define FOCUS_LIMIT_MAX                ((ulong)((FOCUS_ZERO_POS) + (FOCUS_MAX_TRAVEL)))
 
-static bool focus_calibrated           = false;  // saved in NVRAM
+static bool  emulate_focus             = false;  // saved in NVRAM
+static bool  focus_calibrated          = false;  // saved in NVRAM
 static ulong focus_limit_min           = FOCUS_LIMIT_MIN;  // saved in NVRAM
 static ulong focus_limit_max           = FOCUS_LIMIT_MAX;  // saved in NVRAM
 static bool  focus_debug               = false;
@@ -3753,15 +3759,16 @@ static void stepper_autodetect (void)
   stepper_disable_pins();  // Yes, this line is necessary here!
 
   // STEP/DIR chips should have PIN_D tied directly to GND:
+  // ULN2003 chips should have a 1K-ohm loopback resistor between PIN_A(IN1) and PIN_D(IN4):
   if (!stepper_test_pins(STEPPER_PIN_A, HIGH, STEPPER_PIN_D, INPUT_PULLUP)) {
     stepper_driver = STEPPER_DRIVER_STEPDIR;
-  } else {
-    // ULN2003 chips should have a 1K-ohm loopback resistor between PIN_A(IN1) and PIN_D(IN4):
-    if (stepper_test_pins(STEPPER_PIN_A, LOW,  STEPPER_PIN_D, INPUT)
-     && stepper_test_pins(STEPPER_PIN_A, HIGH, STEPPER_PIN_D, INPUT)
-     && stepper_test_pins(STEPPER_PIN_D, LOW,  STEPPER_PIN_A, INPUT)
-     && stepper_test_pins(STEPPER_PIN_D, HIGH, STEPPER_PIN_A, INPUT))
-       stepper_driver = STEPPER_DRIVER_ULN2003;
+  } else if (stepper_test_pins(STEPPER_PIN_A, LOW,  STEPPER_PIN_D, INPUT)
+          && stepper_test_pins(STEPPER_PIN_A, HIGH, STEPPER_PIN_D, INPUT)
+          && stepper_test_pins(STEPPER_PIN_D, LOW,  STEPPER_PIN_A, INPUT)
+          && stepper_test_pins(STEPPER_PIN_D, HIGH, STEPPER_PIN_A, INPUT)) {
+            stepper_driver = STEPPER_DRIVER_ULN2003;
+  } else if (emulate_focus) {
+    stepper_driver = STEPPER_DRIVER_ULN2003;
   }
   stepper_disable_pins();
   if (stepper_driver == STEPPER_DRIVER_NONE)
@@ -4056,7 +4063,7 @@ static bool focus_handle_request (struct rxbuf_s *rxbuf, byte *data)
   static bool slew_done = true;
   byte src = data[2];
 
-  EMULATE_BEGIN("ssaa");
+  EMULATE_BEGIN("focus");
   switch (OP(op,data[1]))
   {
     case OP(MC_GET_POS,3): {
@@ -7711,6 +7718,7 @@ static char *nvram_vars[] = {
   (char *)"emulate.mount",
   (char *)"mount.override",
   (char *)"wlan.channel",
+  (char *)"emulate.focus",
   NULL
 };
 
@@ -7761,6 +7769,7 @@ static const char nvram_vals_defaults[][NVRAM_VALS_MAX_LEN + 1] = {
   "",               // emulate.mount
   "",               // mount.override
   "",               // wlan.channel
+  "",               // emulate.focus
   ""                // NULL
 };
 
@@ -8035,6 +8044,9 @@ static void nvram_restore_settings (void)
   if (2 != sscanf(flimits, "%lu %lu", &min, &max))
     min = max = 0;
   focus_set_calibration(min, max);
+  emulate_focus = nvram_get_bool("emulate.focus");
+  if (emulate_focus)
+    SERIAL_PRINTF("emulate.focus=%u\r\n", emulate_focus);
 #endif /* EMULATE_FOCUS */
 #if EMULATE_MOUNT
   emulate_mount = nvram_get_bool("emulate.mount");
