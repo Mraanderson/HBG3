@@ -47,16 +47,16 @@ A DIY ESP32-based WiFi/Bluetooth/GPS interface for Celestron telescope mounts. S
 1. Build the circuit using ESP32 DevKit-V1 and optional GPS  
 2. Flash the firmware from this repo  
 3. Connect to AUX port on your mount  
-4. Use CPWI or SkyPortal to connect via WiFi  
+4. Use CPWI or SkyPortal to connect via WiFi or Bluetooth  
 
-See the [Build Guide](https://github.com/Mraanderson/HBG3/wiki/Build-Guide) for step-by-step instructions.
+See the [Build Guide](https://rtr.ca/hbg3/assembly/) for step-by-step instructions.
 
 ---
 
 ## 📚 Resources
 
 - [Cloudy Nights HBG3 Discussion](https://www.cloudynights.com/topic/892198-hbg3-with-astronomy-sw-kstars-indi-others/)  
-- [HBG3 PCB Build Guide](https://www.cloudynights.com/topic/854327-homebrew-gen3-pcb-wifibtgpsmusbrelay/)  
+- [HBG3 PCB Build Guide](https://rtr.ca/hbg3/assembly/)  
 - [HBG3 AiO PCB Expansion](https://www.cloudynights.com/topic/975366-hbg3-aio-pcb/)  
 - [CAN Site Reference](https://www.can.telescope.dev/hbg3)  
 
