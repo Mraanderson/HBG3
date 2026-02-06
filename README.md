@@ -1,6 +1,6 @@
 # HBG3
 https://rtr.ca/hbg3/
-I've made this alternative location for documentation and files for the Celestron Homebrew Gadget 3 by Mark Lord. This will be removed if an official GitHub becomes available. From v8.56 uploading of the code to GitHub and the use in AI has been explicitly stated so the repo should now reflect this position. Please respect the developers wishes and use as intended.
+I've made this alternative location for documentation and files for the Celestron Homebrew Generation 3 by Mark Lord. This will be removed if an official GitHub becomes available. From v8.56 uploading of the code to GitHub and the use in AI has been explicitly stated so the repo should now reflect this position. Please respect the developers wishes and use as intended.
 
 [Version history on Mark's website](https://rtr.ca/hbg3/history.html)
 
