@@ -1,11 +1,11 @@
 {
   "name": "HBG3 foot-in-the-door version",
-  "version": "8.50",
+  "version": "v1",
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
-        { "path": "hbg3.bin", "offset": 0 }
+        { "path": "hbg3_loader.bin", "offset": 0 }
       ]
     }
   ]
