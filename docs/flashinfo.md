@@ -26,8 +26,7 @@ It requires no user interaction beyond WiFi setup.
 PlatformIO is used instead of Arduino IDE because it reliably outputs:
 
 - bootloader.bin  
-- partitions.bin  
-- boot_app0.bin (if required)  
+- partitions.bin
 - firmware.bin  
 
 These are required for the web flasher.
@@ -38,7 +37,7 @@ These are required for the web flasher.
 platformio.ini
 partitions.csv
 /src/
-hbg3_loader_v1.ino
+main.cpp
 
 Code
 
