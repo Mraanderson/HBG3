@@ -2,12 +2,82 @@
 <html>
 <head>
   <title>HBG3 Installer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- ESP Web Tools -->
   <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    header {
+      padding: 40px 20px 20px;
+    }
+
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 10px;
+      color: #58a6ff;
+    }
+
+    p {
+      max-width: 500px;
+      margin: 0 auto 20px;
+      line-height: 1.5;
+      color: #c9d1d9;
+    }
+
+    .card {
+      background: #161b22;
+      padding: 25px 30px;
+      border-radius: 12px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.4);
+      margin-top: 10px;
+      width: 90%;
+      max-width: 420px;
+    }
+
+    footer {
+      margin-top: 40px;
+      padding: 20px;
+      font-size: 0.85rem;
+      color: #8b949e;
+    }
+
+    a {
+      color: #58a6ff;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
 </head>
+
 <body>
-  <h1>HBG3 Firmware Setup</h1>
-  <p>Connect your ESP32 via USB and click the button below to start.</p>
-  
-  <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+
+  <header>
+    <h1>HBG3 Firmware Installer</h1>
+    <p>Connect your ESP32 device via USB and click the button below to begin flashing the HBG3 bootstrap loader.</p>
+  </header>
+
+  <div class="card">
+    <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+  </div>
+
+  <footer>
+    HBG3 Installer • Powered by ESP Web Tools
+  </footer>
+
 </body>
 </html>
