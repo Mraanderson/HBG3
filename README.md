@@ -14,6 +14,8 @@ I've made this alternative location for documentation and files for the Celestro
 [BIN file for direct flashing](https://rtr.ca/hbg3/flashing/hbg3.bin)
 This link will always download the latest binary file direct from MLORD - the creator. It is the fastest and less fuss method for getting the code onto an ESP32. See the WiKi for full step by step.
 
+Web flasher is WIP - https://mraanderson.github.io/HBG3/
+
 ----
 
 # HBG3 — HomeBrew Gen3 WiFi Interface for Celestron Telescopes
