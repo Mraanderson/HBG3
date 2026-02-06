@@ -1,0 +1,12 @@
+{
+  "name": "HBG3 Bootstrap Loader",
+  "version": "1.0.0",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "loader.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
