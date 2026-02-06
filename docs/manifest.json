@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "builds": [
     {
-      "chipFamily": "ESP32-WROOM-32",
+      "chipFamily": "ESP32",
       "parts": [
         { "path": "https://rtr.ca/hbg3/flashing/hbg3.bin", "offset": 0 }
       ]
