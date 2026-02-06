@@ -1,6 +1,6 @@
 {
-  "name": "HBG3 Bootstrap Loader",
-  "version": "1.0.0",
+  "name": "HBG3 foot-in-the-door version",
+  "version": "8.50",
   "builds": [
     {
       "chipFamily": "ESP32",
