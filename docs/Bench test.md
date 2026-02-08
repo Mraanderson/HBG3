@@ -6,7 +6,7 @@ This guide provides the full documentation for building a "Simulated Mount" test
 
 ## 1. Hardware Setup (The Bench Rig)
 
-To test the software, you only need an ESP32 DevKit, an OLED display, and two slide or rocker switches.
+To test the software, you only need an ESP32 DevKit, an OLED display, and one or two slide/rocker switches.
 
 ### Wiring Diagram
 | Component | ESP32 Pin | Purpose |
@@ -16,7 +16,7 @@ To test the software, you only need an ESP32 DevKit, an OLED display, and two sl
 | **OLED SCL** | **GPIO 22** | I2C Clock |
 | **OLED SDA** | **GPIO 21** | I2C Data |
 | **Red switch (WIFI)**| **GPIO 13** | WiFi Mode Toggle / Reset |
-| **Blue switch (MUSB)**| **GPIO 15**| USB Mode (Mount vs Serial) |
+| **Blue switch (MUSB)**| **GPIO 15**| USB Mode (Mount vs Serial) OPTIONAL |
 
 ---
 
@@ -26,15 +26,17 @@ The HBG3 web flasher uses a "Minimal Loader" strategy to ensure you always have 
 
 ### Stage 1: The Web Flasher
 1. Connect your ESP32 to your PC via USB data cable (charge only will fail to detect).
-2. Open the [HBG3 Web Flasher](https://rtr.ca/hbg3/flash/) in Chrome or Edge using a Windows/Linux/Mac PC.
+2. Open the [HBG3 Web Flasher](https://mraanderson.github.io/HBG3/) in Chrome, Brave or Edge on a Windows/Linux/Mac computer.
 3. Click **Connect** and select your ESP32 port.
 4. The flasher will install the **Minimal Loader**.
 
 ### Stage 2: The Full OTA Update
-1. Once flashed, the ESP32 reboots and creates a WiFi Access Point: `HBG3-xxxx`.
-2. Connect your phone/PC to this network and go to `192.168.4.1` in your browser.
-3. Entering details to get an internet connection will trigger the **OTA Update**. 
+1. Once flashed, the ESP32 reboots and creates a WiFi Access Point: `HBG3-Setup`.
+2. Connect your phone/PC to this and the captive portal can be used to setup.
+3. Entering details to get an internet connection will trigger the ESP32 to attempt the **OTA Update**. 
 4. The device will automatically download and install the full **Latest Release Production Firmware** direct from rtr.ca/hbg3.
+5. If it fails or hangs either the Internet access failed or simply reset the device and it will try again.
+6. Flashing Blue LED indicates downloading the update.
 
 ---
 
@@ -78,4 +80,3 @@ By default, the HBG3 can act as a "Fake Mount."
 * **`STA`**: Station mode (The HBG3 is connected to your home WiFi).
 * **`BT` / `BLE`**: A Bluetooth or BLE connection is active.
 * **`*`**: A valid GPS lock (Real or Fake) is established.
-  
