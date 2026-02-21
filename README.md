@@ -1,3 +1,9 @@
+# Web Flasher
+
+Web flasher to prepare your ESP32 for the full firmware by OTA update - https://mraanderson.github.io/HBG3/
+
+----
+
 # HBG3
 https://rtr.ca/hbg3/
 I've made this alternative location for documentation and files for the Celestron Homebrew Generation 3 by Mark Lord. This will be removed if an official GitHub becomes available. From v8.56 uploading of the code to GitHub and the use in AI has been explicitly stated so the repo should now reflect this position. Please respect the developers wishes and use as intended.
@@ -12,9 +18,8 @@ I've made this alternative location for documentation and files for the Celestro
 
 
 [BIN file for direct flashing](https://rtr.ca/hbg3/flashing/hbg3.bin)
-This link will always download the latest binary file direct from MLORD - the creator. It is the fastest and less fuss method for getting the code onto an ESP32. See the WiKi for full step by step.
+This link will always download the latest binary file direct from MLORD - the creator.
 
-Web flasher is WIP - https://mraanderson.github.io/HBG3/
 
 ----
 
