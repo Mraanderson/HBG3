@@ -22,6 +22,7 @@ This link will always download the latest binary file direct from MLORD - the cr
 
 ## Android Apps
 [Homebrew BT Bridge](https://play.google.com/store/apps/details?id=com.marklord.homebrewbtbridge)
+
 [Celestron WiFi Config](https://play.google.com/store/apps/details?id=com.marklord.celestronwificonfig)
 
 ----
