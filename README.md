@@ -20,6 +20,9 @@ I've made this alternative location for documentation and files for the Celestro
 [BIN file for direct flashing](https://rtr.ca/hbg3/flashing/hbg3.bin)
 This link will always download the latest binary file direct from MLORD - the creator.
 
+## Android Apps
+[Homebrew BT Bridge](https://play.google.com/store/apps/details?id=com.marklord.homebrewbtbridge)
+[Celestron WiFi Config](https://play.google.com/store/apps/details?id=com.marklord.celestronwificonfig)
 
 ----
 
