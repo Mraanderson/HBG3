@@ -33,17 +33,6 @@ A DIY ESP32-based WiFi/Bluetooth/GPS interface for Celestron telescope mounts. S
 
 ---
 
-## 🚀 Features
-
-- WiFi and Bluetooth control of Celestron mounts  
-- Compatible with CPWI, SkyPortal, SkySafari+  
-- Optional GPS module for automatic location/time sync  
-- USB-Serial and Bluetooth-Serial support  
-- Relay mode for StarSense AutoAlign on older mounts  
-- Fully open-source and DIY-friendly  
-
----
-
 ## 🧲 Supported Mounts
 
 - NexStar SE / SLT / Evolution  
@@ -56,9 +45,24 @@ A DIY ESP32-based WiFi/Bluetooth/GPS interface for Celestron telescope mounts. S
 ## 🔧 Getting Started
 
 1. Build the circuit using ESP32 DevKit-V1 and optional GPS  
-2. Flash the firmware from this repo  
-3. Connect to AUX port on your mount  
-4. Use CPWI or SkyPortal to connect via WiFi or Bluetooth  
+2. Flash the firmware from this repo
+3. Update to the official firmware
+4. Connect to AUX port on your mount  
+5. Use CPWI or SkyPortal to connect via WiFi or Bluetooth  
+
+First, update the firmware on the HBG3, following the instructions from the project site at https://rtr.ca/hbg3/
+
+Using an Android phone/tablet download and install:
+ * the free SkyPortal app https://play.google.com/store/apps/details?id=com.celestron.skyportal and configure the app to use "Access Point" mode for "connection" (somewhere in Settings)
+ * the free HomeBrew BT Bridge app https://play.google.com/store/apps/details?id=com.marklord.homebrewbtbridge
+
+Power on the mount with the HBG3 already plugged into it over AUX, and run the HomeBrew BT Bridge app.
+
+Tap on your HomeBrew-xxxxxx device from the list it presents.  The run SkyPortal, and hit "CONNECT and ALIGN".
+
+---
+
+## Building ##
 
 See the [Build Guide](https://rtr.ca/hbg3/assembly/) for step-by-step instructions.
 
@@ -75,8 +79,8 @@ See the [Build Guide](https://rtr.ca/hbg3/assembly/) for step-by-step instructio
 
 ## 🙌 Credits
 
-Created by mlord and the Cloudy Nights community.  
-PCB designs, firmware, and schematics are open-source and shared for educational and hobbyist use.
+HBG3/HBG4 Created by mlord and supported on the Cloudy Nights community.  
+PCB designs, firmware, and schematics are open-source and shared for educational and hobbyist use. NOT FOR RESALE.
 
 ---
 
