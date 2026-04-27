@@ -44,7 +44,7 @@ A DIY ESP32-based WiFi/Bluetooth/GPS interface for Celestron telescope mounts. S
 
 ## 🔧 Getting Started
 
-1. Build the circuit using ESP32 DevKit-V1 and optional GPS  
+1. Build the device (https://rtr.ca/hbg3/assembly)
 2. Flash the firmware from this repo
 3. Update to the official firmware
 4. Connect to AUX port on your mount  
