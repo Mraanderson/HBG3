@@ -6,16 +6,15 @@ Web flasher to prepare your ESP32 for the full firmware by OTA update - https://
 
 # HBG3
 https://rtr.ca/hbg3/
-I've made this alternative location for documentation and files for the Celestron Homebrew Generation 3 by Mark Lord. This will be removed if an official GitHub becomes available. From v8.56 uploading of the code to GitHub and the use in AI has been explicitly stated so the repo should now reflect this position. Please respect the developers wishes and use as intended.
+This is an alternative location for documentation ~~and files~~ for the Celestron Homebrew Generation 3 and 4, by Mark Lord.
+
+From v8.56 prevention of uploading of the code to GitHub and AI has been explicitly stated so this repository now respects this position. Please adhere to the developers wishes.
 
 [Version history on Mark's website](https://rtr.ca/hbg3/history.html)
-
-[Check the Wiki for an evolving guide](https://github.com/Mraanderson/HBG3/wiki)
 
 [CloudyNights HBG3 thread](https://www.cloudynights.com/topic/854327-homebrew-gen3-pcb-wifibtgpsmusbrelay)
 
 [CloudyNights dew control thread](https://www.cloudynights.com/topic/848895-homebrew-celestron-compatible-dew-heater-control)
-
 
 [BIN file for direct flashing](https://rtr.ca/hbg3/flashing/hbg3.bin)
 This link will always download the latest binary file direct from MLORD - the creator.
@@ -44,8 +43,8 @@ A DIY ESP32-based WiFi/Bluetooth/GPS interface for Celestron telescope mounts. S
 
 ## 🔧 Getting Started
 
-1. Build the device (https://rtr.ca/hbg3/assembly)
-2. Flash the firmware from this repo
+1. Build the device (https://rtr.ca/hbg3/assembly) or buy a built unit
+2. Flash the firmware from this repo or via the methods on http://rtr.ca/hbg3
 3. Update to the official firmware
 4. Connect to AUX port on your mount  
 5. Use CPWI or SkyPortal to connect via WiFi or Bluetooth  
@@ -62,28 +61,22 @@ Tap on your HomeBrew-xxxxxx device from the list it presents.  The run SkyPortal
 
 ---
 
-## Building ##
-
-See the [Build Guide](https://rtr.ca/hbg3/assembly/) for step-by-step instructions.
-
----
-
 ## 📚 Resources
 
 - [Cloudy Nights HBG3 Discussion](https://www.cloudynights.com/topic/892198-hbg3-with-astronomy-sw-kstars-indi-others/)  
-- [HBG3 PCB Build Guide](https://rtr.ca/hbg3/assembly/)  
-- [HBG3 AiO PCB Expansion](https://www.cloudynights.com/topic/975366-hbg3-aio-pcb/)  
+- [HBG3 - Build Guide](https://rtr.ca/hbg3/assembly/)  
+- [HBG3 AIO PCB Expansion](https://www.cloudynights.com/topic/975366-hbg3-aio-pcb/)  
 - [CAN Site Reference](https://www.can.telescope.dev/hbg3)  
 
 ---
 
 ## 🙌 Credits
 
-HBG3/HBG4 Created by mlord and supported on the Cloudy Nights community.  
+HBG3/HBG4 Created by mlord and supported by Mark on the Cloudy Nights forum.  
 PCB designs, firmware, and schematics are open-source and shared for educational and hobbyist use. NOT FOR RESALE.
 
 ---
 
-## 📜 License
+## 📜 License (web flasher)
 
 MIT License — see [LICENSE](LICENSE)
