@@ -46,7 +46,7 @@ A DIY ESP32-based WiFi/Bluetooth/GPS interface for Celestron telescope mounts. S
 1. Build the device (https://rtr.ca/hbg3/assembly) or buy a built unit
 2. Flash the firmware from this repo or via the methods on http://rtr.ca/hbg3
 3. Update to the official firmware
-4. Connect to AUX port on your mount  
+4. Connect to AUX port BEFORE powering on the mount 
 5. Use CPWI or SkyPortal to connect via WiFi or Bluetooth  
 
 First, update the firmware on the HBG3, following the instructions from the project site at https://rtr.ca/hbg3/
@@ -55,7 +55,7 @@ Using an Android phone/tablet download and install:
  * the free SkyPortal app https://play.google.com/store/apps/details?id=com.celestron.skyportal and configure the app to use "Access Point" mode for "connection" (somewhere in Settings)
  * the free HomeBrew BT Bridge app https://play.google.com/store/apps/details?id=com.marklord.homebrewbtbridge
 
-Power on the mount with the HBG3 already plugged into it over AUX, and run the HomeBrew BT Bridge app.
+Power on the mount with the HBG3 **already plugged into it** over AUX, and run the HomeBrew BT Bridge app.
 
 Tap on your HomeBrew-xxxxxx device from the list it presents.  The run SkyPortal, and hit "CONNECT and ALIGN".
 
